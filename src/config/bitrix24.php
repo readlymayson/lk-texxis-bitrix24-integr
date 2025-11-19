@@ -38,19 +38,18 @@ return [
     ],
 
     // Маппинг полей Битрикс24 -> ЛК
-    // ВАЖНО: Email теперь опциональный - личный кабинет можно создать без email
     'field_mapping' => [
         'contact' => [
             'lk_client_field' => 'UF_CRM_1763468430', // Поле "ЛК клиента" в контакте
             'lk_client_values' => ['46','3118','3120','3122'], // Допустимые значения поля "ЛК клиента"
-            'email' => 'EMAIL', // Опционально - если нет email, ЛК создается без него
+            'email' => 'EMAIL',
             'phone' => 'PHONE',
             'name' => 'NAME',
             'last_name' => 'LAST_NAME',
         ],
         'company' => [
             'title' => 'TITLE',
-            'email' => 'EMAIL', // Опционально - если нет email, компания обрабатывается без него
+            'email' => 'EMAIL', 
             'phone' => 'PHONE',
         ],
         'deal' => [
