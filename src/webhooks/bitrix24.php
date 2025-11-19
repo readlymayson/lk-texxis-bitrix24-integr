@@ -117,7 +117,7 @@ function processEventWithRetry($eventName, $webhookData, $config, $logger, $bitr
                 'max_attempts' => $maxRetries + 1
             ]);
 
-            $result = processEvent($eventName, $webhookData, $bitrixAPI, $lkAPI, $logger);
+            $result = processEvent($eventName, $webhookData, $bitrixAPI, $lkAPI, $logger, $config);
 
             if ($result) {
                 return true;
@@ -152,7 +152,7 @@ function processEventWithRetry($eventName, $webhookData, $config, $logger, $bitr
 /**
  * Основная логика обработки события
  */
-function processEvent($eventName, $webhookData, $bitrixAPI, $lkAPI, $logger)
+function processEvent($eventName, $webhookData, $bitrixAPI, $lkAPI, $logger, $config)
 {
     $entityType = $bitrixAPI->getEntityTypeFromEvent($eventName);
     $entityId = $webhookData['data']['FIELDS']['ID'] ?? $webhookData['data']['ID'] ?? null;
@@ -189,10 +189,10 @@ function processEvent($eventName, $webhookData, $bitrixAPI, $lkAPI, $logger)
 
     switch ($action) {
         case 'create':
-            return handleCreate($entityType, $entityData, $lkAPI, $logger);
+            return handleCreate($entityType, $entityData, $lkAPI, $logger, $config);
 
         case 'update':
-            return handleUpdate($entityType, $entityData, $lkAPI, $logger);
+            return handleUpdate($entityType, $entityData, $lkAPI, $logger, $config);
 
         case 'delete':
             return handleDelete($entityType, $entityData, $lkAPI, $logger);
@@ -209,12 +209,13 @@ function processEvent($eventName, $webhookData, $bitrixAPI, $lkAPI, $logger)
 /**
  * Обработка создания сущности
  */
-function handleCreate($entityType, $entityData, $lkAPI, $logger)
+function handleCreate($entityType, $entityData, $lkAPI, $logger, $config)
 {
     switch ($entityType) {
         case 'contact':
             // Проверяем, нужно ли создавать ЛК для этого контакта
-            $lkField = $entityData['UF_CRM_CONTACT_LK_CLIENT'] ?? null;
+            $lkFieldName = $config['field_mapping']['contact']['lk_client_field'];
+            $lkField = $entityData[$lkFieldName] ?? null;
             if (!empty($lkField)) {
                 $logger->info('Creating LK for new contact', ['contact_id' => $entityData['ID']]);
                 return $lkAPI->createLK($entityData);
@@ -238,20 +239,20 @@ function handleCreate($entityType, $entityData, $lkAPI, $logger)
 /**
  * Обработка обновления сущности
  */
-function handleUpdate($entityType, $entityData, $lkAPI, $logger)
+function handleUpdate($entityType, $entityData, $lkAPI, $logger, $config)
 {
     switch ($entityType) {
         case 'contact':
-            return handleContactUpdate($entityData, $lkAPI, $logger);
+            return handleContactUpdate($entityData, $lkAPI, $logger, $config);
 
         case 'company':
-            return handleCompanyUpdate($entityData, $lkAPI, $logger);
+            return handleCompanyUpdate($entityData, $lkAPI, $logger, $config);
 
         case 'deal':
-            return handleDealUpdate($entityData, $lkAPI, $logger);
+            return handleDealUpdate($entityData, $lkAPI, $logger, $config);
 
         case 'smart_process':
-            return handleSmartProcessUpdate($entityData, $lkAPI, $logger);
+            return handleSmartProcessUpdate($entityData, $lkAPI, $logger, $config);
     }
 
     return true;
@@ -260,10 +261,11 @@ function handleUpdate($entityType, $entityData, $lkAPI, $logger)
 /**
  * Обработка обновления контакта
  */
-function handleContactUpdate($contactData, $lkAPI, $logger)
+function handleContactUpdate($contactData, $lkAPI, $logger, $config)
 {
     $contactId = $contactData['ID'];
-    $lkField = $contactData['UF_CRM_CONTACT_LK_CLIENT'] ?? null;
+    $lkFieldName = $config['field_mapping']['contact']['lk_client_field'];
+    $lkField = $contactData[$lkFieldName] ?? null;
 
     // Если поле ЛК установлено и содержит ID ЛК
     if (!empty($lkField)) {
@@ -292,10 +294,11 @@ function handleContactUpdate($contactData, $lkAPI, $logger)
 /**
  * Обработка обновления компании
  */
-function handleCompanyUpdate($companyData, $lkAPI, $logger)
+function handleCompanyUpdate($companyData, $lkAPI, $logger, $config)
 {
     $companyId = $companyData['ID'];
-    $lkField = $companyData['UF_CRM_COMPANY_LK_CLIENT'] ?? null;
+    $lkFieldName = $config['field_mapping']['company']['lk_client_field'];
+    $lkField = $companyData[$lkFieldName] ?? null;
 
     if (!empty($lkField)) {
         $lkId = is_array($lkField) ? ($lkField[0] ?? null) : $lkField;
@@ -315,7 +318,7 @@ function handleCompanyUpdate($companyData, $lkAPI, $logger)
 /**
  * Обработка обновления сделки
  */
-function handleDealUpdate($dealData, $lkAPI, $logger)
+function handleDealUpdate($dealData, $lkAPI, $logger, $config)
 {
     // Логика обработки изменений сделок
     // Может включать обновление статусов проектов в ЛК
@@ -330,7 +333,7 @@ function handleDealUpdate($dealData, $lkAPI, $logger)
 /**
  * Обработка обновления смарт-процесса
  */
-function handleSmartProcessUpdate($processData, $lkAPI, $logger)
+function handleSmartProcessUpdate($processData, $lkAPI, $logger, $config)
 {
     // Синхронизация данных проекта в ЛК
     $logger->info('Smart process updated', [

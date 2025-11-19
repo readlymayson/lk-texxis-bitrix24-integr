@@ -29,13 +29,14 @@ return [
     // Маппинг полей Битрикс24 -> ЛК
     'field_mapping' => [
         'contact' => [
-            'lk_client_field' => 'UF_CRM_1763468430', // Поле "ЛК клиента" в контакте
+            'lk_client_field' => 'UF_CRM_1763531846040', // Поле "ЛК клиента" в контакте
             'email' => 'EMAIL',
             'phone' => 'PHONE',
             'name' => 'NAME',
             'last_name' => 'LAST_NAME',
         ],
         'company' => [
+            'lk_client_field' => 'UF_CRM_COMPANY_LK_CLIENT', // Поле "ЛК клиента" в компании
             'title' => 'TITLE',
             'email' => 'EMAIL',
             'phone' => 'PHONE',

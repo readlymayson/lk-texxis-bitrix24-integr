@@ -1,0 +1,43 @@
+# Включение поддержки PHP
+AddType application/x-httpd-php .php
+
+# Защита конфиденциальных файлов
+<Files ".env">
+    Order allow,deny
+    Deny from all
+</Files>
+
+<Files "env.local">
+    Order allow,deny
+    Deny from all
+</Files>
+
+# Защита директории логов от прямого доступа
+<Directory "src/logs/">
+    Order allow,deny
+    Deny from all
+</Directory>
+
+# Разрешение доступа к основным файлам
+<Files "*.php">
+    Order allow,deny
+    Allow from all
+</Files>
+
+# Кэширование статических ресурсов
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType text/css "access plus 1 month"
+    ExpiresByType application/javascript "access plus 1 month"
+</IfModule>
+
+# Безопасность
+Options -Indexes
+ServerSignature Off
+
+# Редирект на index.php для корневой директории
+DirectoryIndex index.php index.html
+
+# Обработка ошибок
+ErrorDocument 404 /index.php?tab=dashboard
+ErrorDocument 403 /index.php?tab=dashboard
