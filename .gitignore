@@ -3,6 +3,9 @@ logs/
 *.log
 src/logs/
 
+# Данные приложения
+src/data/
+
 # Файлы окружения
 .env
 .env.*
