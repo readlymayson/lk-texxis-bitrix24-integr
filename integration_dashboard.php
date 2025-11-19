@@ -516,7 +516,7 @@ $tab = $_GET['tab'] ?? 'dashboard';
                                                 $configFiles = [
                                                     '.env' => 'Переменные окружения',
                                                     'src/config/bitrix24.php' => 'Основная конфигурация',
-                                                    'env.example' => 'Пример конфигурации'
+                                                    '.env.example' => 'Пример конфигурации'
                                                 ];
 
                                                 foreach ($configFiles as $file => $description):
@@ -539,7 +539,7 @@ $tab = $_GET['tab'] ?? 'dashboard';
                                             <h6>Инструкция по настройке</h6>
                                             <div class="alert alert-info">
                                                 <h6>1. Настройка переменных окружения</h6>
-                                                <p>Создайте файл <code>.env</code> на основе <code>env.example</code></p>
+                                                <p>Создайте файл <code>.env</code> на основе <code>.env.example</code></p>
 
                                                 <h6>2. Настройка webhook в Битрикс24</h6>
                                                 <p>URL: <code><?php echo $_SERVER['HTTP_HOST'] ?? 'your-domain.com'; ?>/src/webhooks/bitrix24.php</code></p>

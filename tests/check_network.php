@@ -68,5 +68,6 @@ echo "<h2>Быстрые ссылки</h2>";
 echo "<p><a href='$localURL' class='success' target='_blank'>🌐 Открыть локально</a></p>";
 echo "<p><a href='$networkURL' class='success' target='_blank'>🌐 Открыть из сети</a></p>";
 echo "<p><a href='check_web.php' class='info'>🔍 Проверить систему</a></p>";
+echo "<p><a href='../index.php' class='info'>← Вернуться в веб-интерфейс</a></p>";
 
 ?>

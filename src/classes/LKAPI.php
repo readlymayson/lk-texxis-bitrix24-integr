@@ -210,16 +210,27 @@ class LKAPI
     private function mapContactFields($contactData)
     {
         $mapping = $this->config['field_mapping']['contact'];
-
-        return [
+        $result = [
             'bitrix_id' => $contactData['ID'] ?? null,
             'name' => $contactData[$mapping['name']] ?? '',
             'last_name' => $contactData[$mapping['last_name']] ?? '',
-            'email' => $this->extractEmail($contactData[$mapping['email']] ?? []),
             'phone' => $this->extractPhone($contactData[$mapping['phone']] ?? []),
             'has_lk' => !empty($contactData[$mapping['lk_client_field']]),
             'lk_created' => $contactData[$mapping['lk_client_field']] ?? null,
         ];
+
+        // Email теперь опциональный - добавляем только если он есть
+        $email = $this->extractEmail($contactData[$mapping['email']] ?? []);
+        if (!empty($email)) {
+            $result['email'] = $email;
+        } else {
+            $this->logger->debug('Contact email not found or empty, creating LK without email', [
+                'contact_id' => $contactData['ID'],
+                'email_field_data' => $contactData[$mapping['email']] ?? null
+            ]);
+        }
+
+        return $result;
     }
 
     /**
@@ -228,14 +239,24 @@ class LKAPI
     private function mapCompanyFields($companyData)
     {
         $mapping = $this->config['field_mapping']['company'];
-
-        return [
+        $result = [
             'bitrix_id' => $companyData['ID'] ?? null,
             'title' => $companyData[$mapping['title']] ?? '',
-            'email' => $this->extractEmail($companyData[$mapping['email']] ?? []),
             'phone' => $this->extractPhone($companyData[$mapping['phone']] ?? []),
-            'has_lk' => !empty($companyData[$mapping['lk_client_field']]),
+            'has_lk' => false, // Компании не имеют поля личного кабинета
         ];
+
+        $email = $this->extractEmail($companyData[$mapping['email']] ?? []);
+        if (!empty($email)) {
+            $result['email'] = $email;
+        } else {
+            $this->logger->debug('Company email not found or empty, processing without email', [
+                'company_id' => $companyData['ID'],
+                'email_field_data' => $companyData[$mapping['email']] ?? null
+            ]);
+        }
+
+        return $result;
     }
 
     /**

@@ -11,6 +11,7 @@ echo "Интеграция Битрикс24 с ЛК\n";
 echo "========================================\n\n";
 
 $testFiles = [
+    'comprehensive_test.php' => 'Комплексное тестирование всех компонентов',
     'test_integration.php' => 'Основные тесты интеграции',
     'test_validation.php' => 'Тесты валидации webhook',
     'test_edge_cases.php' => 'Тесты edge cases и ошибок'

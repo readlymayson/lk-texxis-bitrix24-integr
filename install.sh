@@ -15,8 +15,57 @@ echo Установка интеграции Битрикс24
 echo ========================================
 
 # Создание необходимых директорий
+echo Создание директорий...
 if [ ! -d "src/logs" ]; then
     mkdir -p "src/logs"
+    echo ✓ Создана директория src/logs
+else
+    echo ✓ Директория src/logs уже существует
+fi
+
+if [ ! -d "src/data" ]; then
+    mkdir -p "src/data"
+    echo ✓ Создана директория src/data
+else
+    echo ✓ Директория src/data уже существует
+fi
+
+# Создание файлов данных
+echo Создание файлов данных...
+if [ ! -f "src/data/contacts.json" ]; then
+    echo '{}' > "src/data/contacts.json"
+    echo ✓ Создан файл src/data/contacts.json
+else
+    echo ✓ Файл src/data/contacts.json уже существует
+fi
+
+if [ ! -f "src/data/companies.json" ]; then
+    echo '{}' > "src/data/companies.json"
+    echo ✓ Создан файл src/data/companies.json
+else
+    echo ✓ Файл src/data/companies.json уже существует
+fi
+
+if [ ! -f "src/data/deals.json" ]; then
+    echo '{}' > "src/data/deals.json"
+    echo ✓ Создан файл src/data/deals.json
+else
+    echo ✓ Файл src/data/deals.json уже существует
+fi
+
+# Установка прав доступа
+echo Установка прав доступа...
+chmod 755 src/webhooks/bitrix24.php 2>/dev/null
+chmod 666 src/data/contacts.json 2>/dev/null
+chmod 666 src/data/companies.json 2>/dev/null
+chmod 666 src/data/deals.json 2>/dev/null
+chmod 755 src/data 2>/dev/null
+chmod 755 src/logs 2>/dev/null
+
+if [ -f "src/data/contacts.json" ] && [ -w "src/data/contacts.json" ]; then
+    echo ✓ Права доступа установлены корректно
+else
+    echo ✗ Проблема с правами доступа к файлам данных!
 fi
 
 # Настройка .env файла
@@ -35,8 +84,6 @@ else
     echo ✓ Файл .env уже существует
 fi
 
-# Установка прав доступа
-chmod 755 src/webhooks/bitrix24.php 2>/dev/null
 
 # Проверка конфигурации
 if [ -f "src/config/bitrix24.php" ]; then

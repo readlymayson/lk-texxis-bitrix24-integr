@@ -14,8 +14,19 @@ return [
     'bitrix24' => [
         'webhook_url' => EnvLoader::get('BITRIX24_WEBHOOK_URL', ''),
         'webhook_secret' => EnvLoader::get('BITRIX24_WEBHOOK_SECRET', ''),
+        'application_token' => EnvLoader::get('BITRIX24_APPLICATION_TOKEN', ''), // Токен приложения для валидации webhook
         'client_id' => EnvLoader::get('BITRIX24_CLIENT_ID', ''),
         'client_secret' => EnvLoader::get('BITRIX24_CLIENT_SECRET', ''),
+        'timeout' => EnvLoader::getInt('BITRIX24_TIMEOUT', 30), // Timeout для API запросов (секунды)
+    ],
+
+    // Настройки локального хранилища данных
+    // Все данные хранятся локально в JSON файлах в директории data/
+    'local_storage' => [
+        'data_dir' => __DIR__ . '/../data',
+        'contacts_file' => __DIR__ . '/../data/contacts.json',
+        'companies_file' => __DIR__ . '/../data/companies.json',
+        'deals_file' => __DIR__ . '/../data/deals.json',
     ],
 
     // Настройки логирования
@@ -27,18 +38,19 @@ return [
     ],
 
     // Маппинг полей Битрикс24 -> ЛК
+    // ВАЖНО: Email теперь опциональный - личный кабинет можно создать без email
     'field_mapping' => [
         'contact' => [
             'lk_client_field' => 'UF_CRM_1763531846040', // Поле "ЛК клиента" в контакте
-            'email' => 'EMAIL',
+            'lk_client_values' => ["46"], // Допустимые значения поля "ЛК клиента"
+            'email' => 'EMAIL', // Опционально - если нет email, ЛК создается без него
             'phone' => 'PHONE',
             'name' => 'NAME',
             'last_name' => 'LAST_NAME',
         ],
         'company' => [
-            'lk_client_field' => 'UF_CRM_COMPANY_LK_CLIENT', // Поле "ЛК клиента" в компании
             'title' => 'TITLE',
-            'email' => 'EMAIL',
+            'email' => 'EMAIL', // Опционально - если нет email, компания обрабатывается без него
             'phone' => 'PHONE',
         ],
         'deal' => [

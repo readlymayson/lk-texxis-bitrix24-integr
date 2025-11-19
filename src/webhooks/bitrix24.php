@@ -19,7 +19,7 @@
 require_once __DIR__ . '/../classes/EnvLoader.php';
 require_once __DIR__ . '/../classes/Logger.php';
 require_once __DIR__ . '/../classes/Bitrix24API.php';
-require_once __DIR__ . '/../classes/LKAPI.php';
+require_once __DIR__ . '/../classes/LocalStorage.php';
 
 // Загрузка конфигурации (включает загрузку .env)
 $config = require_once __DIR__ . '/../config/bitrix24.php';
@@ -27,46 +27,80 @@ $config = require_once __DIR__ . '/../config/bitrix24.php';
 // Инициализация компонентов
 $logger = new Logger($config);
 $bitrixAPI = new Bitrix24API($config, $logger);
-$lkAPI = new LKAPI($config, $logger);
+$localStorage = new LocalStorage($logger);
 
 try {
-    // Логирование входящего запроса
-    $logger->info('Received webhook request', [
+    // Получение тела запроса ДО валидации
+    $rawBody = file_get_contents('php://input');
+
+    // Получение всех заголовков
+    $headers = getRequestHeaders();
+
+    // Детальное логирование входящего webhook запроса
+    $logger->info('=== WEBHOOK REQUEST RECEIVED ===', [
+        'timestamp' => date('Y-m-d H:i:s'),
         'method' => $_SERVER['REQUEST_METHOD'] ?? 'UNKNOWN',
+        'uri' => $_SERVER['REQUEST_URI'] ?? 'UNKNOWN',
         'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? 'UNKNOWN',
         'content_type' => $_SERVER['CONTENT_TYPE'] ?? 'UNKNOWN',
-        'remote_addr' => $_SERVER['REMOTE_ADDR'] ?? 'UNKNOWN'
+        'content_length' => $_SERVER['CONTENT_LENGTH'] ?? 'UNKNOWN',
+        'remote_addr' => $_SERVER['REMOTE_ADDR'] ?? 'UNKNOWN',
+        'remote_port' => $_SERVER['REMOTE_PORT'] ?? 'UNKNOWN',
+        'server_name' => $_SERVER['SERVER_NAME'] ?? 'UNKNOWN',
+        'request_time' => $_SERVER['REQUEST_TIME'] ?? 'UNKNOWN',
+        'headers_count' => count($headers),
+        'body_size' => strlen($rawBody),
+        'body_preview' => strlen($rawBody) > 200 ? substr($rawBody, 0, 200) . '...' : $rawBody
     ]);
+
+    // Логирование всех HTTP заголовков
+    $logger->debug('Webhook headers', ['headers' => $headers]);
 
     // Проверка метода запроса
     if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-        $logger->warning('Invalid request method', ['method' => $_SERVER['REQUEST_METHOD']]);
+        $logger->warning('Invalid request method', [
+            'method' => $_SERVER['REQUEST_METHOD'],
+            'expected' => 'POST'
+        ]);
         sendResponse(405, ['error' => 'Method not allowed. Use POST.']);
         exit;
     }
 
-    // Получение тела запроса
-    $rawBody = file_get_contents('php://input');
+    // Проверка тела запроса
     if (empty($rawBody)) {
-        $logger->warning('Empty request body');
+        $logger->warning('Empty request body received', [
+            'content_length' => $_SERVER['CONTENT_LENGTH'] ?? 'not set',
+            'headers' => $headers
+        ]);
         sendResponse(400, ['error' => 'Empty request body']);
         exit;
     }
 
-    // Получение заголовков
-    $headers = getRequestHeaders();
-
     // Валидация webhook запроса
     $webhookData = $bitrixAPI->validateWebhookRequest($headers, $rawBody);
     if ($webhookData === false) {
-        $logger->error('Webhook validation failed');
+        $logger->error('Webhook validation failed', [
+            'raw_body' => $rawBody,
+            'headers' => $headers
+        ]);
         sendResponse(400, ['error' => 'Invalid webhook request']);
         exit;
     }
 
-    $logger->info('Webhook data received', [
+    // Детальное логирование валидных данных от Битрикс24
+    $logger->info('=== WEBHOOK DATA VALIDATED ===', [
         'event' => $webhookData['event'] ?? 'UNKNOWN',
-        'data_keys' => array_keys($webhookData)
+        'event_type' => getWebhookEventType($webhookData['event'] ?? ''),
+        'timestamp' => $webhookData['ts'] ?? 'UNKNOWN',
+        'auth_token' => $webhookData['auth']['application_token'] ?? 'UNKNOWN',
+        'data_keys' => array_keys($webhookData['data'] ?? []),
+        'entity_id' => $webhookData['data']['FIELDS']['ID'] ?? $webhookData['data']['ID'] ?? 'UNKNOWN',
+        'webhook_data_size' => strlen(json_encode($webhookData))
+    ]);
+
+    // Логирование полных данных webhook (только для отладки)
+    $logger->debug('Full webhook data from Bitrix24', [
+        'webhook_data' => $webhookData
     ]);
 
     // Определение типа события и обработка
@@ -74,19 +108,48 @@ try {
     $entityId = $webhookData['data']['FIELDS']['ID'] ?? $webhookData['data']['ID'] ?? null;
 
     if (empty($eventName)) {
-        $logger->error('Missing event name in webhook data');
+        $logger->error('Missing event name in webhook data', [
+            'webhook_data_keys' => array_keys($webhookData)
+        ]);
         sendResponse(400, ['error' => 'Missing event name']);
         exit;
     }
 
+    // Логирование начала обработки события
+    $logger->info('=== STARTING EVENT PROCESSING ===', [
+        'event_name' => $eventName,
+        'event_type' => getWebhookEventType($eventName),
+        'action' => getActionFromEvent($eventName),
+        'entity_id' => $entityId,
+        'processing_start_time' => date('Y-m-d H:i:s')
+    ]);
+
     // Обработка события с повторными попытками
-    $result = processEventWithRetry($eventName, $webhookData, $config, $logger, $bitrixAPI, $lkAPI);
+    $result = processEventWithRetry($eventName, $webhookData, $config, $logger, $bitrixAPI, $localStorage);
+
+    // Логирование завершения обработки события
+    $processingEndTime = date('Y-m-d H:i:s');
+    $processingDuration = time() - strtotime($webhookData['ts'] ?? 'now');
 
     if ($result) {
-        $logger->info('Webhook processed successfully', ['event' => $eventName]);
+        $logger->info('=== EVENT PROCESSING COMPLETED SUCCESSFULLY ===', [
+            'event_name' => $eventName,
+            'event_type' => getWebhookEventType($eventName),
+            'entity_id' => $entityId,
+            'processing_end_time' => $processingEndTime,
+            'processing_duration_seconds' => $processingDuration,
+            'result' => 'SUCCESS'
+        ]);
         sendResponse(200, ['status' => 'success', 'event' => $eventName]);
     } else {
-        $logger->error('Webhook processing failed', ['event' => $eventName]);
+        $logger->error('=== EVENT PROCESSING FAILED ===', [
+            'event_name' => $eventName,
+            'event_type' => getWebhookEventType($eventName),
+            'entity_id' => $entityId,
+            'processing_end_time' => $processingEndTime,
+            'processing_duration_seconds' => $processingDuration,
+            'result' => 'FAILED'
+        ]);
         sendResponse(500, ['error' => 'Processing failed', 'event' => $eventName]);
     }
 
@@ -104,7 +167,7 @@ try {
 /**
  * Обработка события с механизмом повторных попыток
  */
-function processEventWithRetry($eventName, $webhookData, $config, $logger, $bitrixAPI, $lkAPI)
+function processEventWithRetry($eventName, $webhookData, $config, $logger, $bitrixAPI, $localStorage)
 {
     $maxRetries = $config['events']['max_retries'];
     $retryDelays = $config['events']['retry_delays'];
@@ -117,7 +180,7 @@ function processEventWithRetry($eventName, $webhookData, $config, $logger, $bitr
                 'max_attempts' => $maxRetries + 1
             ]);
 
-            $result = processEvent($eventName, $webhookData, $bitrixAPI, $lkAPI, $logger, $config);
+            $result = processEvent($eventName, $webhookData, $bitrixAPI, $localStorage, $logger, $config);
 
             if ($result) {
                 return true;
@@ -150,9 +213,49 @@ function processEventWithRetry($eventName, $webhookData, $config, $logger, $bitr
 }
 
 /**
+ * Проверка допустимого значения поля ЛК клиента
+ */
+function isValidLKClientValue($entityType, $entityData, $config, $logger)
+{
+    // Проверяем, есть ли настройки поля ЛК клиента для этого типа сущности
+    if (!isset($config['field_mapping'][$entityType]['lk_client_field'])) {
+        $logger->debug('LK client field not configured for entity type', [
+            'entity_type' => $entityType
+        ]);
+        return false;
+    }
+
+    $fieldName = $config['field_mapping'][$entityType]['lk_client_field'];
+    $allowedValues = $config['field_mapping'][$entityType]['lk_client_values'] ?? [];
+
+    $fieldValue = $entityData[$fieldName] ?? null;
+
+    if (empty($fieldValue)) {
+        $logger->debug('LK client field is empty or not set', [
+            'entity_type' => $entityType,
+            'field_name' => $fieldName,
+            'field_value' => $fieldValue
+        ]);
+        return false;
+    }
+
+    $isValid = in_array($fieldValue, $allowedValues, true);
+
+    $logger->debug('LK client field validation', [
+        'entity_type' => $entityType,
+        'field_name' => $fieldName,
+        'field_value' => $fieldValue,
+        'allowed_values' => $allowedValues,
+        'is_valid' => $isValid
+    ]);
+
+    return $isValid;
+}
+
+/**
  * Основная логика обработки события
  */
-function processEvent($eventName, $webhookData, $bitrixAPI, $lkAPI, $logger, $config)
+function processEvent($eventName, $webhookData, $bitrixAPI, $localStorage, $logger, $config)
 {
     $entityType = $bitrixAPI->getEntityTypeFromEvent($eventName);
     $entityId = $webhookData['data']['FIELDS']['ID'] ?? $webhookData['data']['ID'] ?? null;
@@ -189,13 +292,13 @@ function processEvent($eventName, $webhookData, $bitrixAPI, $lkAPI, $logger, $co
 
     switch ($action) {
         case 'create':
-            return handleCreate($entityType, $entityData, $lkAPI, $logger, $config);
+            return handleCreate($entityType, $entityData, $localStorage, $logger, $config);
 
         case 'update':
-            return handleUpdate($entityType, $entityData, $lkAPI, $logger, $config);
+            return handleUpdate($entityType, $entityData, $localStorage, $bitrixAPI, $logger, $config);
 
         case 'delete':
-            return handleDelete($entityType, $entityData, $lkAPI, $logger);
+            return handleDelete($entityType, $entityData, $localStorage, $logger);
 
         default:
             $logger->warning('Unknown action for event', [
@@ -209,16 +312,16 @@ function processEvent($eventName, $webhookData, $bitrixAPI, $lkAPI, $logger, $co
 /**
  * Обработка создания сущности
  */
-function handleCreate($entityType, $entityData, $lkAPI, $logger, $config)
+function handleCreate($entityType, $entityData, $localStorage, $logger, $config)
 {
     switch ($entityType) {
         case 'contact':
             // Проверяем, нужно ли создавать ЛК для этого контакта
-            $lkFieldName = $config['field_mapping']['contact']['lk_client_field'];
-            $lkField = $entityData[$lkFieldName] ?? null;
-            if (!empty($lkField)) {
-                $logger->info('Creating LK for new contact', ['contact_id' => $entityData['ID']]);
-                return $lkAPI->createLK($entityData);
+            if (isValidLKClientValue('contact', $entityData, $config, $logger)) {
+                $logger->info('Creating LK for new contact with valid LK client field', ['contact_id' => $entityData['ID']]);
+                return $localStorage->createLK($entityData);
+            } else {
+                $logger->info('Skipping LK creation for new contact - invalid LK client field value', ['contact_id' => $entityData['ID']]);
             }
             break;
 
@@ -239,20 +342,20 @@ function handleCreate($entityType, $entityData, $lkAPI, $logger, $config)
 /**
  * Обработка обновления сущности
  */
-function handleUpdate($entityType, $entityData, $lkAPI, $logger, $config)
+function handleUpdate($entityType, $entityData, $localStorage, $bitrixAPI, $logger, $config)
 {
     switch ($entityType) {
         case 'contact':
-            return handleContactUpdate($entityData, $lkAPI, $logger, $config);
+            return handleContactUpdate($entityData, $localStorage, $bitrixAPI, $logger, $config);
 
         case 'company':
-            return handleCompanyUpdate($entityData, $lkAPI, $logger, $config);
+            return handleCompanyUpdate($entityData, $localStorage, $bitrixAPI, $logger, $config);
 
         case 'deal':
-            return handleDealUpdate($entityData, $lkAPI, $logger, $config);
+            return handleDealUpdate($entityData, $localStorage, $logger, $config);
 
         case 'smart_process':
-            return handleSmartProcessUpdate($entityData, $lkAPI, $logger, $config);
+            return handleSmartProcessUpdate($entityData, $localStorage, $logger, $config);
     }
 
     return true;
@@ -261,64 +364,88 @@ function handleUpdate($entityType, $entityData, $lkAPI, $logger, $config)
 /**
  * Обработка обновления контакта
  */
-function handleContactUpdate($contactData, $lkAPI, $logger, $config)
+function handleContactUpdate($contactData, $localStorage, $bitrixAPI, $logger, $config)
 {
     $contactId = $contactData['ID'];
-    $lkFieldName = $config['field_mapping']['contact']['lk_client_field'];
-    $lkField = $contactData[$lkFieldName] ?? null;
 
-    // Если поле ЛК установлено и содержит ID ЛК
-    if (!empty($lkField)) {
-        $lkId = is_array($lkField) ? ($lkField[0] ?? null) : $lkField;
+    // contactData уже содержит полные данные из Bitrix24 API (из processEventWithRetry)
+    $logger->info('Processing contact update with full data from Bitrix24', [
+        'contact_id' => $contactId,
+        'name' => $contactData['NAME'] ?? 'N/A',
+        'email_count' => count($contactData['EMAIL'] ?? []),
+        'phone_count' => count($contactData['PHONE'] ?? [])
+    ]);
 
-        if ($lkId) {
-            // Синхронизация данных контакта в существующий ЛК
-            $logger->info('Syncing contact update to existing LK', [
+    // Проверяем, существует ли контакт в локальном хранилище
+    $existingContact = $localStorage->getContact($contactId);
+
+    if ($existingContact) {
+        // Контакт найден - проверяем, допустимо ли значение поля ЛК перед обновлением
+        if (isValidLKClientValue('contact', $contactData, $config, $logger)) {
+            $logger->info('Updating existing contact with full data from Bitrix24 - valid LK field', [
                 'contact_id' => $contactId,
-                'lk_id' => $lkId
+                'lk_id' => $existingContact['id']
             ]);
-            return $lkAPI->syncContact($lkId, $contactData);
+            return $localStorage->syncContact($existingContact['id'], $contactData);
         } else {
-            // Создание нового ЛК для контакта
-            $logger->info('Creating new LK for contact', ['contact_id' => $contactId]);
-            return $lkAPI->createLK($contactData);
+            $logger->info('Skipping contact update - invalid LK client field value', [
+                'contact_id' => $contactId,
+                'lk_id' => $existingContact['id']
+            ]);
+            return true; // Не считаем это ошибкой, просто пропускаем обновление
+        }
+    } else {
+        // Контакт не найден - проверяем, нужно ли создавать ЛК
+        if (isValidLKClientValue('contact', $contactData, $config, $logger)) {
+            $logger->info('Creating new LK with full data from Bitrix24 - valid LK client field', ['contact_id' => $contactId]);
+            return $localStorage->createLK($contactData);
+        } else {
+            $logger->info('Skipping LK creation for contact update - invalid LK client field value', ['contact_id' => $contactId]);
+            return true; // Не считаем это ошибкой, просто пропускаем создание
         }
     }
-
-    // Если поле ЛК было снято - потенциально удаление ЛК
-    // (нужно определить логику по требованиям проекта)
-
-    return true;
 }
 
 /**
  * Обработка обновления компании
  */
-function handleCompanyUpdate($companyData, $lkAPI, $logger, $config)
+function handleCompanyUpdate($companyData, $localStorage, $bitrixAPI, $logger, $config)
 {
     $companyId = $companyData['ID'];
-    $lkFieldName = $config['field_mapping']['company']['lk_client_field'];
-    $lkField = $companyData[$lkFieldName] ?? null;
 
-    if (!empty($lkField)) {
-        $lkId = is_array($lkField) ? ($lkField[0] ?? null) : $lkField;
+    // Получаем полные данные компании из Bitrix24 API через crm.company.get
+    $logger->info('Fetching full company data from Bitrix24 API via crm.company.get', ['company_id' => $companyId]);
 
-        if ($lkId) {
-            $logger->info('Syncing company update to LK', [
-                'company_id' => $companyId,
-                'lk_id' => $lkId
-            ]);
-            return $lkAPI->syncCompany($lkId, $companyData);
+    try {
+        $fullCompanyData = $bitrixAPI->getEntityData('company', $companyId);
+
+        if (!$fullCompanyData) {
+            $logger->warning('Failed to fetch company data from Bitrix24 API', ['company_id' => $companyId]);
+            return false;
         }
-    }
 
-    return true;
+        $logger->info('Successfully fetched company data from Bitrix24', [
+            'company_id' => $companyId,
+            'title' => $fullCompanyData['TITLE'] ?? 'N/A'
+        ]);
+
+        // Синхронизируем данные компании
+        $logger->info('Syncing company data to local storage', ['company_id' => $companyId]);
+        return $localStorage->syncCompany(null, $fullCompanyData);
+
+    } catch (Exception $e) {
+        $logger->error('Error fetching company data from Bitrix24 API', [
+            'company_id' => $companyId,
+            'error' => $e->getMessage()
+        ]);
+        return false;
+    }
 }
 
 /**
  * Обработка обновления сделки
  */
-function handleDealUpdate($dealData, $lkAPI, $logger, $config)
+function handleDealUpdate($dealData, $localStorage, $logger, $config)
 {
     // Логика обработки изменений сделок
     // Может включать обновление статусов проектов в ЛК
@@ -327,13 +454,14 @@ function handleDealUpdate($dealData, $lkAPI, $logger, $config)
         'stage' => $dealData['STAGE_ID'] ?? 'unknown'
     ]);
 
-    return true;
+    // Сохраняем данные сделки локально
+    return $localStorage->addDeal($dealData);
 }
 
 /**
  * Обработка обновления смарт-процесса
  */
-function handleSmartProcessUpdate($processData, $lkAPI, $logger, $config)
+function handleSmartProcessUpdate($processData, $localStorage, $logger, $config)
 {
     // Синхронизация данных проекта в ЛК
     $logger->info('Smart process updated', [
@@ -350,7 +478,7 @@ function handleSmartProcessUpdate($processData, $lkAPI, $logger, $config)
 /**
  * Обработка удаления сущности
  */
-function handleDelete($entityType, $entityData, $lkAPI, $logger)
+function handleDelete($entityType, $entityData, $localStorage, $logger)
 {
     switch ($entityType) {
         case 'contact':
@@ -365,6 +493,27 @@ function handleDelete($entityType, $entityData, $lkAPI, $logger)
     }
 
     return true;
+}
+
+/**
+ * Определение типа события webhook
+ */
+function getWebhookEventType($eventName)
+{
+    $eventTypes = [
+        'CONTACT' => 'contact',
+        'COMPANY' => 'company',
+        'DEAL' => 'deal',
+        'DYNAMIC_ITEM' => 'smart_process'
+    ];
+
+    foreach ($eventTypes as $type => $entity) {
+        if (str_contains($eventName, $type)) {
+            return $entity;
+        }
+    }
+
+    return 'unknown';
 }
 
 /**
@@ -398,10 +547,10 @@ function getRequestHeaders()
         if (str_starts_with($key, 'HTTP_')) {
             $headerName = str_replace('HTTP_', '', $key);
             $headerName = str_replace('_', '-', $headerName);
-            $headers[$headerName] = $value;
-        } elseif (in_array($key, ['CONTENT_TYPE', 'CONTENT_LENGTH'])) {
+            $headers[strtolower($headerName)] = $value;
+        } elseif (in_array($key, ['CONTENT_TYPE', 'CONTENT_LENGTH', 'USER_AGENT'])) {
             $headerName = str_replace('_', '-', $key);
-            $headers[$headerName] = $value;
+            $headers[strtolower($headerName)] = $value;
         }
     }
 

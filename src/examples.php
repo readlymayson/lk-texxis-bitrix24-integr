@@ -80,8 +80,8 @@ $companyUpdateExample = [
             ],
             "PHONE" => [
                 ["VALUE" => "+7 (495) 123-45-67", "VALUE_TYPE" => "WORK"]
-            ],
-            "UF_CRM_COMPANY_LK_CLIENT" => "LK-001" // ID существующего ЛК
+            ]
+            // Компании не имеют поля личного кабинета
         ]
     ]
 ];
@@ -272,13 +272,10 @@ function handleContactUpdate($contactData, $lkAPI, $logger)
 
 function handleCompanyUpdate($companyData, $lkAPI, $logger)
 {
-    $lkField = $companyData['UF_CRM_COMPANY_LK_CLIENT'] ?? null;
-
-    if (!empty($lkField)) {
-        $logger->info('Syncing company update to LK', [
-            'company_id' => $companyData['ID'],
-            'lk_id' => $lkField
-        ]);
+    // Компании не имеют поля личного кабинета, синхронизируем всегда
+    $logger->info('Syncing company update to LK', [
+        'company_id' => $companyData['ID']
+    ]);
     }
 
     return true;

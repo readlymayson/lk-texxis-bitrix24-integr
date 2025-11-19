@@ -23,41 +23,96 @@ class Bitrix24API
     {
         try {
             // Проверка наличия необходимых заголовков
-            if (!isset($headers['User-Agent']) || !str_contains($headers['User-Agent'], 'Bitrix24')) {
-                $this->logger->warning('Invalid User-Agent in webhook request', ['headers' => $headers]);
+            // Битрикс24 может отправлять User-Agent как "Bitrix24" или "Bitrix24 Webhook Engine"
+            // Заголовки могут приходить в разных регистрах: User-Agent или user-agent
+            $userAgent = $headers['User-Agent'] ?? $headers['user-agent'] ?? '';
+            if (empty($userAgent) ||
+                (!str_contains($userAgent, 'Bitrix24') && !str_contains($userAgent, 'Bitrix24 Webhook Engine'))) {
+                $this->logger->warning('Invalid User-Agent in webhook request', [
+                    'user_agent' => $userAgent,
+                    'headers' => $headers
+                ]);
                 return false;
             }
 
-            // Проверка типа контента
-            if (!isset($headers['Content-Type']) || !str_contains($headers['Content-Type'], 'application/json')) {
-                $this->logger->warning('Invalid Content-Type in webhook request', ['content_type' => $headers['Content-Type'] ?? 'not set']);
+            // Проверка типа контента - поддерживаем JSON и URL-encoded
+            $contentType = $headers['Content-Type'] ?? $headers['content-type'] ?? '';
+
+            // Валидация тела запроса в зависимости от Content-Type
+            if (str_contains($contentType, 'application/json')) {
+                // Обработка JSON формата
+                $data = json_decode($body, true);
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    $this->logger->error('Invalid JSON in webhook body', [
+                        'error' => json_last_error_msg(),
+                        'body' => $body,
+                        'content_type' => $contentType
+                    ]);
+                    return false;
+                }
+            } elseif (str_contains($contentType, 'application/x-www-form-urlencoded')) {
+                // Обработка URL-encoded формата (как в примере пользователя)
+                // parse_str() уже правильно разбирает вложенные структуры типа data[FIELDS][ID]
+                parse_str($body, $data);
+                if (empty($data)) {
+                    $this->logger->error('Failed to parse URL-encoded webhook body', [
+                        'body' => $body,
+                        'content_type' => $contentType
+                    ]);
+                    return false;
+                }
+            } else {
+                $this->logger->warning('Unsupported Content-Type in webhook request', [
+                    'content_type' => $contentType,
+                    'supported_types' => ['application/json', 'application/x-www-form-urlencoded'],
+                    'headers' => $headers
+                ]);
                 return false;
             }
 
-            // Валидация JSON тела запроса
-            $data = json_decode($body, true);
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                $this->logger->error('Invalid JSON in webhook body', ['error' => json_last_error_msg(), 'body' => $body]);
+            // Проверка токена приложения
+            $expectedToken = $this->config['bitrix24']['application_token'];
+            $receivedToken = $data['auth']['application_token'] ?? '';
+
+            if (!empty($expectedToken) && $receivedToken !== $expectedToken) {
+                $this->logger->error('Invalid application token in webhook request', [
+                    'expected_token' => substr($expectedToken, 0, 8) . '...', // Логируем только начало токена
+                    'received_token' => substr($receivedToken, 0, 8) . '...',
+                    'auth_data' => $data['auth'] ?? []
+                ]);
                 return false;
             }
 
-            $this->logger->debug('Webhook request validated successfully');
+            $this->logger->debug('Webhook request validated successfully', [
+                'content_type' => $contentType,
+                'format' => str_contains($contentType, 'json') ? 'json' : 'url-encoded',
+                'data_keys' => array_keys($data),
+                'application_token_valid' => !empty($expectedToken) ? 'checked' : 'not_configured'
+            ]);
             return $data;
 
         } catch (Exception $e) {
             $this->logger->error('Error validating webhook request', [
                 'error' => $e->getMessage(),
-                'headers' => $headers
+                'headers' => $headers,
+                'body_length' => strlen($body)
             ]);
             return false;
         }
     }
 
+
     /**
      * Получение данных сущности по ID через API
+     * Использует только основные поля из конфига маппинга
      */
     public function getEntityData($entityType, $entityId)
     {
+        $this->logger->info('Starting entity data retrieval from Bitrix24 API', [
+            'entity_type' => $entityType,
+            'entity_id' => $entityId
+        ]);
+
         $method = $this->getApiMethodForEntity($entityType, 'get');
 
         if (!$method) {
@@ -65,9 +120,36 @@ class Bitrix24API
             return false;
         }
 
+        // Получаем список полей для выборки из конфига маппинга
+        $selectFields = $this->getMappedFieldsForEntity($entityType);
         $params = ['id' => $entityId];
 
-        return $this->makeApiCall($method, $params);
+        if (!empty($selectFields)) {
+            $params['select'] = $selectFields;
+            $this->logger->debug('Using mapped fields for entity data retrieval', [
+                'entity_type' => $entityType,
+                'select_fields' => $selectFields
+            ]);
+        }
+
+        $result = $this->makeApiCall($method, $params);
+
+        if ($result && isset($result['result'])) {
+            $this->logger->info('Successfully retrieved entity data from Bitrix24 API', [
+                'entity_type' => $entityType,
+                'entity_id' => $entityId,
+                'has_data' => true,
+                'selected_fields_count' => count($selectFields)
+            ]);
+        } else {
+            $this->logger->warning('Failed to retrieve entity data from Bitrix24 API', [
+                'entity_type' => $entityType,
+                'entity_id' => $entityId,
+                'result_type' => gettype($result)
+            ]);
+        }
+
+        return $result;
     }
 
     /**
@@ -234,6 +316,48 @@ class Bitrix24API
         ];
 
         return $methods[$entityType][$action] ?? false;
+    }
+
+    /**
+     * Получение списка полей для выборки из конфига маппинга
+     */
+    private function getMappedFieldsForEntity($entityType)
+    {
+        $mapping = $this->config['field_mapping'][$entityType] ?? [];
+
+        if (empty($mapping)) {
+            $this->logger->debug('No field mapping found for entity type', [
+                'entity_type' => $entityType
+            ]);
+            return [];
+        }
+
+        // Собираем все поля из маппинга, кроме служебных (lk_client_values)
+        $fields = [];
+        foreach ($mapping as $key => $value) {
+            // Пропускаем служебные поля
+            if ($key === 'lk_client_values') {
+                continue;
+            }
+
+            // Добавляем значения полей (они содержат коды полей Битрикс24)
+            if (is_string($value) && !empty($value)) {
+                $fields[] = $value;
+            }
+        }
+
+        // Добавляем базовые поля ID для всех сущностей
+        if (!in_array('ID', $fields)) {
+            $fields[] = 'ID';
+        }
+
+        $this->logger->debug('Extracted mapped fields for entity', [
+            'entity_type' => $entityType,
+            'mapped_fields' => $fields,
+            'mapping_keys' => array_keys($mapping)
+        ]);
+
+        return array_unique($fields);
     }
 
     /**

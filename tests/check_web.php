@@ -89,7 +89,7 @@ echo "<h2>6. Рекомендации</h2>";
 echo "<ul>";
 
 if (!$configExists) {
-    echo "<li><span class='warning'>Создайте файл .env на основе env.example</span></li>";
+    echo "<li><span class='warning'>Создайте файл .env на основе .env.example</span></li>";
 }
 
 if (!$webhookExecutable) {
@@ -103,7 +103,7 @@ echo "</ul>";
 
 // Ссылка на веб-интерфейс
 echo "<hr>";
-echo "<p><a href='index.php' class='success' style='text-decoration: none; font-size: 18px;'>";
+echo "<p><a href='../index.php' class='success' style='text-decoration: none; font-size: 18px;'>";
 echo "🌐 Открыть веб-интерфейс интеграции";
 echo "</a></p>";
 
