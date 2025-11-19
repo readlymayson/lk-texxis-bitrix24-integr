@@ -1,0 +1,54 @@
+# Логи
+logs/
+*.log
+src/logs/
+
+# Файлы окружения
+.env
+.env.*
+!.env.example
+
+# Временные файлы
+*.tmp
+*.temp
+*~
+
+# Директория с зависимостями Composer
+vendor/
+
+# Файлы IDE и редакторов
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Операционная система
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Архивы и бэкапы
+*.zip
+*.tar.gz
+*.rar
+*.7z
+*.bak
+
+# Сессии PHP
+session.save_path/
+
+# Кэш
+cache/
+tmp/
+
+# Документация (если генерируется автоматически)
+docs/generated/
+
+# Тестовые файлы
+test-*.php
+test-webhook.json
