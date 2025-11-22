@@ -24,7 +24,10 @@ $bitrixData = [
     'contact' => null,
     'company' => null,
     'deals' => [],
-    'projects' => []
+    'projects' => [],
+    'managers' => [],
+    'contacts' => [],
+    'companies' => []
 ];
 $availableContacts = [];
 
@@ -57,6 +60,12 @@ try {
         $bitrixData['deals'] = array_filter($allDeals, function($deal) use ($lastContact) {
             return $deal['contact_id'] == $lastContact['bitrix_id'];
         });
+
+        // Получаем все проекты, менеджеров, контакты и компании для отображения
+        $bitrixData['projects'] = $localStorage->getAllProjects();
+        $bitrixData['managers'] = $localStorage->getAllManagers();
+        $bitrixData['contacts'] = $localStorage->getAllContacts();
+        $bitrixData['companies'] = $localStorage->getAllCompanies();
     }
 } catch (Exception $e) {
     $logger->error('Error loading last contact data', ['error' => $e->getMessage()]);
@@ -89,6 +98,12 @@ if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST' &
         $bitrixData['deals'] = array_filter($allDeals, function($deal) use ($selectedContact) {
             return $deal['contact_id'] == $selectedContact['bitrix_id'];
         });
+
+        // Получаем все проекты, менеджеров, контакты и компании для отображения
+        $bitrixData['projects'] = $localStorage->getAllProjects();
+        $bitrixData['managers'] = $localStorage->getAllManagers();
+        $bitrixData['contacts'] = $localStorage->getAllContacts();
+        $bitrixData['companies'] = $localStorage->getAllCompanies();
     }
 }
 
@@ -166,6 +181,34 @@ function getProjectStageColor($stageId) {
         'DT123_1:COMPLETED' => 'success'
     ];
     return $colors[$stageId] ?? 'secondary';
+}
+
+/**
+ * Получение цвета для статуса проекта
+ */
+function getProjectStatusColor($status) {
+    $colors = [
+        'DT123_1:NEW' => 'primary',
+        'DT123_1:PREPARATION' => 'info',
+        'DT123_1:EXECUTING' => 'warning',
+        'DT123_1:COMPLETED' => 'success',
+        'DT123_1:CANCELLED' => 'danger'
+    ];
+    return $colors[$status] ?? 'secondary';
+}
+
+/**
+ * Получение текста для статуса проекта
+ */
+function getProjectStatusText($status) {
+    $texts = [
+        'DT123_1:NEW' => 'Новый',
+        'DT123_1:PREPARATION' => 'Подготовка',
+        'DT123_1:EXECUTING' => 'Выполнение',
+        'DT123_1:COMPLETED' => 'Завершен',
+        'DT123_1:CANCELLED' => 'Отменен'
+    ];
+    return $texts[$status] ?? $status;
 }
 
 /**
@@ -248,6 +291,58 @@ function getProjectStageText($stageId) {
                                 </div>
                             </form>
                         <?php endif; ?>
+
+                        <!-- Информация о системе привязки -->
+                        <div class="alert alert-info mt-3">
+                            <h5><i class="fas fa-info-circle me-2"></i>Система привязки к личным кабинетам</h5>
+                            <div class="row">
+                                <div class="col-md-4">
+                                    <h6><i class="fas fa-user me-1"></i>Контакты</h6>
+                                    <small class="text-muted">
+                                        Сохраняются локально по bitrix_id<br>
+                                        Создание только при наличии поля UF_CRM_1763468430<br>
+                                        Автоматически подтягиваются связанные компании и проекты
+                                    </small>
+                                </div>
+                                <div class="col-md-4">
+                                    <h6><i class="fas fa-building me-1"></i>Компании</h6>
+                                    <small class="text-muted">
+                                        Сохраняются локально по bitrix_id<br>
+                                        Привязываются к контактам через CONTACT_ID<br>
+                                        Обрабатываются только если CONTACT_ID указан<br>
+                                        и соответствует существующему контакту
+                                    </small>
+                                </div>
+                                <div class="col-md-4">
+                                    <h6><i class="fas fa-project-diagram me-1"></i>Проекты</h6>
+                                    <small class="text-muted">
+                                        Сохраняются локально по bitrix_id<br>
+                                        Привязываются к клиентам через contactId<br>
+                                        Обрабатываются только при наличии контакта
+                                    </small>
+                                </div>
+                            </div>
+                            <hr>
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <h6><i class="fas fa-database me-1"></i>Текущая статистика</h6>
+                                    <ul class="list-unstyled mb-0 small">
+                                        <li><strong>Контактов:</strong> <?php echo count($bitrixData['contacts'] ?? []); ?> (локально)</li>
+                                        <li><strong>Компаний:</strong> <?php echo count($bitrixData['companies'] ?? []); ?> (связаны с контактами)</li>
+                                        <li><strong>Проектов:</strong> <?php echo count($bitrixData['projects'] ?? []); ?> (по клиентам)</li>
+                                        <li><strong>Менеджеров:</strong> <?php echo count($bitrixData['managers'] ?? []); ?> (справочно)</li>
+                                    </ul>
+                                </div>
+                                <div class="col-md-6">
+                                    <h6><i class="fas fa-cogs me-1"></i>Настройки интеграции</h6>
+                                    <ul class="list-unstyled mb-0 small">
+                                        <li><strong>Smart Process ID:</strong> <?php echo htmlspecialchars($config['bitrix24']['smart_process_id'] ?? 'не указан'); ?></li>
+                                        <li><strong>Webhook URL:</strong> <?php echo htmlspecialchars($config['bitrix24']['webhook_url'] ?? 'не настроен'); ?></li>
+                                        <li><strong>Логирование:</strong> <?php echo ($config['logging']['enabled'] ?? true) ? 'включено' : 'отключено'; ?></li>
+                                    </ul>
+                                </div>
+                            </div>
+                        </div>
 
                         <!-- Информация о текущих данных -->
                         <?php if ($hasBitrixData && $userData): ?>
@@ -381,6 +476,73 @@ function getProjectStageText($stageId) {
                             <tr><th>Создан:</th><td><?php echo formatBitrixDate($bitrixData['company']['DATE_CREATE'] ?? 'Неизвестно'); ?></td></tr>
                         </table>
                     </div>
+                </div>
+            </div>
+        </div>
+        <?php endif; ?>
+
+        <!-- Проекты -->
+        <?php if (!empty($bitrixData['projects'])): ?>
+        <div class="card mb-4">
+            <div class="profile-header card-header">
+                <h4 class="mb-0"><i class="fas fa-project-diagram me-2"></i>Проекты (Smart Processes)</h4>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover data-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Организация</th>
+                                <th>Объект</th>
+                                <th>Тип системы</th>
+                                <th>Местонахождение</th>
+                                <th>Дата реализации</th>
+                                <th>Статус</th>
+                                <th>Клиент</th>
+                                <th>Менеджер</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($bitrixData['projects'] as $project): ?>
+                            <tr>
+                                <td><?php echo htmlspecialchars($project['bitrix_id']); ?></td>
+                                <td><?php echo htmlspecialchars($project['organization_name']); ?></td>
+                                <td><?php echo htmlspecialchars($project['object_name']); ?></td>
+                                <td><?php echo htmlspecialchars($project['system_type']); ?></td>
+                                <td><?php echo htmlspecialchars($project['location']); ?></td>
+                                <td><?php echo $project['implementation_date'] ? formatBitrixDate($project['implementation_date']) : '-'; ?></td>
+                                <td><span class="badge bg-<?php echo getProjectStatusColor($project['status']); ?>"><?php echo getProjectStatusText($project['status']); ?></span></td>
+                                <td>
+                                    <?php
+                                    $client = isset($bitrixData['contacts'][$project['client_id']]) ? $bitrixData['contacts'][$project['client_id']] : null;
+                                    if ($client):
+                                        echo htmlspecialchars($client['name'] . ' ' . $client['last_name']);
+                                        if (!empty($client['email'])):
+                                            echo '<br><small class="text-muted">' . htmlspecialchars($client['email']) . '</small>';
+                                        endif;
+                                    else:
+                                        echo '-';
+                                    endif;
+                                    ?>
+                                </td>
+                                <td>
+                                    <?php
+                                    $manager = isset($bitrixData['managers'][$project['manager_id']]) ? $bitrixData['managers'][$project['manager_id']] : null;
+                                    if ($manager):
+                                        echo htmlspecialchars($manager['name'] . ' ' . $manager['last_name']);
+                                        if (!empty($manager['position'])):
+                                            echo '<br><small class="text-muted">' . htmlspecialchars($manager['position']) . '</small>';
+                                        endif;
+                                    else:
+                                        echo '-';
+                                    endif;
+                                    ?>
+                                </td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>

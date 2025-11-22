@@ -12,6 +12,8 @@ class LocalStorage
     private $contactsFile;
     private $companiesFile;
     private $dealsFile;
+    private $projectsFile; // ДОБАВИТЬ ДЛЯ ПРОЕКТОВ
+    private $managersFile; // ДОБАВИТЬ ДЛЯ МЕНЕДЖЕРОВ
 
     public function __construct($logger)
     {
@@ -20,6 +22,8 @@ class LocalStorage
         $this->contactsFile = $this->dataDir . '/contacts.json';
         $this->companiesFile = $this->dataDir . '/companies.json';
         $this->dealsFile = $this->dataDir . '/deals.json';
+        $this->projectsFile = $this->dataDir . '/projects.json'; // ДОБАВИТЬ
+        $this->managersFile = $this->dataDir . '/managers.json'; // ДОБАВИТЬ
 
         $this->ensureDataDirectory();
     }
@@ -132,11 +136,10 @@ class LocalStorage
     /**
      * Синхронизация данных контакта
      */
-    public function syncContact($lkId, $contactData)
+    public function syncContactByBitrixId($bitrixId, $contactData)
     {
-        $this->logger->info('Syncing contact data locally - START', [
-            'lk_id' => $lkId,
-            'contact_id' => $contactData['ID'],
+        $this->logger->info('Syncing contact data locally by bitrix_id - START', [
+            'contact_bitrix_id' => $bitrixId,
             'contact_name' => $contactData['NAME'] ?? 'N/A',
             'contact_last_name' => $contactData['LAST_NAME'] ?? 'N/A'
         ]);
@@ -207,9 +210,9 @@ class LocalStorage
     /**
      * Синхронизация данных компании
      */
-    public function syncCompany($lkId, $companyData)
+    public function syncCompanyByBitrixId($bitrixId, $companyData)
     {
-        $this->logger->info('Syncing company data locally', ['lk_id' => $lkId, 'company_id' => $companyData['ID']]);
+        $this->logger->info('Syncing company data locally by bitrix_id', ['company_bitrix_id' => $bitrixId, 'company_title' => $companyData['TITLE'] ?? 'N/A']);
 
         $companies = $this->readData($this->companiesFile);
 
@@ -358,6 +361,99 @@ class LocalStorage
         $this->writeData($this->dealsFile, $deals);
 
         $this->logger->info('Deal data stored locally', ['deal_id' => $dealData['ID']]);
+
+        return true;
+    }
+
+    /**
+     * Получение всех проектов
+     */
+    public function getAllProjects()
+    {
+        return $this->readData($this->projectsFile);
+    }
+
+    /**
+     * Получение проекта по ID
+     */
+    public function getProject($projectId)
+    {
+        $projects = $this->readData($this->projectsFile);
+        return $projects[$projectId] ?? null;
+    }
+
+    /**
+     * Добавление/обновление проекта
+     */
+    public function addProject($projectData)
+    {
+        $projects = $this->readData($this->projectsFile);
+
+        $projectId = $projectData['bitrix_id'] ?? $projectData['id'] ?? $projectData['ID'] ?? null;
+
+        $projects[$projectId] = [
+            'bitrix_id' => $projectId,
+            'organization_name' => $projectData['organization_name'] ?? '',
+            'object_name' => $projectData['object_name'] ?? '',
+            'system_type' => $projectData['system_type'] ?? '',
+            'location' => $projectData['location'] ?? '',
+            'implementation_date' => $projectData['implementation_date'] ?? null,
+            'status' => $projectData['status'] ?? '',
+            'client_id' => $projectData['client_id'] ?? null,
+            'manager_id' => $projectData['manager_id'] ?? null,
+            'lk_id' => $projectData['lk_id'] ?? null,
+            'created_at' => $projectData['created_at'] ?? $projectData['DATE_CREATE'] ?? date('Y-m-d H:i:s'),
+            'updated_at' => $projectData['updated_at'] ?? $projectData['DATE_MODIFY'] ?? date('Y-m-d H:i:s'),
+            'source' => 'bitrix24_webhook'
+        ];
+
+        $this->writeData($this->projectsFile, $projects);
+
+        $this->logger->info('Project data stored locally', ['project_id' => $projectId]);
+
+        return true;
+    }
+
+    /**
+     * Получение всех менеджеров
+     */
+    public function getAllManagers()
+    {
+        return $this->readData($this->managersFile);
+    }
+
+    /**
+     * Получение менеджера по ID
+     */
+    public function getManager($managerId)
+    {
+        $managers = $this->readData($this->managersFile);
+        return $managers[$managerId] ?? null;
+    }
+
+    /**
+     * Добавление/обновление менеджера
+     */
+    public function addManager($managerData)
+    {
+        $managers = $this->readData($this->managersFile);
+
+        $managers[$managerData['ID']] = [
+            'bitrix_id' => $managerData['ID'],
+            'name' => $managerData['name'] ?? '',
+            'last_name' => $managerData['last_name'] ?? '',
+            'email' => $managerData['email'] ?? '',
+            'phone' => $managerData['phone'] ?? '',
+            'position' => $managerData['position'] ?? '',
+            'photo' => $managerData['photo'] ?? '',
+            'created_at' => $managerData['created_at'] ?? date('Y-m-d H:i:s'),
+            'updated_at' => $managerData['updated_at'] ?? date('Y-m-d H:i:s'),
+            'source' => 'bitrix24_webhook'
+        ];
+
+        $this->writeData($this->managersFile, $managers);
+
+        $this->logger->info('Manager data stored locally', ['manager_id' => $managerData['ID']]);
 
         return true;
     }

@@ -53,16 +53,36 @@ else
     echo ✓ Файл src/data/deals.json уже существует
 fi
 
+if [ ! -f "src/data/projects.json" ]; then
+    echo '{}' > "src/data/projects.json"
+    echo ✓ Создан файл src/data/projects.json
+else
+    echo ✓ Файл src/data/projects.json уже существует
+fi
+
+if [ ! -f "src/data/managers.json" ]; then
+    echo '{}' > "src/data/managers.json"
+    echo ✓ Создан файл src/data/managers.json
+else
+    echo ✓ Файл src/data/managers.json уже существует
+fi
+
 # Установка прав доступа
 echo Установка прав доступа...
 chmod 755 src/webhooks/bitrix24.php 2>/dev/null
 chmod 666 src/data/contacts.json 2>/dev/null
 chmod 666 src/data/companies.json 2>/dev/null
 chmod 666 src/data/deals.json 2>/dev/null
+chmod 666 src/data/projects.json 2>/dev/null
+chmod 666 src/data/managers.json 2>/dev/null
 chmod 755 src/data 2>/dev/null
 chmod 755 src/logs 2>/dev/null
 
-if [ -f "src/data/contacts.json" ] && [ -w "src/data/contacts.json" ]; then
+if [ -f "src/data/contacts.json" ] && [ -w "src/data/contacts.json" ] && \
+   [ -f "src/data/companies.json" ] && [ -w "src/data/companies.json" ] && \
+   [ -f "src/data/deals.json" ] && [ -w "src/data/deals.json" ] && \
+   [ -f "src/data/projects.json" ] && [ -w "src/data/projects.json" ] && \
+   [ -f "src/data/managers.json" ] && [ -w "src/data/managers.json" ]; then
     echo ✓ Права доступа установлены корректно
 else
     echo ✗ Проблема с правами доступа к файлам данных!

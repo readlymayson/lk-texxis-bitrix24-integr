@@ -107,6 +107,18 @@ try {
     $eventName = $webhookData['event'] ?? '';
     $entityId = $webhookData['data']['FIELDS']['ID'] ?? $webhookData['data']['ID'] ?? null;
 
+    // Временная отладка для смарт-процессов
+    if (str_contains($eventName, 'DYNAMICITEM')) {
+        $logger->info('=== SMART PROCESS EVENT DEBUG ===', [
+            'event_name' => $eventName,
+            'entity_id' => $entityId,
+            'entity_type_determined' => $bitrixAPI->getEntityTypeFromEvent($eventName),
+            'smart_process_id_config' => $config['bitrix24']['smart_process_id'] ?? 'NOT_SET',
+            'php_version' => PHP_VERSION,
+            'timestamp' => date('Y-m-d H:i:s')
+        ]);
+    }
+
     if (empty($eventName)) {
         $logger->error('Missing event name in webhook data', [
             'webhook_data_keys' => array_keys($webhookData)
@@ -260,6 +272,18 @@ function processEvent($eventName, $webhookData, $bitrixAPI, $localStorage, $logg
     $entityType = $bitrixAPI->getEntityTypeFromEvent($eventName);
     $entityId = $webhookData['data']['FIELDS']['ID'] ?? $webhookData['data']['ID'] ?? null;
 
+    // Отладка для смарт-процессов
+    if (str_contains($eventName, 'DYNAMICITEM')) {
+        $logger->info('=== PROCESS EVENT DEBUG ===', [
+            'event' => $eventName,
+            'entity_type_result' => $entityType,
+            'entity_id' => $entityId,
+            'webhook_data_keys' => array_keys($webhookData),
+            'data_keys' => isset($webhookData['data']) ? array_keys($webhookData['data']) : [],
+            'fields_keys' => isset($webhookData['data']['FIELDS']) ? array_keys($webhookData['data']['FIELDS']) : []
+        ]);
+    }
+
     if (!$entityType || !$entityId) {
         $logger->error('Cannot determine entity type or ID', [
             'event' => $eventName,
@@ -285,7 +309,33 @@ function processEvent($eventName, $webhookData, $bitrixAPI, $localStorage, $logg
         return false;
     }
 
-    $entityData = $entityData['result'];
+    // Обработка структуры ответа API для разных типов сущностей
+    if ($entityType === 'smart_process') {
+        // Для смарт-процессов данные могут быть в result.item или напрямую в result
+        $logger->debug('Processing smart process entity data structure', [
+            'original_structure' => array_keys($entityData),
+            'has_result_item' => isset($entityData['result']['item']),
+            'has_result_array' => isset($entityData['result']) && is_array($entityData['result']),
+            'result_keys' => isset($entityData['result']) ? array_keys($entityData['result']) : []
+        ]);
+
+        if (isset($entityData['result']['item'])) {
+            $entityData = $entityData['result']['item'];
+            $logger->debug('Using result.item for smart process data');
+        } elseif (isset($entityData['result']) && is_array($entityData['result'])) {
+            $entityData = $entityData['result'];
+            $logger->debug('Using result array for smart process data');
+        } else {
+            $logger->error('Unexpected smart process data structure', [
+                'entity_type' => $entityType,
+                'entity_id' => $entityId,
+                'data_keys' => array_keys($entityData)
+            ]);
+            return false;
+        }
+    } else {
+        $entityData = $entityData['result'];
+    }
 
     // Определение действия на основе события
     $action = getActionFromEvent($eventName);
@@ -319,7 +369,12 @@ function handleCreate($entityType, $entityData, $localStorage, $logger, $config)
             // Проверяем, нужно ли создавать ЛК для этого контакта
             if (isValidLKClientValue('contact', $entityData, $config, $logger)) {
                 $logger->info('Creating LK for new contact with valid LK client field', ['contact_id' => $entityData['ID']]);
-                return $localStorage->createLK($entityData);
+                $result = $localStorage->createLK($entityData);
+                if ($result) {
+                    // После создания ЛК, подтягиваем связанные компании
+                    syncRelatedCompaniesForContact($entityData['ID'], $bitrixAPI, $localStorage, $config, $logger);
+                }
+                return $result;
             } else {
                 $logger->info('Skipping LK creation for new contact - invalid LK client field value', ['contact_id' => $entityData['ID']]);
             }
@@ -333,6 +388,32 @@ function handleCreate($entityType, $entityData, $localStorage, $logger, $config)
         case 'smart_process':
             // Обработка создания смарт-процесса (проекта)
             $logger->info('New smart process created', ['process_id' => $entityData['ID']]);
+            // Синхронизировать проект в локальном хранилище
+            $localStorage->addProject($entityData);
+            // Получить данные менеджера, если указан
+            if (!empty($entityData['ASSIGNED_BY_ID'])) {
+                $managerData = $bitrixAPI->getEntityData('user', $entityData['ASSIGNED_BY_ID']);
+                if ($managerData && isset($managerData['result'])) {
+                    $localStorage->addManager($managerData['result']);
+                }
+            }
+            // Синхронизировать проект через клиента (если указан клиент)
+            $mapping = $config['field_mapping']['smart_process'];
+            $clientId = $entityData[$mapping['client_id']] ?? null;
+            if (!empty($clientId)) {
+                // Проверить, существует ли контакт с таким bitrix_id
+                $existingContact = $localStorage->getContact($clientId);
+                if ($existingContact) {
+                    require_once __DIR__ . '/../classes/LKAPI.php';
+                    $lkApi = new LKAPI($config, $logger);
+                    $lkApi->syncProjectByClient($clientId, $entityData);
+                } else {
+                    $logger->warning('Client not found in local storage, cannot sync project', [
+                        'project_id' => $entityData['ID'],
+                        'client_id' => $clientId
+                    ]);
+                }
+            }
             break;
     }
 
@@ -355,7 +436,7 @@ function handleUpdate($entityType, $entityData, $localStorage, $bitrixAPI, $logg
             return handleDealUpdate($entityData, $localStorage, $logger, $config);
 
         case 'smart_process':
-            return handleSmartProcessUpdate($entityData, $localStorage, $logger, $config);
+            return handleSmartProcessUpdate($entityData, $localStorage, $bitrixAPI, $logger, $config);
     }
 
     return true;
@@ -386,7 +467,7 @@ function handleContactUpdate($contactData, $localStorage, $bitrixAPI, $logger, $
                 'contact_id' => $contactId,
                 'lk_id' => $existingContact['id']
             ]);
-            return $localStorage->syncContact($existingContact['id'], $contactData);
+            return $localStorage->syncContactByBitrixId($contactId, $contactData);
         } else {
             $logger->info('Skipping contact update - invalid LK client field value', [
                 'contact_id' => $contactId,
@@ -398,7 +479,12 @@ function handleContactUpdate($contactData, $localStorage, $bitrixAPI, $logger, $
         // Контакт не найден - проверяем, нужно ли создавать ЛК
         if (isValidLKClientValue('contact', $contactData, $config, $logger)) {
             $logger->info('Creating new LK with full data from Bitrix24 - valid LK client field', ['contact_id' => $contactId]);
-            return $localStorage->createLK($contactData);
+            $result = $localStorage->createLK($contactData);
+            if ($result) {
+                // После создания ЛК, подтягиваем связанные компании
+                syncRelatedCompaniesForContact($contactId, $bitrixAPI, $localStorage, $config, $logger);
+            }
+            return $result;
         } else {
             $logger->info('Skipping LK creation for contact update - invalid LK client field value', ['contact_id' => $contactId]);
             return true; // Не считаем это ошибкой, просто пропускаем создание
@@ -429,9 +515,51 @@ function handleCompanyUpdate($companyData, $localStorage, $bitrixAPI, $logger, $
             'title' => $fullCompanyData['TITLE'] ?? 'N/A'
         ]);
 
-        // Синхронизируем данные компании
-        $logger->info('Syncing company data to local storage', ['company_id' => $companyId]);
-        return $localStorage->syncCompany(null, $fullCompanyData);
+        // Определяем, к какому ЛК привязать компанию
+        $contactId = $fullCompanyData['CONTACT_ID'] ?? null;
+
+        if (!empty($contactId)) {
+            // Компания привязана к контакту - проверяем, существует ли контакт с ЛК
+            $existingContact = $localStorage->getContact($contactId);
+            if ($existingContact) {
+                $logger->info('Syncing company to contact LK', [
+                    'company_id' => $companyId,
+                    'company_title' => $fullCompanyData['TITLE'] ?? 'N/A',
+                    'contact_id' => $contactId,
+                    'contact_name' => $existingContact['name'] . ' ' . $existingContact['last_name']
+                ]);
+
+                // Создать экземпляр LKAPI для синхронизации
+                require_once __DIR__ . '/../classes/LKAPI.php';
+                $lkApi = new LKAPI($config, $logger);
+
+                $result = $lkApi->syncCompanyByBitrixId($companyId, $fullCompanyData);
+                if (!$result) {
+                    $logger->error('Failed to sync company to contact LK', [
+                        'company_id' => $companyId,
+                        'contact_id' => $contactId
+                    ]);
+                    return false;
+                }
+            } else {
+                $logger->warning('Company contact not found in local storage, skipping company processing', [
+                    'company_id' => $companyId,
+                    'contact_id' => $contactId,
+                    'reason' => 'Contact does not exist or has no LK'
+                ]);
+                return true; // Не считаем это ошибкой, просто пропускаем
+            }
+        } else {
+            // Компания не имеет основного контакта - пропускаем обработку
+            $logger->info('Skipping company processing - no primary contact specified', [
+                'company_id' => $companyId,
+                'company_title' => $fullCompanyData['TITLE'] ?? 'N/A',
+                'reason' => 'No CONTACT_ID field'
+            ]);
+            return true; // Не считаем это ошибкой, просто пропускаем
+        }
+
+        return true;
 
     } catch (Exception $e) {
         $logger->error('Error fetching company data from Bitrix24 API', [
@@ -461,16 +589,79 @@ function handleDealUpdate($dealData, $localStorage, $logger, $config)
 /**
  * Обработка обновления смарт-процесса
  */
-function handleSmartProcessUpdate($processData, $localStorage, $logger, $config)
+function handleSmartProcessUpdate($processData, $localStorage, $bitrixAPI, $logger, $config)
 {
-    // Синхронизация данных проекта в ЛК
+    // Отладка: проверяем структуру данных
+    $logger->debug('handleSmartProcessUpdate called with data', [
+        'process_data_keys' => array_keys($processData),
+        'has_id' => isset($processData['id']) || isset($processData['ID']),
+        'id_value' => $processData['id'] ?? $processData['ID'] ?? 'NOT_SET',
+        'title' => $processData['title'] ?? $processData['TITLE'] ?? 'NOT_SET'
+    ]);
+
+    // Маппируем данные проекта
+    require_once __DIR__ . '/../classes/LKAPI.php';
+    $lkApi = new LKAPI($config, $logger);
+    $mappedProjectData = $lkApi->mapProjectFields($processData);
+
+    // Обработка обновления смарт-процесса (проекта)
     $logger->info('Smart process updated', [
-        'process_id' => $processData['ID'],
+        'process_id' => $mappedProjectData['bitrix_id'] ?? 'NULL_ID',
         'entity_type' => $processData['ENTITY_TYPE'] ?? 'unknown'
     ]);
 
-    // Определяем, связан ли этот процесс с каким-то ЛК
-    // Логика зависит от структуры данных проекта
+    // Синхронизировать проект в локальном хранилище
+    $logger->debug('Adding project to local storage', [
+        'project_id' => $mappedProjectData['bitrix_id'],
+        'client_id' => $mappedProjectData['client_id'],
+        'organization_name' => $mappedProjectData['organization_name']
+    ]);
+    $localStorage->addProject($mappedProjectData);
+
+    // Получить данные менеджера, если указан
+    if (!empty($processData['ASSIGNED_BY_ID'])) {
+        $managerData = $bitrixAPI->getEntityData('user', $processData['ASSIGNED_BY_ID']);
+        if ($managerData && isset($managerData['result'])) {
+            $localStorage->addManager($managerData['result']);
+        }
+    }
+
+    // Синхронизировать проект через клиента (если указан клиент)
+    $mapping = $config['field_mapping']['smart_process'];
+    $clientId = $processData[$mapping['client_id']] ?? null;
+
+    if (!empty($clientId)) {
+        // Проверить, существует ли контакт с таким bitrix_id
+        $existingContact = $localStorage->getContact($clientId);
+
+        if ($existingContact) {
+            $logger->info('Syncing project by existing client', [
+                'project_id' => $mappedProjectData['bitrix_id'],
+                'client_id' => $clientId,
+                'client_name' => $existingContact['name'] . ' ' . $existingContact['last_name']
+            ]);
+
+            $result = $lkApi->syncProjectByClient($clientId, $mappedProjectData);
+            if (!$result) {
+                $logger->error('Failed to sync project by client', [
+                    'project_id' => $mappedProjectData['bitrix_id'],
+                    'client_id' => $clientId
+                ]);
+                return false;
+            }
+        } else {
+            $logger->warning('Client not found in local storage, cannot sync project', [
+                'project_id' => $mappedProjectData['bitrix_id'],
+                'client_id' => $clientId,
+                'client_field' => $mapping['client_id']
+            ]);
+        }
+    } else {
+        $logger->warning('No client linked to project', [
+            'project_id' => $processData['ID'],
+            'client_field' => $mapping['client_id']
+        ]);
+    }
 
     return true;
 }
@@ -555,6 +746,175 @@ function getRequestHeaders()
     }
 
     return $headers;
+}
+
+/**
+ * Синхронизация связанных компаний для контакта
+ */
+function syncRelatedCompaniesForContact($contactId, $bitrixAPI, $localStorage, $config, $logger)
+{
+    $logger->info('Checking for related companies for contact', ['contact_id' => $contactId]);
+
+    try {
+        // Ищем компании, где текущий контакт указан как CONTACT_ID
+        $companies = $bitrixAPI->getEntityList('company', [
+            'filter' => ['CONTACT_ID' => $contactId]
+        ]);
+
+        if ($companies && isset($companies['result'])) {
+            $companyList = $companies['result'];
+            $logger->info('Found related companies for contact', [
+                'contact_id' => $contactId,
+                'companies_count' => count($companyList)
+            ]);
+
+            foreach ($companyList as $company) {
+                $companyId = $company['ID'];
+                $logger->info('Processing related company', [
+                    'company_id' => $companyId,
+                    'company_title' => $company['TITLE'] ?? 'N/A',
+                    'contact_id' => $contactId
+                ]);
+
+                // Получаем полные данные компании
+                $fullCompanyData = $bitrixAPI->getEntityData('company', $companyId);
+                if ($fullCompanyData && isset($fullCompanyData['result'])) {
+                    $companyData = $fullCompanyData['result'];
+
+                    // Проверяем, что CONTACT_ID все еще указывает на наш контакт
+                    if (($companyData['CONTACT_ID'] ?? null) === $contactId) {
+                        $logger->info('Syncing related company to contact LK', [
+                            'company_id' => $companyId,
+                            'company_title' => $companyData['TITLE'] ?? 'N/A',
+                            'contact_id' => $contactId
+                        ]);
+
+                        // Создать экземпляр LKAPI для синхронизации
+                        require_once __DIR__ . '/../classes/LKAPI.php';
+                        $lkApi = new LKAPI($config, $logger);
+
+                        $syncResult = $lkApi->syncCompanyByBitrixId($companyId, $companyData);
+                        if (!$syncResult) {
+                            $logger->error('Failed to sync related company', [
+                                'company_id' => $companyId,
+                                'contact_id' => $contactId
+                            ]);
+                        }
+                    } else {
+                        $logger->warning('Company CONTACT_ID changed, skipping', [
+                            'company_id' => $companyId,
+                            'expected_contact_id' => $contactId,
+                            'actual_contact_id' => $companyData['CONTACT_ID'] ?? null
+                        ]);
+                    }
+                } else {
+                    $logger->error('Failed to get company data from Bitrix24 API', [
+                        'company_id' => $companyId,
+                        'contact_id' => $contactId
+                    ]);
+                }
+            }
+        } else {
+            $logger->debug('No related companies found for contact', ['contact_id' => $contactId]);
+        }
+
+        // Ищем связанные проекты (смарт-процессы)
+        $logger->info('Checking for related projects for contact', ['contact_id' => $contactId]);
+
+        try {
+            $smartProcessId = $config['bitrix24']['smart_process_id'] ?? null;
+            if ($smartProcessId) {
+                // Ищем смарт-процессы, где текущий контакт указан как клиент
+                $projects = $bitrixAPI->getEntityList('smart_process', [
+                    'filter' => ['CONTACT_ID' => $contactId],
+                    'entityTypeId' => $smartProcessId
+                ]);
+
+                if ($projects && isset($projects['result'])) {
+                    $projectList = $projects['result'];
+                    $logger->info('Found related projects for contact', [
+                        'contact_id' => $contactId,
+                        'projects_count' => count($projectList)
+                    ]);
+
+                    foreach ($projectList as $project) {
+                        $projectId = $project['ID'] ?? null;
+
+                        // Пропускаем проекты без ID
+                        if (empty($projectId)) {
+                            $logger->warning('Skipping project without ID in list', [
+                                'contact_id' => $contactId,
+                                'project_data' => $project
+                            ]);
+                            continue;
+                        }
+
+                        $logger->info('Processing related project', [
+                            'project_id' => $projectId,
+                            'project_title' => $project['TITLE'] ?? 'N/A',
+                            'contact_id' => $contactId
+                        ]);
+
+                        // Получаем полные данные проекта
+                        $fullProjectData = $bitrixAPI->getEntityData('smart_process', $projectId);
+                        if ($fullProjectData && isset($fullProjectData['result'])) {
+                            $projectData = $fullProjectData['result'];
+
+                            // Проверяем, что CONTACT_ID все еще указывает на наш контакт
+                            $mapping = $config['field_mapping']['smart_process'];
+                            $projectContactId = $projectData[$mapping['client_id']] ?? null;
+
+                            if ($projectContactId === $contactId) {
+                                $logger->info('Syncing related project to contact LK', [
+                                    'project_id' => $projectId,
+                                    'project_title' => $projectData['TITLE'] ?? 'N/A',
+                                    'contact_id' => $contactId
+                                ]);
+
+                                // Создать экземпляр LKAPI для синхронизации
+                                require_once __DIR__ . '/../classes/LKAPI.php';
+                                $lkApi = new LKAPI($config, $logger);
+
+                                $syncResult = $lkApi->syncProjectByClient($contactId, $projectData);
+                                if (!$syncResult) {
+                                    $logger->error('Failed to sync related project', [
+                                        'project_id' => $projectId,
+                                        'contact_id' => $contactId
+                                    ]);
+                                }
+                            } else {
+                                $logger->warning('Project client changed, skipping', [
+                                    'project_id' => $projectId,
+                                    'expected_contact_id' => $contactId,
+                                    'actual_contact_id' => $projectContactId
+                                ]);
+                            }
+                        } else {
+                            $logger->error('Failed to get project data from Bitrix24 API', [
+                                'project_id' => $projectId,
+                                'contact_id' => $contactId
+                            ]);
+                        }
+                    }
+                } else {
+                    $logger->debug('No related projects found for contact', ['contact_id' => $contactId]);
+                }
+            } else {
+                $logger->warning('Smart process ID not configured, skipping project sync', ['contact_id' => $contactId]);
+            }
+        } catch (Exception $e) {
+            $logger->error('Error syncing related projects for contact', [
+                'contact_id' => $contactId,
+                'error' => $e->getMessage()
+            ]);
+        }
+
+    } catch (Exception $e) {
+        $logger->error('Error syncing related companies for contact', [
+            'contact_id' => $contactId,
+            'error' => $e->getMessage()
+        ]);
+    }
 }
 
 /**

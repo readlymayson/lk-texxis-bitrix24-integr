@@ -18,6 +18,7 @@ return [
         'client_id' => EnvLoader::get('BITRIX24_CLIENT_ID', ''),
         'client_secret' => EnvLoader::get('BITRIX24_CLIENT_SECRET', ''),
         'timeout' => EnvLoader::getInt('BITRIX24_TIMEOUT', 30), // Timeout для API запросов (секунды)
+        'smart_process_id' => 1036, // ID смарт-процесса для проектов
     ],
 
     // Настройки локального хранилища данных
@@ -27,6 +28,8 @@ return [
         'contacts_file' => __DIR__ . '/../data/contacts.json',
         'companies_file' => __DIR__ . '/../data/companies.json',
         'deals_file' => __DIR__ . '/../data/deals.json',
+        'projects_file' => __DIR__ . '/../data/projects.json', // ДОБАВИТЬ ДЛЯ ПРОЕКТОВ
+        'managers_file' => __DIR__ . '/../data/managers.json', // ДОБАВИТЬ ДЛЯ МЕНЕДЖЕРОВ
     ],
 
     // Настройки логирования
@@ -40,7 +43,7 @@ return [
     // Маппинг полей Битрикс24 -> ЛК
     'field_mapping' => [
         'contact' => [
-            'lk_client_field' => 'UF_CRM_1763468430', // Поле "ЛК клиента" в контакте
+            'lk_client_field' => 'UF_CRM_1763531846040', // (Заменить для боевого) Поле "ЛК клиента" в контакте
             'lk_client_values' => ['46','3118','3120','3122'], // Допустимые значения поля "ЛК клиента"
             'email' => 'EMAIL',
             'phone' => 'PHONE',
@@ -56,6 +59,24 @@ return [
             'title' => 'TITLE',
             'stage_id' => 'STAGE_ID',
         ],
+        // Маппинг полей проектов (смарт-процессов)
+        'smart_process' => [
+            'organization_name' => 'ufCrm6_1758957874',        // Название организации конечного заказчика
+            'object_name' => 'ufCrm6_1758958190',              // Название/тип объекта
+            'system_type' => 'ufCrm6_1758959081',              // Состав оборудования из спецификации проекта
+            'location' => 'ufCrm6_1758958310',                 // Адрес объекта
+            'implementation_date' => 'ufCrm6_1758959105',      // Дата реализации проекта
+            'status' => 'stageId',                             // Статус смарт-процесса
+            'client_id' => 'contactId',                         // Связь с клиентом (контактом)
+        ],
+        // ДОБАВИТЬ МАППИНГ МЕНЕДЖЕРОВ
+        'user' => [
+            'name' => 'NAME',
+            'last_name' => 'LAST_NAME',
+            'email' => 'EMAIL',
+            'phone' => 'PERSONAL_PHONE',
+            'position' => 'WORK_POSITION',
+        ],
     ],
 
     // Настройки обработки событий
@@ -70,6 +91,7 @@ return [
             'ONCRMDEALUPDATE',       // Изменение сделки
             'ONCRMDEALADD',          // Создание сделки
             'ONCRM_DYNAMIC_ITEM_UPDATE', // Изменение смарт-процесса
+            'ONCRM_DYNAMIC_ITEM_ADD',    // Создание смарт-процесса
         ],
 
         // Задержки между повторными попытками (секунды)

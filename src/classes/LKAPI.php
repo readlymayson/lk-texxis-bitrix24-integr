@@ -20,14 +20,19 @@ class LKAPI
      */
     public function createLK($contactData, $companyData = null)
     {
-        $this->logger->info('Creating personal account', [
+        $this->logger->info('Creating personal account locally', [
             'contact_id' => $contactData['ID'] ?? null,
             'company_id' => $companyData['ID'] ?? null
         ]);
 
-        $payload = $this->prepareLKData($contactData, $companyData);
+        // Локальная обработка - данные уже сохранены в LocalStorage
+        // Просто логируем успешное создание
+        $this->logger->info('Personal account created successfully', [
+            'contact_id' => $contactData['ID'] ?? null,
+            'contact_name' => ($contactData['NAME'] ?? '') . ' ' . ($contactData['LAST_NAME'] ?? '')
+        ]);
 
-        return $this->makeLKApiCall('lk/create', $payload);
+        return true;
     }
 
     /**
@@ -35,16 +40,19 @@ class LKAPI
      */
     public function updateLK($lkId, $contactData, $companyData = null)
     {
-        $this->logger->info('Updating personal account', [
+        $this->logger->info('Updating personal account locally', [
             'lk_id' => $lkId,
             'contact_id' => $contactData['ID'] ?? null,
             'company_id' => $companyData['ID'] ?? null
         ]);
 
-        $payload = $this->prepareLKData($contactData, $companyData);
-        $payload['lk_id'] = $lkId;
+        // Локальная обработка - данные уже обновлены в LocalStorage
+        $this->logger->info('Personal account updated successfully', [
+            'lk_id' => $lkId,
+            'contact_name' => ($contactData['NAME'] ?? '') . ' ' . ($contactData['LAST_NAME'] ?? '')
+        ]);
 
-        return $this->makeLKApiCall('lk/update', $payload);
+        return true;
     }
 
     /**
@@ -52,63 +60,105 @@ class LKAPI
      */
     public function deleteLK($lkId)
     {
-        $this->logger->info('Deleting personal account', ['lk_id' => $lkId]);
+        $this->logger->info('Deleting personal account locally', ['lk_id' => $lkId]);
 
-        return $this->makeLKApiCall('lk/delete', ['lk_id' => $lkId]);
+        // Локальная обработка - данные уже удалены из LocalStorage
+        $this->logger->info('Personal account deleted successfully', ['lk_id' => $lkId]);
+
+        return true;
     }
 
     /**
      * Синхронизация данных контакта в ЛК
      */
-    public function syncContact($lkId, $contactData)
+    public function syncContactByBitrixId($bitrixId, $contactData)
     {
-        $this->logger->info('Syncing contact data to LK', [
-            'lk_id' => $lkId,
-            'contact_id' => $contactData['ID'] ?? null
+        $this->logger->info('Syncing contact data locally by bitrix_id', [
+            'contact_bitrix_id' => $bitrixId,
+            'contact_name' => ($contactData['NAME'] ?? '') . ' ' . ($contactData['LAST_NAME'] ?? '')
         ]);
 
-        $payload = [
-            'lk_id' => $lkId,
-            'contact' => $this->mapContactFields($contactData)
-        ];
+        // Локальная обработка - данные уже сохранены в LocalStorage
+        $this->logger->info('Contact data synced successfully', [
+            'contact_bitrix_id' => $bitrixId,
+            'contact_name' => ($contactData['NAME'] ?? '') . ' ' . ($contactData['LAST_NAME'] ?? '')
+        ]);
 
-        return $this->makeLKApiCall('lk/sync/contact', $payload);
+        return true;
     }
 
     /**
      * Синхронизация данных компании в ЛК
      */
-    public function syncCompany($lkId, $companyData)
+    public function syncCompanyByBitrixId($bitrixId, $companyData)
     {
-        $this->logger->info('Syncing company data to LK', [
-            'lk_id' => $lkId,
-            'company_id' => $companyData['ID'] ?? null
+        $this->logger->info('Syncing company data locally by bitrix_id', [
+            'company_bitrix_id' => $bitrixId,
+            'company_title' => $companyData['TITLE'] ?? 'Unknown',
+            'contact_id' => $companyData['CONTACT_ID'] ?? null
         ]);
 
-        $payload = [
-            'lk_id' => $lkId,
-            'company' => $this->mapCompanyFields($companyData)
-        ];
+        // Локальная обработка - данные уже сохранены в LocalStorage
+        $this->logger->info('Company data synced successfully', [
+            'company_bitrix_id' => $bitrixId,
+            'company_title' => $companyData['TITLE'] ?? 'Unknown',
+            'linked_to_contact' => $companyData['CONTACT_ID'] ?? null
+        ]);
 
-        return $this->makeLKApiCall('lk/sync/company', $payload);
+        return true;
     }
 
     /**
      * Синхронизация данных проекта в ЛК
      */
-    public function syncProject($lkId, $projectData)
+    public function syncProjectByClient($clientId, $projectData)
     {
-        $this->logger->info('Syncing project data to LK', [
-            'lk_id' => $lkId,
-            'project_id' => $projectData['ID'] ?? null
+        $this->logger->info('Syncing project data locally by client (bitrix_id)', [
+            'client_bitrix_id' => $clientId,
+            'project_id' => $projectData['bitrix_id'] ?? null,
+            'project_title' => $projectData['organization_name'] ?? $projectData['TITLE'] ?? 'Unknown'
         ]);
 
-        $payload = [
-            'lk_id' => $lkId,
-            'project' => $this->mapProjectFields($projectData)
-        ];
+        // Локальная обработка - данные уже сохранены в LocalStorage
+        $this->logger->info('Project data synced successfully', [
+            'client_bitrix_id' => $clientId,
+            'project_id' => $projectData['bitrix_id'] ?? null,
+            'project_title' => $projectData['organization_name'] ?? $projectData['TITLE'] ?? 'Unknown'
+        ]);
 
-        return $this->makeLKApiCall('lk/sync/project', $payload);
+        return true;
+    }
+
+    /**
+     * Синхронизация данных менеджера в ЛК
+     */
+    public function syncManager($managerData)
+    {
+        $this->logger->info('Syncing manager data locally', [
+            'manager_id' => $managerData['ID'] ?? null,
+            'manager_name' => ($managerData['NAME'] ?? '') . ' ' . ($managerData['LAST_NAME'] ?? '')
+        ]);
+
+        // Локальная обработка - данные уже сохранены в LocalStorage
+        $this->logger->info('Manager data synced successfully', [
+            'manager_id' => $managerData['ID'] ?? null,
+            'manager_name' => ($managerData['NAME'] ?? '') . ' ' . ($managerData['LAST_NAME'] ?? '')
+        ]);
+
+        return true;
+    }
+
+    /**
+     * Получение данных менеджера
+     */
+    public function getManager($managerId)
+    {
+        $this->logger->info('Getting manager data locally', ['manager_id' => $managerId]);
+
+        // Для локальной работы возвращаем true (данные уже доступны в LocalStorage)
+        $this->logger->info('Manager data retrieved successfully', ['manager_id' => $managerId]);
+
+        return ['success' => true, 'manager_id' => $managerId];
     }
 
     /**
@@ -262,15 +312,54 @@ class LKAPI
     /**
      * Маппинг полей проекта
      */
-    private function mapProjectFields($projectData)
+    protected function mapProjectFields($projectData)
     {
+        $mapping = $this->config['field_mapping']['smart_process'];
+
+        // Отладка маппинга
+        $this->logger->debug('Mapping project fields', [
+            'project_data_keys' => array_keys($projectData),
+            'id_value' => $projectData['id'] ?? $projectData['ID'] ?? 'NOT_FOUND',
+            'title_value' => $projectData['title'] ?? $projectData['TITLE'] ?? 'NOT_FOUND',
+            'organization_field' => $mapping['organization_name'],
+            'organization_value' => $projectData[$mapping['organization_name']] ?? 'NOT_FOUND',
+            'object_field' => $mapping['object_name'],
+            'object_value' => $projectData[$mapping['object_name']] ?? 'NOT_FOUND',
+            'contact_field' => $mapping['client_id'],
+            'contact_value' => $projectData[$mapping['client_id']] ?? 'NOT_FOUND',
+            'all_uf_fields' => array_filter(array_keys($projectData), fn($k) => str_starts_with($k, 'ufCrm')),
+            'raw_contact_id' => $projectData['contactId'] ?? $projectData['contact_id'] ?? 'NOT_FOUND'
+        ]);
+
         return [
-            'bitrix_id' => $projectData['ID'] ?? null,
-            'title' => $projectData['title'] ?? $projectData['TITLE'] ?? '',
-            'description' => $projectData['description'] ?? $projectData['DESCRIPTION'] ?? '',
-            'status' => $projectData['stage_id'] ?? $projectData['STAGE_ID'] ?? '',
+            'bitrix_id' => $projectData['id'] ?? $projectData['ID'] ?? null,
+            'organization_name' => $projectData[$mapping['organization_name']] ?? '',
+            'object_name' => $projectData[$mapping['object_name']] ?? '',
+            'system_type' => $projectData[$mapping['system_type']] ?? '',
+            'location' => $projectData[$mapping['location']] ?? '',
+            'implementation_date' => $projectData[$mapping['implementation_date']] ?? null,
+            'status' => $projectData[$mapping['status']] ?? '',
+            'client_id' => $projectData[$mapping['client_id']] ?? null, // Связь с клиентом
+            'manager_id' => $projectData['ASSIGNED_BY_ID'] ?? null, // Ответственный менеджер
             'created_at' => $projectData['created_at'] ?? $projectData['DATE_CREATE'] ?? null,
             'updated_at' => $projectData['updated_at'] ?? $projectData['DATE_MODIFY'] ?? null,
+        ];
+    }
+
+    /**
+     * Маппинг полей менеджера
+     */
+    private function mapManagerFields($managerData)
+    {
+        $mapping = $this->config['field_mapping']['user'];
+        return [
+            'bitrix_id' => $managerData['ID'] ?? null,
+            'name' => $managerData[$mapping['name']] ?? '',
+            'last_name' => $managerData[$mapping['last_name']] ?? '',
+            'email' => $this->extractEmail($managerData[$mapping['email']] ?? []),
+            'phone' => $this->extractPhone($managerData[$mapping['phone']] ?? []),
+            'position' => $managerData[$mapping['position']] ?? '',
+            'photo' => $managerData[$mapping['photo']] ?? '',
         ];
     }
 

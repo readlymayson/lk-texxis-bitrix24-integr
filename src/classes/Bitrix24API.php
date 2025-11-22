@@ -124,6 +124,19 @@ class Bitrix24API
         $selectFields = $this->getMappedFieldsForEntity($entityType);
         $params = ['id' => $entityId];
 
+        // Для смарт-процессов добавляем entityTypeId
+        if ($entityType === 'smart_process') {
+            $smartProcessId = $this->config['bitrix24']['smart_process_id'] ?? '';
+            if (!empty($smartProcessId)) {
+                $params['entityTypeId'] = $smartProcessId;
+                $this->logger->debug('Using smart process entityTypeId', [
+                    'entity_type_id' => $smartProcessId
+                ]);
+            } else {
+                $this->logger->warning('Smart process ID not configured in config');
+            }
+        }
+
         if (!empty($selectFields)) {
             $params['select'] = $selectFields;
             $this->logger->debug('Using mapped fields for entity data retrieval', [
@@ -139,13 +152,16 @@ class Bitrix24API
                 'entity_type' => $entityType,
                 'entity_id' => $entityId,
                 'has_data' => true,
-                'selected_fields_count' => count($selectFields)
+                'selected_fields_count' => count($selectFields),
+                'result_structure' => array_keys($result),
+                'result_data_keys' => isset($result['result']) ? (is_array($result['result']) ? array_keys($result['result']) : 'not_array') : 'no_result'
             ]);
         } else {
             $this->logger->warning('Failed to retrieve entity data from Bitrix24 API', [
                 'entity_type' => $entityType,
                 'entity_id' => $entityId,
-                'result_type' => gettype($result)
+                'result_type' => gettype($result),
+                'result_keys' => is_array($result) ? array_keys($result) : 'not_array'
             ]);
         }
 
@@ -312,6 +328,11 @@ class Bitrix24API
                 'update' => 'crm.item.update',
                 'add' => 'crm.item.add',
                 'delete' => 'crm.item.delete'
+            ],
+            // ДОБАВИТЬ МЕТОДЫ ДЛЯ МЕНЕДЖЕРОВ
+            'user' => [
+                'get' => 'user.get',
+                'list' => 'user.get',
             ]
         ];
 
@@ -369,7 +390,7 @@ class Bitrix24API
             'ONCRMCONTACT' => 'contact',
             'ONCRMCOMPANY' => 'company',
             'ONCRMDEAL' => 'deal',
-            'ONCRM_DYNAMIC_ITEM' => 'smart_process'
+            'ONCRMDYNAMICITEM' => 'smart_process'
         ];
 
         foreach ($mapping as $prefix => $type) {
