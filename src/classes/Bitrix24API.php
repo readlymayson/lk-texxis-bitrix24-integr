@@ -1,5 +1,4 @@
 <?php
-# -*- coding: utf-8 -*-
 
 /**
  * Класс для работы с API Битрикс24
@@ -22,9 +21,6 @@ class Bitrix24API
     public function validateWebhookRequest($headers, $body)
     {
         try {
-            // Проверка наличия необходимых заголовков
-            // Битрикс24 может отправлять User-Agent как "Bitrix24" или "Bitrix24 Webhook Engine"
-            // Заголовки могут приходить в разных регистрах: User-Agent или user-agent
             $userAgent = $headers['User-Agent'] ?? $headers['user-agent'] ?? '';
             if (empty($userAgent) ||
                 (!str_contains($userAgent, 'Bitrix24') && !str_contains($userAgent, 'Bitrix24 Webhook Engine'))) {
@@ -35,12 +31,9 @@ class Bitrix24API
                 return false;
             }
 
-            // Проверка типа контента - поддерживаем JSON и URL-encoded
             $contentType = $headers['Content-Type'] ?? $headers['content-type'] ?? '';
 
-            // Валидация тела запроса в зависимости от Content-Type
             if (str_contains($contentType, 'application/json')) {
-                // Обработка JSON формата
                 $data = json_decode($body, true);
                 if (json_last_error() !== JSON_ERROR_NONE) {
                     $this->logger->error('Invalid JSON in webhook body', [
@@ -51,8 +44,6 @@ class Bitrix24API
                     return false;
                 }
             } elseif (str_contains($contentType, 'application/x-www-form-urlencoded')) {
-                // Обработка URL-encoded формата (как в примере пользователя)
-                // parse_str() уже правильно разбирает вложенные структуры типа data[FIELDS][ID]
                 parse_str($body, $data);
                 if (empty($data)) {
                     $this->logger->error('Failed to parse URL-encoded webhook body', [
@@ -70,7 +61,6 @@ class Bitrix24API
                 return false;
             }
 
-            // Проверка токена приложения
             $expectedToken = $this->config['bitrix24']['application_token'];
             $receivedToken = $data['auth']['application_token'] ?? '';
 
@@ -120,12 +110,10 @@ class Bitrix24API
             return false;
         }
 
-        // Получаем список полей для выборки из конфига маппинга
         $selectFields = $this->getMappedFieldsForEntity($entityType);
 
         $params = ['id' => $entityId];
 
-        // Для смарт-процессов добавляем entityTypeId
         $this->addSmartProcessParams($entityType, $params);
 
         if (!empty($selectFields)) {
@@ -139,13 +127,9 @@ class Bitrix24API
         $result = $this->makeApiCall($method, $params);
 
         if ($result && isset($result['result'])) {
-            $this->logger->info('Successfully retrieved entity data from Bitrix24 API', [
+            $this->logger->debug('Successfully retrieved entity data from Bitrix24 API', [
                 'entity_type' => $entityType,
-                'entity_id' => $entityId,
-                'has_data' => true,
-                'selected_fields_count' => count($selectFields),
-                'result_structure' => array_keys($result),
-                'result_data_keys' => isset($result['result']) ? (is_array($result['result']) ? array_keys($result['result']) : 'not_array') : 'no_result'
+                'entity_id' => $entityId
             ]);
         } else {
             $this->logger->warning('Failed to retrieve entity data from Bitrix24 API', [
@@ -176,7 +160,6 @@ class Bitrix24API
             $params['filter'] = $filter;
         }
         
-        // Если select не передан, используем поля из конфигурации
         if (empty($select)) {
             $select = $this->getMappedFieldsForEntity($entityType);
         }
@@ -189,7 +172,6 @@ class Bitrix24API
             ]);
         }
 
-        // Для смарт-процессов добавляем entityTypeId
         $this->addSmartProcessParams($entityType, $params);
 
         return $this->makeApiCall($method, $params);
@@ -216,7 +198,6 @@ class Bitrix24API
         if ($result && isset($result['result'])) {
             $contacts = $result['result'];
             
-            // Логируем структуру ответа для отладки
             $this->logger->debug('Company contacts API response structure', [
                 'company_id' => $companyId,
                 'result_type' => gettype($contacts),
@@ -226,13 +207,13 @@ class Bitrix24API
             ]);
             
             if (is_array($contacts) && !empty($contacts)) {
-                $this->logger->info('Successfully retrieved company contacts', [
+                $this->logger->debug('Successfully retrieved company contacts', [
                     'company_id' => $companyId,
                     'contacts_count' => count($contacts)
                 ]);
                 return $contacts;
             } else {
-                $this->logger->info('Company contacts list is empty', [
+                $this->logger->debug('Company contacts list is empty', [
                     'company_id' => $companyId
                 ]);
                 return [];
@@ -383,7 +364,6 @@ class Bitrix24API
                 'add' => 'crm.item.add',
                 'delete' => 'crm.item.delete'
             ],
-            // ДОБАВИТЬ МЕТОДЫ ДЛЯ МЕНЕДЖЕРОВ
             'user' => [
                 'get' => 'user.get',
                 'list' => 'user.get',
@@ -407,33 +387,27 @@ class Bitrix24API
             return [];
         }
 
-        // Собираем все поля из маппинга, кроме служебных (lk_client_values, lk_client_field)
         $fields = [];
         foreach ($mapping as $key => $value) {
-            // Пропускаем служебные поля
             if ($key === 'lk_client_values' || $key === 'lk_client_field') {
                 continue;
             }
 
-            // Добавляем значения полей (они содержат коды полей Битрикс24)
             if (is_string($value) && !empty($value)) {
                 $fields[] = $value;
             }
         }
 
-        // Добавляем базовые поля ID для всех сущностей
         if (!in_array('ID', $fields)) {
             $fields[] = 'ID';
         }
 
-        // Для компаний и сделок добавляем CONTACT_ID, если он используется для связи
         if (($entityType === 'company' || $entityType === 'deal') && !in_array('CONTACT_ID', $fields)) {
             if (isset($mapping['contact_id']) && !empty($mapping['contact_id'])) {
                 $fields[] = $mapping['contact_id'];
             }
         }
 
-        // Удаляем дубликаты и переиндексируем массив для корректной JSON сериализации
         $fields = array_values(array_unique($fields));
 
         $this->logger->debug('Extracted mapped fields for entity', [
@@ -475,10 +449,8 @@ class Bitrix24API
      */
     public function addSmartProcessItem($entityTypeId, $fields = [])
     {
-        $this->logger->info('Creating smart process item', [
-            'entity_type_id' => $entityTypeId,
-            'fields_count' => count($fields),
-            'fields_keys' => array_keys($fields)
+        $this->logger->debug('Creating smart process item', [
+            'entity_type_id' => $entityTypeId
         ]);
 
         $method = 'crm.item.add';
@@ -491,7 +463,7 @@ class Bitrix24API
 
         if ($result && isset($result['result']['item'])) {
             $itemId = $result['result']['item']['id'] ?? null;
-            $this->logger->info('Smart process item created successfully', [
+            $this->logger->debug('Smart process item created successfully', [
                 'entity_type_id' => $entityTypeId,
                 'item_id' => $itemId
             ]);
@@ -527,10 +499,8 @@ class Bitrix24API
             return false;
         }
 
-        // Формируем поля для создания карточки на основе маппинга
         $fields = [];
         
-        // Базовые поля (контакт, компания, менеджер)
         if (isset($data['contact_id']) && !empty($mapping['contact_id'])) {
             $fields[$mapping['contact_id']] = $data['contact_id'];
         }
@@ -543,7 +513,6 @@ class Bitrix24API
             $fields[$mapping['manager_id']] = $data['manager_id'];
         }
 
-        // Поля для изменения личных данных
         if (isset($data['new_email']) && !empty($mapping['new_email'])) {
             $fields[$mapping['new_email']] = $data['new_email'];
         }
@@ -556,7 +525,6 @@ class Bitrix24API
             $fields[$mapping['change_reason_personal']] = $data['change_reason_personal'];
         }
 
-        // Поля для изменения данных о компании
         if (isset($data['new_company_name']) && !empty($mapping['new_company_name'])) {
             $fields[$mapping['new_company_name']] = $data['new_company_name'];
         }
@@ -607,7 +575,6 @@ class Bitrix24API
             return false;
         }
 
-        // Формируем поля для создания карточки на основе маппинга
         $fields = [];
         
         if (isset($data['contact_id']) && !empty($mapping['contact_id'])) {

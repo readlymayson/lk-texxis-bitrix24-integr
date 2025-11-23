@@ -1,5 +1,4 @@
 <?php
-# -*- coding: utf-8 -*-
 
 /**
  * Конфигурация для интеграции с Битрикс24
@@ -31,8 +30,8 @@ return [
         'contacts_file' => __DIR__ . '/../data/contacts.json',
         'companies_file' => __DIR__ . '/../data/companies.json',
         'deals_file' => __DIR__ . '/../data/deals.json',
-        'projects_file' => __DIR__ . '/../data/projects.json', // ДОБАВИТЬ ДЛЯ ПРОЕКТОВ
-        'managers_file' => __DIR__ . '/../data/managers.json', // ДОБАВИТЬ ДЛЯ МЕНЕДЖЕРОВ
+        'projects_file' => __DIR__ . '/../data/projects.json',
+        'managers_file' => __DIR__ . '/../data/managers.json',
     ],
 
     // Настройки логирования
@@ -107,7 +106,6 @@ return [
             'company_id' => 'companyId',                       // Связь с компанией (если есть)
             'manager_id' => 'assignedById',                    // Ответственный менеджер
         ],
-        // ДОБАВИТЬ МАППИНГ МЕНЕДЖЕРОВ
         'user' => [
             'name' => 'NAME',
             'last_name' => 'LAST_NAME',

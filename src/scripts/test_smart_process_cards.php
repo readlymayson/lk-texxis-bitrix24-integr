@@ -1,5 +1,4 @@
 <?php
-# -*- coding: utf-8 -*-
 
 /**
  * Скрипт для проверки создания карточек в смарт-процессах
@@ -15,26 +14,21 @@
  * php test_smart_process_cards.php 2 4 1               # Контакт, компания и менеджер
  */
 
-// Подключение автозагрузки классов
 require_once __DIR__ . '/../classes/EnvLoader.php';
 require_once __DIR__ . '/../classes/Logger.php';
 require_once __DIR__ . '/../classes/Bitrix24API.php';
 
-// Загрузка конфигурации
 $config = require_once __DIR__ . '/../config/bitrix24.php';
 
-// Инициализация компонентов
 $logger = new Logger($config);
 $bitrixAPI = new Bitrix24API($config, $logger);
 
-// Получение параметров из командной строки
 $contactId = $argv[1] ?? null;
 $companyId = $argv[2] ?? null;
 $managerId = $argv[3] ?? null;
 
 echo "=== ТЕСТИРОВАНИЕ СОЗДАНИЯ КАРТОЧЕК В СМАРТ-ПРОЦЕССАХ ===\n\n";
 
-// Интерактивный ввод, если параметры не переданы
 if (empty($contactId)) {
     echo "Введите параметры для тестирования:\n";
     echo "Contact ID (обязательно): ";
@@ -67,7 +61,6 @@ echo "  Contact ID: {$contactId}\n";
 echo "  Company ID: " . ($companyId ?? 'не указан') . "\n";
 echo "  Manager ID: " . ($managerId ?? 'не указан') . "\n\n";
 
-// Проверка конфигурации
 $changeDataProcessId = $config['bitrix24']['smart_process_change_data_id'] ?? '';
 $deleteDataProcessId = $config['bitrix24']['smart_process_delete_data_id'] ?? '';
 
@@ -81,9 +74,6 @@ if (empty($changeDataProcessId) && empty($deleteDataProcessId)) {
     exit(1);
 }
 
-// ============================================
-// ТЕСТ 1: Создание карточки "Изменение данных в ЛК"
-// ============================================
 if (!empty($changeDataProcessId)) {
     echo "--- ТЕСТ 1: Создание карточки 'Изменение данных в ЛК' ---\n";
     
@@ -99,7 +89,6 @@ if (!empty($changeDataProcessId)) {
         $changeData['manager_id'] = $managerId;
     }
     
-    // Тестовые данные для изменения личных данных
     $changeData['new_email'] = 'test_new_email@example.com';
     $changeData['new_phone'] = '+7 (999) 123-45-67';
     $changeData['change_reason_personal'] = 'Тестовая причина изменения личных данных';
@@ -139,9 +128,6 @@ if (!empty($changeDataProcessId)) {
     echo "--- ТЕСТ 1: Пропущен (ID смарт-процесса не настроен) ---\n\n";
 }
 
-// ============================================
-// ТЕСТ 2: Создание карточки "Удаление пользовательских данных"
-// ============================================
 if (!empty($deleteDataProcessId)) {
     echo "--- ТЕСТ 2: Создание карточки 'Удаление пользовательских данных' ---\n";
     

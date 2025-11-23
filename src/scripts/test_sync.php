@@ -1,5 +1,4 @@
 <?php
-# -*- coding: utf-8 -*-
 
 /**
  * Скрипт для тестовой синхронизации одного ЛК с его связанными сущностями
@@ -13,23 +12,16 @@
  * php test_sync.php 2      # Синхронизирует контакт с ID=2
  */
 
-// Подключение автозагрузки классов
 require_once __DIR__ . '/../classes/EnvLoader.php';
 require_once __DIR__ . '/../classes/Logger.php';
 require_once __DIR__ . '/../classes/Bitrix24API.php';
 require_once __DIR__ . '/../classes/LocalStorage.php';
 
-// Загрузка конфигурации
 $config = require_once __DIR__ . '/../config/bitrix24.php';
 
-// Инициализация компонентов
 $logger = new Logger($config);
 $bitrixAPI = new Bitrix24API($config, $logger);
 $localStorage = new LocalStorage($logger);
-
-// ============================================
-// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-// ============================================
 
 /**
  * Извлечение ID контакта из значения (может быть строкой или массивом)
@@ -74,7 +66,6 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
         'deals' => ['count' => 0, 'success' => 0, 'failed' => 0]
     ];
 
-    // Синхронизация компаний
     $logger->info('Checking for related companies for contact', ['contact_id' => $contactId]);
     try {
         $companies = $bitrixAPI->getEntityList('company', [
@@ -108,7 +99,6 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
         $logger->error('Error syncing related companies', ['contact_id' => $contactId, 'error' => $e->getMessage()]);
     }
 
-    // Синхронизация проектов
     $logger->info('Checking for related projects for contact', ['contact_id' => $contactId]);
     try {
         $smartProcessId = $config['bitrix24']['smart_process_id'] ?? null;
@@ -162,7 +152,6 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
         $logger->error('Error syncing related projects', ['contact_id' => $contactId, 'error' => $e->getMessage()]);
     }
 
-    // Синхронизация сделок
     $logger->info('Checking for related deals for contact', ['contact_id' => $contactId]);
     try {
         $deals = $bitrixAPI->getEntityList('deal', [
@@ -194,11 +183,6 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
     return $results;
 }
 
-// ============================================
-// ОСНОВНОЙ КОД
-// ============================================
-
-// Получение параметров из командной строки
 $contactIdFilter = $argv[1] ?? null;
 
 echo "=== ТЕСТОВАЯ СИНХРОНИЗАЦИЯ ОДНОГО ЛК ===\n\n";
@@ -210,7 +194,6 @@ $results = [
     'errors' => []
 ];
 
-// Выбор контакта для синхронизации
 $contactsFile = $config['local_storage']['contacts_file'];
 if (!file_exists($contactsFile)) {
     echo "✗ ОШИБКА: Файл контактов не найден: {$contactsFile}\n";
@@ -262,7 +245,6 @@ try {
     
     $contactDataFromAPI = $fullContactData['result'];
     
-    // Проверка поля ЛК клиента
     $lkClientField = $config['field_mapping']['contact']['lk_client_field'] ?? '';
     $lkClientValues = $config['field_mapping']['contact']['lk_client_values'] ?? [];
     
@@ -295,7 +277,6 @@ try {
 
 echo "\n";
 
-// Синхронизация менеджера
 echo "--- СИНХРОНИЗАЦИЯ МЕНЕДЖЕРА ---\n";
 
 try {
@@ -329,7 +310,6 @@ try {
 
 echo "\n";
 
-// Синхронизация связанных сущностей
 echo "--- СИНХРОНИЗАЦИЯ СВЯЗАННЫХ СУЩНОСТЕЙ ---\n\n";
 
 try {

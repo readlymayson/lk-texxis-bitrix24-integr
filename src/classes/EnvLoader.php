@@ -1,5 +1,4 @@
 <?php
-# -*- coding: utf-8 -*-
 
 /**
  * Класс для загрузки переменных окружения из .env файла
@@ -20,7 +19,6 @@ class EnvLoader
         $envFile = $envFile ?: self::findEnvFile();
 
         if (!$envFile || !file_exists($envFile)) {
-            // Если .env нет, используем переменные окружения системы
             self::$loaded = true;
             return;
         }
@@ -30,21 +28,17 @@ class EnvLoader
         foreach ($lines as $line) {
             $line = trim($line);
 
-            // Пропускаем комментарии
             if (str_starts_with($line, '#')) {
                 continue;
             }
 
-            // Разбираем KEY=VALUE
             if (strpos($line, '=') !== false) {
                 list($key, $value) = explode('=', $line, 2);
                 $key = trim($key);
                 $value = trim($value);
 
-                // Убираем кавычки если есть
                 $value = self::stripQuotes($value);
 
-                // Устанавливаем переменную окружения
                 putenv("{$key}={$value}");
                 $_ENV[$key] = $value;
                 $_SERVER[$key] = $value;
@@ -59,7 +53,6 @@ class EnvLoader
      */
     public static function get($key, $default = null)
     {
-        // Проверяем в разных местах
         return $_ENV[$key] ??
                $_SERVER[$key] ??
                getenv($key) ??

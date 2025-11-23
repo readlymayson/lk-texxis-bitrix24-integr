@@ -1,5 +1,4 @@
 <?php
-# -*- coding: utf-8 -*-
 
 /**
  * Основной обработчик вебхуков от Битрикс24
@@ -15,28 +14,21 @@
  * - ONCRM_DYNAMIC_ITEM_UPDATE - изменение смарт-процесса
  */
 
-// Подключение автозагрузки классов
 require_once __DIR__ . '/../classes/EnvLoader.php';
 require_once __DIR__ . '/../classes/Logger.php';
 require_once __DIR__ . '/../classes/Bitrix24API.php';
 require_once __DIR__ . '/../classes/LocalStorage.php';
 
-// Загрузка конфигурации (включает загрузку .env)
 $config = require_once __DIR__ . '/../config/bitrix24.php';
 
-// Инициализация компонентов
 $logger = new Logger($config);
 $bitrixAPI = new Bitrix24API($config, $logger);
 $localStorage = new LocalStorage($logger);
 
 try {
-    // Получение тела запроса ДО валидации
     $rawBody = file_get_contents('php://input');
-
-    // Получение всех заголовков
     $headers = getRequestHeaders();
 
-    // Детальное логирование входящего webhook запроса
     $logger->info('=== WEBHOOK REQUEST RECEIVED ===', [
         'timestamp' => date('Y-m-d H:i:s'),
         'method' => $_SERVER['REQUEST_METHOD'] ?? 'UNKNOWN',
@@ -53,10 +45,8 @@ try {
         'body_preview' => strlen($rawBody) > 200 ? substr($rawBody, 0, 200) . '...' : $rawBody
     ]);
 
-    // Логирование всех HTTP заголовков
     $logger->debug('Webhook headers', ['headers' => $headers]);
 
-    // Проверка метода запроса
     if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
         $logger->warning('Invalid request method', [
             'method' => $_SERVER['REQUEST_METHOD'],
@@ -66,7 +56,6 @@ try {
         exit;
     }
 
-    // Проверка тела запроса
     if (empty($rawBody)) {
         $logger->warning('Empty request body received', [
             'content_length' => $_SERVER['CONTENT_LENGTH'] ?? 'not set',
@@ -76,7 +65,6 @@ try {
         exit;
     }
 
-    // Валидация webhook запроса
     $webhookData = $bitrixAPI->validateWebhookRequest($headers, $rawBody);
     if ($webhookData === false) {
         $logger->error('Webhook validation failed', [
@@ -87,35 +75,24 @@ try {
         exit;
     }
 
-    // Детальное логирование валидных данных от Битрикс24
-    $logger->info('=== WEBHOOK DATA VALIDATED ===', [
+    $logger->debug('Webhook data validated', [
         'event' => $webhookData['event'] ?? 'UNKNOWN',
         'event_type' => getWebhookEventType($webhookData['event'] ?? ''),
-        'timestamp' => $webhookData['ts'] ?? 'UNKNOWN',
-        'auth_token' => $webhookData['auth']['application_token'] ?? 'UNKNOWN',
-        'data_keys' => array_keys($webhookData['data'] ?? []),
-        'entity_id' => $webhookData['data']['FIELDS']['ID'] ?? $webhookData['data']['ID'] ?? 'UNKNOWN',
-        'webhook_data_size' => strlen(json_encode($webhookData))
+        'entity_id' => $webhookData['data']['FIELDS']['ID'] ?? $webhookData['data']['ID'] ?? 'UNKNOWN'
     ]);
 
-    // Логирование полных данных webhook (только для отладки)
     $logger->debug('Full webhook data from Bitrix24', [
         'webhook_data' => $webhookData
     ]);
 
-    // Определение типа события и обработка
     $eventName = $webhookData['event'] ?? '';
     $entityId = $webhookData['data']['FIELDS']['ID'] ?? $webhookData['data']['ID'] ?? null;
 
-    // Временная отладка для смарт-процессов
     if (str_contains($eventName, 'DYNAMICITEM')) {
-        $logger->info('=== SMART PROCESS EVENT DEBUG ===', [
+        $logger->debug('Smart process event detected', [
             'event_name' => $eventName,
             'entity_id' => $entityId,
-            'entity_type_determined' => $bitrixAPI->getEntityTypeFromEvent($eventName),
-            'smart_process_id_config' => $config['bitrix24']['smart_process_id'] ?? 'NOT_SET',
-            'php_version' => PHP_VERSION,
-            'timestamp' => date('Y-m-d H:i:s')
+            'entity_type_determined' => $bitrixAPI->getEntityTypeFromEvent($eventName)
         ]);
     }
 
@@ -127,7 +104,6 @@ try {
         exit;
     }
 
-    // Логирование начала обработки события
     $logger->info('=== STARTING EVENT PROCESSING ===', [
         'event_name' => $eventName,
         'event_type' => getWebhookEventType($eventName),
@@ -136,17 +112,14 @@ try {
         'processing_start_time' => date('Y-m-d H:i:s')
     ]);
 
-    // Обработка события с повторными попытками
     $result = processEventWithRetry($eventName, $webhookData, $config, $logger, $bitrixAPI, $localStorage);
 
-    // Логирование завершения обработки события
     $processingEndTime = date('Y-m-d H:i:s');
     $processingDuration = time() - strtotime($webhookData['ts'] ?? 'now');
 
     if ($result) {
-        $logger->info('=== EVENT PROCESSING COMPLETED SUCCESSFULLY ===', [
+        $logger->debug('Event processing completed successfully', [
             'event_name' => $eventName,
-            'event_type' => getWebhookEventType($eventName),
             'entity_id' => $entityId,
             'processing_end_time' => $processingEndTime,
             'processing_duration_seconds' => $processingDuration,
@@ -216,7 +189,6 @@ function processEventWithRetry($eventName, $webhookData, $config, $logger, $bitr
                 'error' => $e->getMessage()
             ]);
 
-            // Для исключений не делаем повторные попытки
             break;
         }
     }
@@ -285,21 +257,20 @@ function syncManagerForContact($contactId, $assignedById, $bitrixAPI, $localStor
         return false;
     }
     
-    $logger->info('Fetching manager data for contact', [
+    $logger->debug('Fetching manager data for contact', [
         'contact_id' => $contactId,
         'assigned_by_id' => $assignedById
     ]);
     
     $managerData = $bitrixAPI->getEntityData('user', $assignedById);
     if ($managerData && isset($managerData['result'])) {
-        // Для user.get result может быть массивом, берем первый элемент
         $userData = $managerData['result'];
         if (is_array($userData) && isset($userData[0])) {
             $userData = $userData[0];
         }
         
         $localStorage->syncManagerByBitrixId($assignedById, $userData);
-        $logger->info('Manager created/updated for contact', [
+        $logger->debug('Manager created/updated for contact', [
             'contact_id' => $contactId,
             'manager_id' => $assignedById
         ]);
@@ -318,7 +289,6 @@ function syncManagerForContact($contactId, $assignedById, $bitrixAPI, $localStor
  */
 function isValidLKClientValue($entityType, $entityData, $config, $logger)
 {
-    // Проверяем, есть ли настройки поля ЛК клиента для этого типа сущности
     if (!isset($config['field_mapping'][$entityType]['lk_client_field'])) {
         $logger->debug('LK client field not configured for entity type', [
             'entity_type' => $entityType
@@ -358,7 +328,6 @@ function isValidLKClientValue($entityType, $entityData, $config, $logger)
  */
 function shouldDeleteContactData($entityType, $entityData, $config, $logger)
 {
-    // Проверяем, есть ли настройки поля ЛК клиента для этого типа сущности
     if (!isset($config['field_mapping'][$entityType]['lk_client_field'])) {
         return false;
     }
@@ -366,7 +335,6 @@ function shouldDeleteContactData($entityType, $entityData, $config, $logger)
     $fieldName = $config['field_mapping'][$entityType]['lk_client_field'];
     $deleteValue = $config['field_mapping'][$entityType]['lk_delete_value'] ?? '';
 
-    // Если значение для удаления не задано, пропускаем проверку
     if (empty($deleteValue)) {
         return false;
     }
@@ -377,13 +345,12 @@ function shouldDeleteContactData($entityType, $entityData, $config, $logger)
         return false;
     }
 
-    // Приводим к строке для сравнения (чтобы корректно сравнивать число и строку)
     $fieldValue = (string)$fieldValue;
     $deleteValue = (string)$deleteValue;
 
     $shouldDelete = ($fieldValue === $deleteValue);
 
-    $logger->info('Checking if contact data should be deleted', [
+    $logger->debug('Checking if contact data should be deleted', [
         'entity_type' => $entityType,
         'field_name' => $fieldName,
         'field_value' => $fieldValue,
@@ -402,7 +369,6 @@ function processEvent($eventName, $webhookData, $bitrixAPI, $localStorage, $logg
     $entityType = $bitrixAPI->getEntityTypeFromEvent($eventName);
     $entityId = $webhookData['data']['FIELDS']['ID'] ?? $webhookData['data']['ID'] ?? null;
 
-    // Отладка для смарт-процессов
     if (str_contains($eventName, 'DYNAMICITEM')) {
         $logger->info('=== PROCESS EVENT DEBUG ===', [
             'event' => $eventName,
@@ -423,13 +389,12 @@ function processEvent($eventName, $webhookData, $bitrixAPI, $localStorage, $logg
         return false;
     }
 
-    $logger->info('Processing event', [
+    $logger->debug('Processing event', [
         'event' => $eventName,
         'entity_type' => $entityType,
         'entity_id' => $entityId
     ]);
 
-    // Получение полных данных сущности из Битрикс24
     $entityData = $bitrixAPI->getEntityData($entityType, $entityId);
     if (!$entityData || !isset($entityData['result'])) {
         $logger->error('Failed to get entity data from Bitrix24', [
@@ -439,9 +404,7 @@ function processEvent($eventName, $webhookData, $bitrixAPI, $localStorage, $logg
         return false;
     }
 
-    // Обработка структуры ответа API для разных типов сущностей
     if ($entityType === 'smart_process') {
-        // Для смарт-процессов данные могут быть в result.item или напрямую в result
         $logger->debug('Processing smart process entity data structure', [
             'original_structure' => array_keys($entityData),
             'has_result_item' => isset($entityData['result']['item']),
@@ -467,7 +430,6 @@ function processEvent($eventName, $webhookData, $bitrixAPI, $localStorage, $logg
         $entityData = $entityData['result'];
     }
 
-    // Определение действия на основе события
     $action = getActionFromEvent($eventName);
 
     switch ($action) {
@@ -498,7 +460,6 @@ function handleCreate($entityType, $entityData, $localStorage, $bitrixAPI, $logg
         case 'contact':
             $contactId = $entityData['ID'];
             
-            // Проверяем, существует ли ЛК на сайте
             $existingContact = $localStorage->getContact($contactId);
             if ($existingContact) {
                 $logger->info('LK already exists for contact, skipping creation', [
@@ -508,8 +469,6 @@ function handleCreate($entityType, $entityData, $localStorage, $bitrixAPI, $logg
                 return true; // ЛК уже существует, не создаем повторно
             }
             
-            // Проверяем, нужно ли создавать ЛК для этого контакта
-            // Создание зависит от поля lk_client_field (field_lk) - должно иметь допустимое значение
             if (isValidLKClientValue('contact', $entityData, $config, $logger)) {
                 $logger->info('Creating LK for new contact with valid LK client field', [
                     'contact_id' => $contactId,
@@ -518,10 +477,8 @@ function handleCreate($entityType, $entityData, $localStorage, $bitrixAPI, $logg
                 ]);
                 $result = $localStorage->createLK($entityData);
                 if ($result) {
-                    // После создания ЛК, подтягиваем все связанные сущности
                     syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage, $config, $logger);
                     
-                    // Получаем и синхронизируем менеджера, если указан ASSIGNED_BY_ID
                     $managerField = $config['field_mapping']['contact']['manager_id'] ?? 'ASSIGNED_BY_ID';
                     $assignedById = $entityData[$managerField] ?? null;
                     syncManagerForContact($contactId, $assignedById, $bitrixAPI, $localStorage, $logger);
@@ -632,7 +589,6 @@ function handleContactUpdate($contactData, $localStorage, $bitrixAPI, $logger, $
         'phone_count' => count($contactData['PHONE'] ?? [])
     ]);
 
-    // Проверяем, нужно ли удалить данные контакта при определенном значении поля ЛК
     if (shouldDeleteContactData('contact', $contactData, $config, $logger)) {
         $logger->info('Deleting contact data due to LK field value', [
             'contact_id' => $contactId,
@@ -650,12 +606,9 @@ function handleContactUpdate($contactData, $localStorage, $bitrixAPI, $logger, $
         return $deleteResult;
     }
 
-    // Проверяем, существует ли ЛК на сайте (проверка существования контакта в локальном хранилище)
     $existingContact = $localStorage->getContact($contactId);
 
     if ($existingContact) {
-        // ЛК уже существует - проверяем, допустимо ли значение поля lk_client_field перед обновлением
-        // Если поле невалидно, обновление пропускается, но ЛК остается
         if (isValidLKClientValue('contact', $contactData, $config, $logger)) {
             $logger->info('Updating existing contact with full data from Bitrix24 - valid LK field', [
                 'contact_id' => $contactId,
@@ -669,11 +622,9 @@ function handleContactUpdate($contactData, $localStorage, $bitrixAPI, $logger, $
                 'contact_id' => $contactId,
                 'lk_id' => $existingContact['id']
             ]);
-            return true; // Не считаем это ошибкой, просто пропускаем обновление
+            return true;
         }
     } else {
-        // ЛК не существует - проверяем, нужно ли создавать ЛК
-        // Создание зависит от поля lk_client_field (field_lk) - должно иметь допустимое значение
         if (isValidLKClientValue('contact', $contactData, $config, $logger)) {
             $logger->info('Creating new LK with full data from Bitrix24 - valid LK client field value', [
                 'contact_id' => $contactId,
@@ -682,10 +633,8 @@ function handleContactUpdate($contactData, $localStorage, $bitrixAPI, $logger, $
             ]);
             $result = $localStorage->createLK($contactData);
             if ($result) {
-                // После создания ЛК, подтягиваем все связанные сущности (компании и проекты)
                 syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage, $config, $logger);
                 
-                // Получаем и синхронизируем менеджера, если указан ASSIGNED_BY_ID
                 $managerField = $config['field_mapping']['contact']['manager_id'] ?? 'ASSIGNED_BY_ID';
                 $assignedById = $contactData[$managerField] ?? null;
                 $logger->debug('Extracting manager ID for contact', [
@@ -711,7 +660,6 @@ function handleCompanyUpdate($companyData, $localStorage, $bitrixAPI, $logger, $
 {
     $companyId = $companyData['ID'];
 
-    // Получаем полные данные компании из Bitrix24 API через crm.company.get
     $logger->info('Fetching full company data from Bitrix24 API via crm.company.get', ['company_id' => $companyId]);
 
     try {
@@ -733,7 +681,6 @@ function handleCompanyUpdate($companyData, $localStorage, $bitrixAPI, $logger, $
 
         $companyData = $fullCompanyData['result'];
 
-        // Логируем все ключи для отладки
         $logger->debug('Company data keys from API', [
             'company_id' => $companyId,
             'all_keys' => array_keys($companyData),
@@ -746,7 +693,6 @@ function handleCompanyUpdate($companyData, $localStorage, $bitrixAPI, $logger, $
             'title' => $companyData['TITLE'] ?? 'N/A'
         ]);
 
-        // Логируем CONTACT_ID для отладки
         $rawContactId = $companyData['CONTACT_ID'] ?? null;
         $logger->debug('Raw CONTACT_ID from company data', [
             'company_id' => $companyId,
@@ -757,8 +703,6 @@ function handleCompanyUpdate($companyData, $localStorage, $bitrixAPI, $logger, $
             'contact_id_keys' => is_array($rawContactId) ? array_keys($rawContactId) : 'not_array'
         ]);
 
-        // Проверяем, привязана ли компания к контакту с существующим ЛК
-        // Используем extractContactId для обработки массива или строки
         $contactId = extractContactId($rawContactId);
         
         $logger->debug('Extracted contact ID', [
@@ -768,7 +712,6 @@ function handleCompanyUpdate($companyData, $localStorage, $bitrixAPI, $logger, $
             'has_contact_in_storage' => !empty($contactId) ? hasContactInLocalStorage($contactId, $localStorage, $logger) : false
         ]);
         
-        // Если CONTACT_ID пустой, пытаемся получить связанные контакты через множественную связь
         if (empty($contactId)) {
             $logger->info('CONTACT_ID is empty, trying to get company contacts via crm.company.contact.items.get', [
                 'company_id' => $companyId
@@ -826,7 +769,6 @@ function handleCompanyUpdate($companyData, $localStorage, $bitrixAPI, $logger, $
             'contact_id' => $contactId
         ]);
 
-        // Устанавливаем CONTACT_ID в данные компании для сохранения связи
         $companyData['CONTACT_ID'] = $contactId;
 
         // Синхронизируем компанию через LocalStorage
@@ -1032,17 +974,43 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
                 $fullCompanyData = $bitrixAPI->getEntityData('company', $companyId);
                 if ($fullCompanyData && isset($fullCompanyData['result'])) {
                     $companyData = $fullCompanyData['result'];
+                    $companyContactId = extractContactId($companyData['CONTACT_ID'] ?? null);
 
-                    // Синхронизируем компанию с ЛК контакта
-                    // Убираем строгую проверку CONTACT_ID, так как в Битрикс24 это поле может быть не всегда корректно установлено
-                        $logger->info('Syncing related company to contact LK', [
+                    // Проверяем, что компания действительно связана с контактом
+                    $isRelated = false;
+                    if (!empty($companyContactId) && $companyContactId === (string)$contactId) {
+                        $isRelated = true;
+                    } elseif (empty($companyContactId)) {
+                        // Если CONTACT_ID пустой, проверяем через множественную связь
+                        $companyContacts = $bitrixAPI->getCompanyContacts($companyId);
+                        if ($companyContacts !== false) {
+                            foreach ($companyContacts as $relatedContact) {
+                                $relatedContactId = $relatedContact['CONTACT_ID'] ?? $relatedContact['ID'] ?? null;
+                                if (!empty($relatedContactId) && (string)$relatedContactId === (string)$contactId) {
+                                    $isRelated = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!$isRelated) {
+                        $logger->warning('Skipping company sync - not related to contact', [
                             'company_id' => $companyId,
                             'company_title' => $companyData['TITLE'] ?? 'N/A',
-                        'contact_id' => $contactId,
-                        'company_contact_id' => $companyData['CONTACT_ID'] ?? null
+                            'contact_id' => $contactId,
+                            'company_contact_id' => $companyContactId
                         ]);
+                        continue;
+                    }
 
-                    // Устанавливаем правильный CONTACT_ID для связи с контактом
+                    $logger->info('Syncing related company to contact LK', [
+                        'company_id' => $companyId,
+                        'company_title' => $companyData['TITLE'] ?? 'N/A',
+                        'contact_id' => $contactId,
+                        'company_contact_id' => $companyContactId
+                    ]);
+
                     $companyData['CONTACT_ID'] = $contactId;
 
                     $syncResult = $localStorage->syncCompanyByBitrixId($companyId, $companyData);

@@ -1,5 +1,4 @@
 <?php
-# -*- coding: utf-8 -*-
 
 /**
  * Класс для локального хранения данных интеграции с Битрикс24
@@ -14,6 +13,13 @@ class LocalStorage
     private $dealsFile;
     private $projectsFile;
     private $managersFile;
+    private $cachedData = [
+        'contacts' => null,
+        'companies' => null,
+        'deals' => null,
+        'projects' => null,
+        'managers' => null
+    ];
 
     public function __construct($logger)
     {
@@ -22,8 +28,6 @@ class LocalStorage
         $this->contactsFile = $this->dataDir . '/contacts.json';
         $this->companiesFile = $this->dataDir . '/companies.json';
         $this->dealsFile = $this->dataDir . '/deals.json';
-        $this->projectsFile = $this->dataDir . '/projects.json';
-        $this->managersFile = $this->dataDir . '/managers.json';
         $this->projectsFile = $this->dataDir . '/projects.json';
         $this->managersFile = $this->dataDir . '/managers.json';
 
@@ -41,45 +45,42 @@ class LocalStorage
     }
 
     /**
-     * Чтение данных из файла
+     * Чтение данных из файла с кэшированием
      */
-    private function readData($file)
+    private function readData($file, $cacheKey = null)
     {
+        if ($cacheKey && isset($this->cachedData[$cacheKey]) && $this->cachedData[$cacheKey] !== null) {
+            return $this->cachedData[$cacheKey];
+        }
+
         if (!file_exists($file)) {
             return [];
         }
 
         $data = json_decode(file_get_contents($file), true);
-        return $data ?: [];
+        $result = $data ?: [];
+
+        if ($cacheKey) {
+            $this->cachedData[$cacheKey] = $result;
+        }
+
+        return $result;
     }
 
     /**
      * Запись данных в файл
      */
-    private function writeData($file, $data)
+    private function writeData($file, $data, $cacheKey = null)
     {
-        $this->logger->info('Writing data to file', [
-            'file' => basename($file),
-            'data_keys_count' => count($data),
-            'file_writable' => is_writable($file),
-            'file_exists' => file_exists($file)
-        ]);
-
         $jsonData = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
 
         if ($jsonData === false) {
             $this->logger->error('JSON encoding failed', [
                 'file' => basename($file),
-                'json_error' => json_last_error_msg(),
-                'data_sample' => substr(print_r($data, true), 0, 200)
+                'json_error' => json_last_error_msg()
             ]);
             return false;
         }
-
-        $this->logger->info('JSON encoding successful', [
-            'file' => basename($file),
-            'json_length' => strlen($jsonData)
-        ]);
 
         $writeResult = file_put_contents($file, $jsonData);
 
@@ -92,10 +93,13 @@ class LocalStorage
             return false;
         }
 
-        $this->logger->info('File write successful', [
+        if ($cacheKey) {
+            $this->cachedData[$cacheKey] = $data;
+        }
+
+        $this->logger->debug('File write successful', [
             'file' => basename($file),
-            'bytes_written' => $writeResult,
-            'final_file_size' => filesize($file) ?? 'unknown'
+            'bytes_written' => $writeResult
         ]);
 
         return $writeResult;
@@ -106,14 +110,12 @@ class LocalStorage
      */
     public function createLK($contactData)
     {
-        $this->logger->info('Creating local LK for contact', ['contact_id' => $contactData['ID']]);
+        $this->logger->debug('Creating local LK for contact', ['contact_id' => $contactData['ID']]);
 
-        $contacts = $this->readData($this->contactsFile);
+        $contacts = $this->readData($this->contactsFile, 'contacts');
 
-        // Генерируем ID ЛК
         $lkId = 'LK-' . time() . '-' . $contactData['ID'];
 
-        // Сохраняем информацию из Bitrix24 согласно маппингу
         $lkData = [
             'id' => $lkId,
             'bitrix_id' => $contactData['ID'],
@@ -131,7 +133,7 @@ class LocalStorage
         ];
 
         $contacts[$contactData['ID']] = $lkData;
-        $this->writeData($this->contactsFile, $contacts);
+        $this->writeData($this->contactsFile, $contacts, 'contacts');
 
         $this->logger->info('Local LK created successfully', ['lk_id' => $lkId, 'contact_id' => $contactData['ID']]);
 
@@ -143,7 +145,6 @@ class LocalStorage
      */
     public function createCompany($companyData)
     {
-        // Извлекаем ID компании, проверяя разные возможные форматы
         $companyId = $companyData['ID'] ?? $companyData['id'] ?? null;
         
         if (empty($companyId)) {
@@ -155,9 +156,9 @@ class LocalStorage
             return false;
         }
 
-        $this->logger->info('Creating company locally', ['company_id' => $companyId]);
+        $this->logger->debug('Creating company locally', ['company_id' => $companyId]);
 
-        $companies = $this->readData($this->companiesFile);
+        $companies = $this->readData($this->companiesFile, 'companies');
 
         $companies[$companyId] = [
             'id' => $companyId,
@@ -175,7 +176,7 @@ class LocalStorage
             'source' => 'bitrix24_webhook'
         ];
 
-        $this->writeData($this->companiesFile, $companies);
+        $this->writeData($this->companiesFile, $companies, 'companies');
 
         $this->logger->info('Company created successfully', ['company_id' => $companyId]);
 
@@ -187,7 +188,6 @@ class LocalStorage
      */
     public function syncContactByBitrixId($contactId, $contactData)
     {
-        // Находим контакт по Bitrix ID
         $existingContact = $this->getContact($contactId);
 
         if (!$existingContact) {
@@ -197,7 +197,6 @@ class LocalStorage
             return false;
         }
 
-        // Используем LK ID для синхронизации
         return $this->syncContact($existingContact['id'], $contactData);
     }
 
@@ -206,20 +205,12 @@ class LocalStorage
      */
     public function syncContact($lkId, $contactData)
     {
-        $this->logger->info('Syncing contact data locally - START', [
+        $this->logger->debug('Syncing contact data locally', [
             'lk_id' => $lkId,
-            'contact_id' => $contactData['ID'],
-            'contact_name' => $contactData['NAME'] ?? 'N/A',
-            'contact_last_name' => $contactData['LAST_NAME'] ?? 'N/A'
+            'contact_id' => $contactData['ID']
         ]);
 
-        $contacts = $this->readData($this->contactsFile);
-        $this->logger->info('Contacts file read', [
-            'contacts_count' => count($contacts),
-            'file_exists' => file_exists($this->contactsFile),
-            'file_readable' => is_readable($this->contactsFile),
-            'file_writable' => is_writable($this->contactsFile)
-        ]);
+        $contacts = $this->readData($this->contactsFile, 'contacts');
 
         if (!isset($contacts[$contactData['ID']])) {
             $this->logger->warning('Contact not found in local storage, creating new', [
@@ -230,13 +221,10 @@ class LocalStorage
         }
 
         $oldData = $contacts[$contactData['ID']];
-        $this->logger->info('Contact found, preparing update', [
-            'contact_id' => $contactData['ID'],
-            'old_name' => $oldData['name'] ?? 'N/A',
-            'old_updated_at' => $oldData['updated_at'] ?? 'N/A'
+        $this->logger->debug('Contact found, preparing update', [
+            'contact_id' => $contactData['ID']
         ]);
 
-        // Обновляем данные контакта согласно маппингу
         $contacts[$contactData['ID']]['name'] = $contactData['NAME'] ?? $contacts[$contactData['ID']]['name'];
         $contacts[$contactData['ID']]['last_name'] = $contactData['LAST_NAME'] ?? $contacts[$contactData['ID']]['last_name'];
         $contacts[$contactData['ID']]['second_name'] = $contactData['SECOND_NAME'] ?? $contacts[$contactData['ID']]['second_name'];
@@ -247,33 +235,17 @@ class LocalStorage
         $newUpdatedAt = date('Y-m-d H:i:s');
         $contacts[$contactData['ID']]['updated_at'] = $newUpdatedAt;
 
-        $this->logger->info('Contact data updated in memory', [
-            'contact_id' => $contactData['ID'],
-            'new_name' => $contacts[$contactData['ID']]['name'],
-            'new_last_name' => $contacts[$contactData['ID']]['last_name'],
-            'new_updated_at' => $newUpdatedAt,
-            'email_is_array' => is_array($contacts[$contactData['ID']]['email']),
-            'phone_is_array' => is_array($contacts[$contactData['ID']]['phone'])
+        $this->logger->debug('Contact data updated in memory', [
+            'contact_id' => $contactData['ID']
         ]);
 
-        $writeResult = $this->writeData($this->contactsFile, $contacts);
-        $this->logger->info('Contact data write attempt completed', [
-            'contact_id' => $contactData['ID'],
-            'write_result' => $writeResult !== false,
-            'file_size_after_write' => filesize($this->contactsFile) ?? 'unknown'
-        ]);
-
-        // Проверяем, что данные действительно сохранились
-        $verifyContacts = $this->readData($this->contactsFile);
-        $verifyData = $verifyContacts[$contactData['ID']] ?? null;
-        $this->logger->info('Contact data verification after write', [
-            'contact_id' => $contactData['ID'],
-            'verification_success' => $verifyData !== null,
-            'verified_name' => $verifyData['name'] ?? 'N/A',
-            'verified_updated_at' => $verifyData['updated_at'] ?? 'N/A'
-        ]);
-
-        $this->logger->info('Contact data synced successfully - END', ['contact_id' => $contactData['ID']]);
+        $writeResult = $this->writeData($this->contactsFile, $contacts, 'contacts');
+        
+        if ($writeResult === false) {
+            $this->logger->error('Failed to write contact data', ['contact_id' => $contactData['ID']]);
+        } else {
+            $this->logger->info('Contact synced successfully', ['contact_id' => $contactData['ID']]);
+        }
 
         return true;
     }
@@ -283,9 +255,9 @@ class LocalStorage
      */
     public function syncCompany($lkId, $companyData)
     {
-        $this->logger->info('Syncing company data locally', ['lk_id' => $lkId, 'company_id' => $companyData['ID']]);
+        $this->logger->debug('Syncing company data locally', ['lk_id' => $lkId, 'company_id' => $companyData['ID']]);
 
-        $companies = $this->readData($this->companiesFile);
+        $companies = $this->readData($this->companiesFile, 'companies');
 
         $companies[$companyData['ID']] = [
             'id' => $companyData['ID'],
@@ -302,9 +274,13 @@ class LocalStorage
             'source' => 'bitrix24_webhook'
         ];
 
-        $this->writeData($this->companiesFile, $companies);
+        $writeResult = $this->writeData($this->companiesFile, $companies, 'companies');
 
-        $this->logger->info('Company data synced successfully', ['company_id' => $companyData['ID']]);
+        if ($writeResult === false) {
+            $this->logger->error('Failed to write company data', ['company_id' => $companyData['ID']]);
+        } else {
+            $this->logger->info('Company synced successfully', ['company_id' => $companyData['ID']]);
+        }
 
         return true;
     }
@@ -314,7 +290,7 @@ class LocalStorage
      */
     public function getAllContacts()
     {
-        return $this->readData($this->contactsFile);
+        return $this->readData($this->contactsFile, 'contacts');
     }
 
     /**
@@ -322,18 +298,16 @@ class LocalStorage
      */
     public function getLastUpdatedContact()
     {
-        $contacts = $this->readData($this->contactsFile);
+        $contacts = $this->readData($this->contactsFile, 'contacts');
 
         if (empty($contacts)) {
             return null;
         }
 
-        // Сортируем по времени обновления (новые сначала)
         uasort($contacts, function($a, $b) {
             return strtotime($b['updated_at'] ?? $b['created_at']) <=> strtotime($a['updated_at'] ?? $a['created_at']);
         });
 
-        // Возвращаем первый (самый свежий)
         return reset($contacts);
     }
 
@@ -342,13 +316,12 @@ class LocalStorage
      */
     public function getContactsSortedByUpdate($limit = null)
     {
-        $contacts = $this->readData($this->contactsFile);
+        $contacts = $this->readData($this->contactsFile, 'contacts');
 
         if (empty($contacts)) {
             return [];
         }
 
-        // Сортируем по времени обновления (новые сначала)
         uasort($contacts, function($a, $b) {
             return strtotime($b['updated_at'] ?? $b['created_at']) <=> strtotime($a['updated_at'] ?? $a['created_at']);
         });
@@ -365,7 +338,7 @@ class LocalStorage
      */
     public function getContact($contactId)
     {
-        $contacts = $this->readData($this->contactsFile);
+        $contacts = $this->readData($this->contactsFile, 'contacts');
         return $contacts[$contactId] ?? null;
     }
 
@@ -374,7 +347,7 @@ class LocalStorage
      */
     public function getContactByEmail($email)
     {
-        $contacts = $this->readData($this->contactsFile);
+        $contacts = $this->readData($this->contactsFile, 'contacts');
 
         foreach ($contacts as $contact) {
             if (isset($contact['email']) && $contact['email'] === $email) {
@@ -390,7 +363,7 @@ class LocalStorage
      */
     public function getAllCompanies()
     {
-        return $this->readData($this->companiesFile);
+        return $this->readData($this->companiesFile, 'companies');
     }
 
     /**
@@ -398,7 +371,7 @@ class LocalStorage
      */
     public function getCompany($companyId)
     {
-        $companies = $this->readData($this->companiesFile);
+        $companies = $this->readData($this->companiesFile, 'companies');
         return $companies[$companyId] ?? null;
     }
 
@@ -407,7 +380,7 @@ class LocalStorage
      */
     public function getAllDeals()
     {
-        return $this->readData($this->dealsFile);
+        return $this->readData($this->dealsFile, 'deals');
     }
 
     /**
@@ -415,7 +388,7 @@ class LocalStorage
      */
     public function getAllProjects()
     {
-        return $this->readData($this->projectsFile);
+        return $this->readData($this->projectsFile, 'projects');
     }
 
     /**
@@ -423,7 +396,7 @@ class LocalStorage
      */
     public function getAllManagers()
     {
-        return $this->readData($this->managersFile);
+        return $this->readData($this->managersFile, 'managers');
     }
 
     /**
@@ -431,9 +404,9 @@ class LocalStorage
      */
     public function addProject($projectData)
     {
-        $this->logger->info('Adding project locally', ['project_id' => $projectData['id'] ?? $projectData['ID'] ?? 'unknown']);
+        $this->logger->debug('Adding project locally', ['project_id' => $projectData['id'] ?? $projectData['ID'] ?? 'unknown']);
 
-        $projects = $this->readData($this->projectsFile);
+        $projects = $this->readData($this->projectsFile, 'projects');
 
         $projectId = $projectData['id'] ?? $projectData['ID'] ?? $projectData['bitrix_id'] ?? null;
         if (!$projectId) {
@@ -463,9 +436,13 @@ class LocalStorage
             'status' => $projects[$projectId]['status']
         ]);
 
-        $this->writeData($this->projectsFile, $projects);
+        $writeResult = $this->writeData($this->projectsFile, $projects, 'projects');
 
-        $this->logger->info('Project added successfully', ['project_id' => $projectId]);
+        if ($writeResult === false) {
+            $this->logger->error('Failed to write project data', ['project_id' => $projectId]);
+        } else {
+            $this->logger->info('Project added successfully', ['project_id' => $projectId]);
+        }
 
         return true;
     }
@@ -475,9 +452,9 @@ class LocalStorage
      */
     public function addManager($managerData)
     {
-        $this->logger->info('Adding manager locally', ['manager_id' => $managerData['ID'] ?? 'unknown']);
+        $this->logger->debug('Adding manager locally', ['manager_id' => $managerData['ID'] ?? 'unknown']);
 
-        $managers = $this->readData($this->managersFile);
+        $managers = $this->readData($this->managersFile, 'managers');
 
         $managerId = $managerData['ID'] ?? $managerData['bitrix_id'] ?? null;
         if (!$managerId) {
@@ -498,9 +475,13 @@ class LocalStorage
             'source' => 'bitrix24_webhook'
         ];
 
-        $this->writeData($this->managersFile, $managers);
+        $writeResult = $this->writeData($this->managersFile, $managers, 'managers');
 
-        $this->logger->info('Manager added successfully', ['manager_id' => $managerId]);
+        if ($writeResult === false) {
+            $this->logger->error('Failed to write manager data', ['manager_id' => $managerId]);
+        } else {
+            $this->logger->info('Manager added successfully', ['manager_id' => $managerId]);
+        }
 
         return true;
     }
@@ -510,7 +491,6 @@ class LocalStorage
      */
     public function syncCompanyByBitrixId($companyId, $companyData)
     {
-        // Находим компанию по Bitrix ID
         $existingCompany = $this->getCompany($companyId);
 
         if (!$existingCompany) {
@@ -520,7 +500,6 @@ class LocalStorage
             return $this->createCompany($companyData);
         }
 
-        // Используем company ID для синхронизации
         return $this->syncCompany($companyId, $companyData);
     }
 
@@ -529,9 +508,9 @@ class LocalStorage
      */
     public function syncProjectByBitrixId($projectId, $projectData)
     {
-        $this->logger->info('Syncing project by Bitrix ID', ['project_id' => $projectId]);
+        $this->logger->debug('Syncing project by Bitrix ID', ['project_id' => $projectId]);
 
-        $projects = $this->readData($this->projectsFile);
+        $projects = $this->readData($this->projectsFile, 'projects');
 
         if (!isset($projects[$projectId])) {
             $this->logger->warning('Project not found for sync by Bitrix ID, creating new', [
@@ -540,7 +519,6 @@ class LocalStorage
             return $this->addProject($projectData);
         }
 
-        // Обновляем данные проекта
         $projects[$projectId]['organization_name'] = $projectData['organization_name'] ?? $projects[$projectId]['organization_name'] ?? '';
         $projects[$projectId]['object_name'] = $projectData['object_name'] ?? $projects[$projectId]['object_name'] ?? '';
         $projects[$projectId]['system_type'] = $projectData['system_type'] ?? $projects[$projectId]['system_type'] ?? '';
@@ -558,9 +536,13 @@ class LocalStorage
             'status' => $projects[$projectId]['status']
         ]);
 
-        $this->writeData($this->projectsFile, $projects);
+        $writeResult = $this->writeData($this->projectsFile, $projects, 'projects');
 
-        $this->logger->info('Project synced successfully', ['project_id' => $projectId]);
+        if ($writeResult === false) {
+            $this->logger->error('Failed to write project data', ['project_id' => $projectId]);
+        } else {
+            $this->logger->info('Project synced successfully', ['project_id' => $projectId]);
+        }
 
         return true;
     }
@@ -570,9 +552,9 @@ class LocalStorage
      */
     public function syncManagerByBitrixId($managerId, $managerData)
     {
-        $this->logger->info('Syncing manager by Bitrix ID', ['manager_id' => $managerId]);
+        $this->logger->debug('Syncing manager by Bitrix ID', ['manager_id' => $managerId]);
 
-        $managers = $this->readData($this->managersFile);
+        $managers = $this->readData($this->managersFile, 'managers');
 
         if (!isset($managers[$managerId])) {
             $this->logger->warning('Manager not found for sync by Bitrix ID, creating new', [
@@ -581,7 +563,6 @@ class LocalStorage
             return $this->addManager($managerData);
         }
 
-        // Обновляем данные менеджера
         $managers[$managerId]['name'] = $managerData['NAME'] ?? $managers[$managerId]['name'];
         $managers[$managerId]['last_name'] = $managerData['LAST_NAME'] ?? $managers[$managerId]['last_name'];
         $managers[$managerId]['email'] = $managerData['EMAIL'] ?? $managers[$managerId]['email'];
@@ -590,9 +571,13 @@ class LocalStorage
         $managers[$managerId]['photo'] = $managerData['PERSONAL_PHOTO'] ?? $managers[$managerId]['photo'];
         $managers[$managerId]['updated_at'] = date('Y-m-d H:i:s');
 
-        $this->writeData($this->managersFile, $managers);
+        $writeResult = $this->writeData($this->managersFile, $managers, 'managers');
 
-        $this->logger->info('Manager synced successfully', ['manager_id' => $managerId]);
+        if ($writeResult === false) {
+            $this->logger->error('Failed to write manager data', ['manager_id' => $managerId]);
+        } else {
+            $this->logger->info('Manager synced successfully', ['manager_id' => $managerId]);
+        }
 
         return true;
     }
@@ -602,9 +587,9 @@ class LocalStorage
      */
     public function syncDealByBitrixId($dealId, $dealData)
     {
-        $this->logger->info('Syncing deal by Bitrix ID', ['deal_id' => $dealId]);
+        $this->logger->debug('Syncing deal by Bitrix ID', ['deal_id' => $dealId]);
 
-        $deals = $this->readData($this->dealsFile);
+        $deals = $this->readData($this->dealsFile, 'deals');
 
         if (!isset($deals[$dealId])) {
             $this->logger->warning('Deal not found for sync by Bitrix ID, creating new', [
@@ -613,7 +598,6 @@ class LocalStorage
             return $this->addDeal($dealData);
         }
 
-        // Обновляем данные сделки
         $deals[$dealId]['title'] = $dealData['TITLE'] ?? ($deals[$dealId]['title'] ?? '');
         $deals[$dealId]['stage'] = $dealData['STAGE_ID'] ?? ($deals[$dealId]['stage'] ?? '');
         $deals[$dealId]['opportunity'] = $dealData['OPPORTUNITY'] ?? ($deals[$dealId]['opportunity'] ?? '');
@@ -622,9 +606,13 @@ class LocalStorage
         $deals[$dealId]['company_id'] = $dealData['COMPANY_ID'] ?? ($deals[$dealId]['company_id'] ?? null);
         $deals[$dealId]['updated_at'] = date('Y-m-d H:i:s');
 
-        $this->writeData($this->dealsFile, $deals);
+        $writeResult = $this->writeData($this->dealsFile, $deals, 'deals');
 
-        $this->logger->info('Deal synced successfully', ['deal_id' => $dealId]);
+        if ($writeResult === false) {
+            $this->logger->error('Failed to write deal data', ['deal_id' => $dealId]);
+        } else {
+            $this->logger->info('Deal synced successfully', ['deal_id' => $dealId]);
+        }
 
         return true;
     }
@@ -634,7 +622,7 @@ class LocalStorage
      */
     public function addDeal($dealData)
     {
-        $deals = $this->readData($this->dealsFile);
+        $deals = $this->readData($this->dealsFile, 'deals');
 
         $deals[$dealData['ID']] = [
             'id' => $dealData['ID'],
@@ -649,9 +637,13 @@ class LocalStorage
             'source' => 'bitrix24_webhook'
         ];
 
-        $this->writeData($this->dealsFile, $deals);
+        $writeResult = $this->writeData($this->dealsFile, $deals, 'deals');
 
-        $this->logger->info('Deal data stored locally', ['deal_id' => $dealData['ID']]);
+        if ($writeResult === false) {
+            $this->logger->error('Failed to write deal data', ['deal_id' => $dealData['ID']]);
+        } else {
+            $this->logger->info('Deal stored successfully', ['deal_id' => $dealData['ID']]);
+        }
 
         return true;
     }
@@ -665,9 +657,8 @@ class LocalStorage
      */
     public function deleteContactData($contactId)
     {
-        $this->logger->info('Starting deletion of contact data and all related entities', ['contact_id' => $contactId]);
+        $this->logger->debug('Starting deletion of contact data and all related entities', ['contact_id' => $contactId]);
 
-        // Приводим contactId к строке для корректного сравнения
         $contactId = (string)$contactId;
         
         $deletedCompanies = [];
@@ -675,14 +666,13 @@ class LocalStorage
         $deletedProjects = [];
         $contactDeleted = false;
 
-        // Удаляем контакт
-        $contacts = $this->readData($this->contactsFile);
+        $contacts = $this->readData($this->contactsFile, 'contacts');
         if (isset($contacts[$contactId])) {
             unset($contacts[$contactId]);
-            $writeResult = $this->writeData($this->contactsFile, $contacts);
+            $writeResult = $this->writeData($this->contactsFile, $contacts, 'contacts');
             if ($writeResult !== false) {
                 $contactDeleted = true;
-                $this->logger->info('Contact deleted from local storage', ['contact_id' => $contactId]);
+                $this->logger->debug('Contact deleted from local storage', ['contact_id' => $contactId]);
             } else {
                 $this->logger->error('Failed to write contacts file after deletion', ['contact_id' => $contactId]);
             }
@@ -691,7 +681,7 @@ class LocalStorage
         }
 
         // Удаляем связанные компании
-        $companies = $this->readData($this->companiesFile);
+        $companies = $this->readData($this->companiesFile, 'companies');
         foreach ($companies as $companyId => $company) {
             $companyContactId = $company['contact_id'] ?? null;
             
@@ -711,11 +701,10 @@ class LocalStorage
             }
         }
         if (!empty($deletedCompanies)) {
-            $writeResult = $this->writeData($this->companiesFile, $companies);
+            $writeResult = $this->writeData($this->companiesFile, $companies, 'companies');
             if ($writeResult !== false) {
-                $this->logger->info('Related companies deleted', [
+                $this->logger->debug('Related companies deleted', [
                     'contact_id' => $contactId,
-                    'deleted_companies' => $deletedCompanies,
                     'count' => count($deletedCompanies)
                 ]);
             } else {
@@ -726,22 +715,19 @@ class LocalStorage
             }
         }
 
-        // Удаляем связанные сделки
-        $deals = $this->readData($this->dealsFile);
+        $deals = $this->readData($this->dealsFile, 'deals');
         foreach ($deals as $dealId => $deal) {
             $dealContactId = $deal['contact_id'] ?? null;
-            // Приводим к строке для сравнения
             if ((string)$dealContactId === $contactId) {
                 unset($deals[$dealId]);
                 $deletedDeals[] = $dealId;
             }
         }
         if (!empty($deletedDeals)) {
-            $writeResult = $this->writeData($this->dealsFile, $deals);
+            $writeResult = $this->writeData($this->dealsFile, $deals, 'deals');
             if ($writeResult !== false) {
-                $this->logger->info('Related deals deleted', [
+                $this->logger->debug('Related deals deleted', [
                     'contact_id' => $contactId,
-                    'deleted_deals' => $deletedDeals,
                     'count' => count($deletedDeals)
                 ]);
             } else {
@@ -752,22 +738,19 @@ class LocalStorage
             }
         }
 
-        // Удаляем связанные проекты
-        $projects = $this->readData($this->projectsFile);
+        $projects = $this->readData($this->projectsFile, 'projects');
         foreach ($projects as $projectId => $project) {
             $projectClientId = $project['client_id'] ?? null;
-            // Приводим к строке для сравнения
             if ((string)$projectClientId === $contactId) {
                 unset($projects[$projectId]);
                 $deletedProjects[] = $projectId;
             }
         }
         if (!empty($deletedProjects)) {
-            $writeResult = $this->writeData($this->projectsFile, $projects);
+            $writeResult = $this->writeData($this->projectsFile, $projects, 'projects');
             if ($writeResult !== false) {
-                $this->logger->info('Related projects deleted', [
+                $this->logger->debug('Related projects deleted', [
                     'contact_id' => $contactId,
-                    'deleted_projects' => $deletedProjects,
                     'count' => count($deletedProjects)
                 ]);
             } else {

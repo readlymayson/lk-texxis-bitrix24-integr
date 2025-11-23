@@ -1,16 +1,13 @@
 <?php
-# -*- coding: utf-8 -*-
 
 /**
  * Главная страница - Личный кабинет с данными из Bitrix24
  */
 
-// Подключение необходимых классов
 require_once __DIR__ . '/src/classes/Logger.php';
 require_once __DIR__ . '/src/classes/Bitrix24API.php';
 require_once __DIR__ . '/src/classes/LocalStorage.php';
 
-// Загрузка конфигурации
 $config = require_once __DIR__ . '/src/config/bitrix24.php';
 
 /**
@@ -81,6 +78,57 @@ function formatFieldValue($value, $fieldKey) {
 }
 
 /**
+ * Загрузка данных контакта и связанных сущностей
+ */
+function loadContactData($contact, $localStorage, $config) {
+    $userData = $contact;
+    $bitrixData = [
+        'contact' => null,
+        'company' => null,
+        'deals' => [],
+        'projects' => [],
+        'managers' => [],
+        'contacts' => [],
+        'companies' => []
+    ];
+
+    if (isset($contact['bitrix_data']) && !empty($contact['bitrix_data'])) {
+        $bitrixData['contact'] = $contact['bitrix_data'];
+    } else {
+        $contactMapping = $config['field_mapping']['contact'] ?? [];
+        $bitrixData['contact'] = [
+            'ID' => $contact['bitrix_id'],
+            ($contactMapping['name'] ?? 'NAME') => $contact['name'],
+            ($contactMapping['last_name'] ?? 'LAST_NAME') => $contact['last_name'],
+            ($contactMapping['email'] ?? 'EMAIL') => is_array($contact['email']) ? $contact['email'] : [['VALUE' => $contact['email']]],
+            ($contactMapping['phone'] ?? 'PHONE') => is_array($contact['phone']) ? $contact['phone'] : [['VALUE' => $contact['phone']]],
+            ($contactMapping['post'] ?? 'POST') => $contact['post'] ?? null,
+            ($contactMapping['company_title'] ?? 'COMPANY_TITLE') => $contact['company_title'] ?? null,
+            'COMPANY_ID' => $contact['company']
+        ];
+    }
+
+    if (!empty($contact['company'])) {
+        $bitrixData['company'] = $localStorage->getCompany($contact['company']);
+    }
+
+    $allDeals = $localStorage->getAllDeals();
+    $contactDeals = array_filter($allDeals, function($deal) use ($contact) {
+        $dealContactId = $deal['contact_id'] ?? null;
+        $contactBitrixId = $contact['bitrix_id'] ?? null;
+        return !empty($dealContactId) && !empty($contactBitrixId) && $dealContactId == $contactBitrixId;
+    });
+    $bitrixData['deals'] = !empty($contactDeals) ? $contactDeals : $allDeals;
+
+    $bitrixData['projects'] = $localStorage->getAllProjects();
+    $bitrixData['managers'] = $localStorage->getAllManagers();
+    $bitrixData['contacts'] = $localStorage->getAllContacts();
+    $bitrixData['companies'] = $localStorage->getAllCompanies();
+
+    return ['userData' => $userData, 'bitrixData' => $bitrixData];
+}
+
+/**
  * Автоматическое отображение полей сущности из маппинга
  */
 function renderEntityFields($entityData, $entityType, $config, $excludeFields = []) {
@@ -91,7 +139,6 @@ function renderEntityFields($entityData, $entityType, $config, $excludeFields = 
     $mapping = $config['field_mapping'][$entityType];
 
     foreach ($mapping as $fieldKey => $fieldCode) {
-        // Пропускаем служебные поля и исключенные поля
         if (in_array($fieldKey, array_merge(['lk_client_field', 'lk_client_values'], $excludeFields))) {
             continue;
         }
@@ -100,7 +147,6 @@ function renderEntityFields($entityData, $entityType, $config, $excludeFields = 
         $fieldValue = $entityData[$fieldCode] ?? null;
         $formattedValue = formatFieldValue($fieldValue, $fieldKey);
 
-        // Пропускаем пустые значения
         if ($formattedValue === 'Не указано') {
             continue;
         }
@@ -109,12 +155,10 @@ function renderEntityFields($entityData, $entityType, $config, $excludeFields = 
     }
 }
 
-// Инициализация логгера, API и локального хранилища
 $logger = new Logger($config);
 $bitrixAPI = new Bitrix24API($config, $logger);
 $localStorage = new LocalStorage($logger);
 
-// Данные пользователя (автоматически загружаем последний обновленный)
 $userData = null;
 $bitrixData = [
     'contact' => null,
@@ -127,111 +171,30 @@ $bitrixData = [
 ];
 $availableContacts = [];
 
-// Автоматически загружаем последний обновленный контакт
 try {
-    // Получаем все контакты отсортированные по времени обновления
-    $availableContacts = $localStorage->getContactsSortedByUpdate(10); // Последние 10 контактов
-
-    // Показываем последний обновленный контакт
+    $availableContacts = $localStorage->getContactsSortedByUpdate(10);
     $lastContact = $localStorage->getLastUpdatedContact();
 
     if ($lastContact) {
-        $userData = $lastContact;
-
-        // Используем полную информацию из Bitrix24, если она сохранена
-        if (isset($lastContact['bitrix_data']) && !empty($lastContact['bitrix_data'])) {
-            $bitrixData['contact'] = $lastContact['bitrix_data'];
-        } else {
-            // Fallback для старых записей
-            $contactMapping = $config['field_mapping']['contact'] ?? [];
-        $bitrixData['contact'] = [
-            'ID' => $lastContact['bitrix_id'],
-                ($contactMapping['name'] ?? 'NAME') => $lastContact['name'],
-                ($contactMapping['last_name'] ?? 'LAST_NAME') => $lastContact['last_name'],
-                ($contactMapping['email'] ?? 'EMAIL') => is_array($lastContact['email']) ? $lastContact['email'] : [['VALUE' => $lastContact['email']]],
-                ($contactMapping['phone'] ?? 'PHONE') => is_array($lastContact['phone']) ? $lastContact['phone'] : [['VALUE' => $lastContact['phone']]],
-                ($contactMapping['post'] ?? 'POST') => $lastContact['post'] ?? null,
-                ($contactMapping['company_title'] ?? 'COMPANY_TITLE') => $lastContact['company_title'] ?? null,
-            'COMPANY_ID' => $lastContact['company']
-        ];
-        }
-
-        // Получаем связанные данные
-        if (!empty($lastContact['company'])) {
-            $bitrixData['company'] = $localStorage->getCompany($lastContact['company']);
-        }
-
-        // Получаем все сделки для отображения
-        $allDeals = $localStorage->getAllDeals();
-        // Показываем сделки, привязанные к контакту, или все если нет привязанных
-        $contactDeals = array_filter($allDeals, function($deal) use ($lastContact) {
-            $dealContactId = $deal['contact_id'] ?? null;
-            $contactBitrixId = $lastContact['bitrix_id'] ?? null;
-            return !empty($dealContactId) && !empty($contactBitrixId) && $dealContactId == $contactBitrixId;
-        });
-        $bitrixData['deals'] = !empty($contactDeals) ? $contactDeals : $allDeals;
-
-        // Получаем все проекты, менеджеров, контакты и компании для отображения
-        $bitrixData['projects'] = $localStorage->getAllProjects();
-        $bitrixData['managers'] = $localStorage->getAllManagers();
-        $bitrixData['contacts'] = $localStorage->getAllContacts();
-        $bitrixData['companies'] = $localStorage->getAllCompanies();
+        $result = loadContactData($lastContact, $localStorage, $config);
+        $userData = $result['userData'];
+        $bitrixData = $result['bitrixData'];
     }
 } catch (Exception $e) {
     $logger->error('Error loading last contact data', ['error' => $e->getMessage()]);
 }
 
-// Обработка выбора контакта из списка
 if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['select_contact'])) {
     $selectedContactId = $_POST['select_contact'] ?? '';
 
     if (!empty($selectedContactId) && isset($availableContacts[$selectedContactId])) {
         $selectedContact = $availableContacts[$selectedContactId];
-
-        $userData = $selectedContact;
-
-        // Используем полную информацию из Bitrix24, если она сохранена
-        if (isset($selectedContact['bitrix_data']) && !empty($selectedContact['bitrix_data'])) {
-            $bitrixData['contact'] = $selectedContact['bitrix_data'];
-        } else {
-            // Fallback для старых записей
-            $contactMapping = $config['field_mapping']['contact'] ?? [];
-        $bitrixData['contact'] = [
-            'ID' => $selectedContact['bitrix_id'],
-                ($contactMapping['name'] ?? 'NAME') => $selectedContact['name'],
-                ($contactMapping['last_name'] ?? 'LAST_NAME') => $selectedContact['last_name'],
-                ($contactMapping['email'] ?? 'EMAIL') => is_array($selectedContact['email']) ? $selectedContact['email'] : [['VALUE' => $selectedContact['email']]],
-                ($contactMapping['phone'] ?? 'PHONE') => is_array($selectedContact['phone']) ? $selectedContact['phone'] : [['VALUE' => $selectedContact['phone']]],
-                ($contactMapping['post'] ?? 'POST') => $selectedContact['post'] ?? null,
-                ($contactMapping['company_title'] ?? 'COMPANY_TITLE') => $selectedContact['company_title'] ?? null,
-            'COMPANY_ID' => $selectedContact['company']
-        ];
-        }
-
-        // Получаем связанные данные
-        if (!empty($selectedContact['company'])) {
-            $bitrixData['company'] = $localStorage->getCompany($selectedContact['company']);
-        }
-
-        // Получаем все сделки для отображения
-        $allDeals = $localStorage->getAllDeals();
-        // Показываем сделки, привязанные к контакту, или все если нет привязанных
-        $contactDeals = array_filter($allDeals, function($deal) use ($selectedContact) {
-            $dealContactId = $deal['contact_id'] ?? null;
-            $contactBitrixId = $selectedContact['bitrix_id'] ?? null;
-            return !empty($dealContactId) && !empty($contactBitrixId) && $dealContactId == $contactBitrixId;
-        });
-        $bitrixData['deals'] = !empty($contactDeals) ? $contactDeals : $allDeals;
-
-        // Получаем все проекты, менеджеров, контакты и компании для отображения
-        $bitrixData['projects'] = $localStorage->getAllProjects();
-        $bitrixData['managers'] = $localStorage->getAllManagers();
-        $bitrixData['contacts'] = $localStorage->getAllContacts();
-        $bitrixData['companies'] = $localStorage->getAllCompanies();
+        $result = loadContactData($selectedContact, $localStorage, $config);
+        $userData = $result['userData'];
+        $bitrixData = $result['bitrixData'];
     }
 }
 
-// Проверка наличия данных из Bitrix24
 $hasBitrixData = $bitrixData['contact'] !== null;
 
 /**
