@@ -13,6 +13,102 @@ require_once __DIR__ . '/src/classes/LocalStorage.php';
 // Загрузка конфигурации
 $config = require_once __DIR__ . '/src/config/bitrix24.php';
 
+/**
+ * Получение читаемого названия поля для отображения
+ */
+function getFieldDisplayName($fieldKey) {
+    $fieldNames = [
+        'lk_client_field' => 'Поле ЛК клиента',
+        'lk_client_values' => 'Допустимые значения ЛК',
+        'email' => 'Email',
+        'phone' => 'Телефон',
+        'name' => 'Имя',
+        'last_name' => 'Фамилия',
+        'second_name' => 'Отчество',
+        'type_id' => 'Тип клиента',
+        'company_id' => 'Компания',
+        'title' => 'Название',
+        'organization_name' => 'Организация',
+        'object_name' => 'Объект',
+        'system_type' => 'Тип системы',
+        'location' => 'Местонахождение',
+        'implementation_date' => 'Дата реализации',
+        'status' => 'Статус',
+        'stage_id' => 'Стадия',
+        'client_id' => 'Клиент',
+        'manager_id' => 'Менеджер'
+    ];
+
+    return $fieldNames[$fieldKey] ?? ucfirst(str_replace('_', ' ', $fieldKey));
+}
+
+/**
+ * Форматирование значения поля для отображения
+ */
+function formatFieldValue($value, $fieldKey) {
+    if ($value === null || $value === '') {
+        return 'Не указано';
+    }
+
+    // Для массивов (email, phone)
+    if (is_array($value)) {
+        if (empty($value)) {
+            return 'Не указано';
+        }
+
+        // Для email и phone показываем первое значение
+        if (isset($value[0]['VALUE'])) {
+            return htmlspecialchars($value[0]['VALUE']);
+        }
+
+        return htmlspecialchars(implode(', ', $value));
+    }
+
+    // Специальное форматирование для дат
+    if (strpos($fieldKey, 'date') !== false || strpos($fieldKey, 'DATE') !== false) {
+        if (is_numeric($value)) {
+            return date('d.m.Y', $value);
+        }
+        try {
+            $date = new DateTime($value);
+            return $date->format('d.m.Y');
+        } catch (Exception $e) {
+            return htmlspecialchars($value);
+        }
+    }
+
+    return htmlspecialchars($value);
+}
+
+/**
+ * Автоматическое отображение полей сущности из маппинга
+ */
+function renderEntityFields($entityData, $entityType, $config, $excludeFields = []) {
+    if (empty($entityData) || !isset($config['field_mapping'][$entityType])) {
+        return;
+    }
+
+    $mapping = $config['field_mapping'][$entityType];
+
+    foreach ($mapping as $fieldKey => $fieldCode) {
+        // Пропускаем служебные поля и исключенные поля
+        if (in_array($fieldKey, array_merge(['lk_client_field', 'lk_client_values'], $excludeFields))) {
+            continue;
+        }
+
+        $displayName = getFieldDisplayName($fieldKey);
+        $fieldValue = $entityData[$fieldCode] ?? null;
+        $formattedValue = formatFieldValue($fieldValue, $fieldKey);
+
+        // Пропускаем пустые значения
+        if ($formattedValue === 'Не указано') {
+            continue;
+        }
+
+        echo '<tr><th>' . htmlspecialchars($displayName) . ':</th><td>' . $formattedValue . '</td></tr>' . PHP_EOL;
+    }
+}
+
 // Инициализация логгера, API и локального хранилища
 $logger = new Logger($config);
 $bitrixAPI = new Bitrix24API($config, $logger);
@@ -41,14 +137,24 @@ try {
 
     if ($lastContact) {
         $userData = $lastContact;
+
+        // Используем полную информацию из Bitrix24, если она сохранена
+        if (isset($lastContact['bitrix_data']) && !empty($lastContact['bitrix_data'])) {
+            $bitrixData['contact'] = $lastContact['bitrix_data'];
+        } else {
+            // Fallback для старых записей
+            $contactMapping = $config['field_mapping']['contact'] ?? [];
         $bitrixData['contact'] = [
             'ID' => $lastContact['bitrix_id'],
-            'NAME' => $lastContact['name'],
-            'LAST_NAME' => $lastContact['last_name'],
-            'EMAIL' => is_array($lastContact['email']) ? $lastContact['email'] : [['VALUE' => $lastContact['email']]],
-            'PHONE' => is_array($lastContact['phone']) ? $lastContact['phone'] : [['VALUE' => $lastContact['phone']]],
+                ($contactMapping['name'] ?? 'NAME') => $lastContact['name'],
+                ($contactMapping['last_name'] ?? 'LAST_NAME') => $lastContact['last_name'],
+                ($contactMapping['email'] ?? 'EMAIL') => is_array($lastContact['email']) ? $lastContact['email'] : [['VALUE' => $lastContact['email']]],
+                ($contactMapping['phone'] ?? 'PHONE') => is_array($lastContact['phone']) ? $lastContact['phone'] : [['VALUE' => $lastContact['phone']]],
+                ($contactMapping['post'] ?? 'POST') => $lastContact['post'] ?? null,
+                ($contactMapping['company_title'] ?? 'COMPANY_TITLE') => $lastContact['company_title'] ?? null,
             'COMPANY_ID' => $lastContact['company']
         ];
+        }
 
         // Получаем связанные данные
         if (!empty($lastContact['company'])) {
@@ -57,9 +163,13 @@ try {
 
         // Получаем все сделки для отображения
         $allDeals = $localStorage->getAllDeals();
-        $bitrixData['deals'] = array_filter($allDeals, function($deal) use ($lastContact) {
-            return $deal['contact_id'] == $lastContact['bitrix_id'];
+        // Показываем сделки, привязанные к контакту, или все если нет привязанных
+        $contactDeals = array_filter($allDeals, function($deal) use ($lastContact) {
+            $dealContactId = $deal['contact_id'] ?? null;
+            $contactBitrixId = $lastContact['bitrix_id'] ?? null;
+            return !empty($dealContactId) && !empty($contactBitrixId) && $dealContactId == $contactBitrixId;
         });
+        $bitrixData['deals'] = !empty($contactDeals) ? $contactDeals : $allDeals;
 
         // Получаем все проекты, менеджеров, контакты и компании для отображения
         $bitrixData['projects'] = $localStorage->getAllProjects();
@@ -79,14 +189,24 @@ if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST' &
         $selectedContact = $availableContacts[$selectedContactId];
 
         $userData = $selectedContact;
+
+        // Используем полную информацию из Bitrix24, если она сохранена
+        if (isset($selectedContact['bitrix_data']) && !empty($selectedContact['bitrix_data'])) {
+            $bitrixData['contact'] = $selectedContact['bitrix_data'];
+        } else {
+            // Fallback для старых записей
+            $contactMapping = $config['field_mapping']['contact'] ?? [];
         $bitrixData['contact'] = [
             'ID' => $selectedContact['bitrix_id'],
-            'NAME' => $selectedContact['name'],
-            'LAST_NAME' => $selectedContact['last_name'],
-            'EMAIL' => is_array($selectedContact['email']) ? $selectedContact['email'] : [['VALUE' => $selectedContact['email']]],
-            'PHONE' => is_array($selectedContact['phone']) ? $selectedContact['phone'] : [['VALUE' => $selectedContact['phone']]],
+                ($contactMapping['name'] ?? 'NAME') => $selectedContact['name'],
+                ($contactMapping['last_name'] ?? 'LAST_NAME') => $selectedContact['last_name'],
+                ($contactMapping['email'] ?? 'EMAIL') => is_array($selectedContact['email']) ? $selectedContact['email'] : [['VALUE' => $selectedContact['email']]],
+                ($contactMapping['phone'] ?? 'PHONE') => is_array($selectedContact['phone']) ? $selectedContact['phone'] : [['VALUE' => $selectedContact['phone']]],
+                ($contactMapping['post'] ?? 'POST') => $selectedContact['post'] ?? null,
+                ($contactMapping['company_title'] ?? 'COMPANY_TITLE') => $selectedContact['company_title'] ?? null,
             'COMPANY_ID' => $selectedContact['company']
         ];
+        }
 
         // Получаем связанные данные
         if (!empty($selectedContact['company'])) {
@@ -95,9 +215,13 @@ if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST' &
 
         // Получаем все сделки для отображения
         $allDeals = $localStorage->getAllDeals();
-        $bitrixData['deals'] = array_filter($allDeals, function($deal) use ($selectedContact) {
-            return $deal['contact_id'] == $selectedContact['bitrix_id'];
+        // Показываем сделки, привязанные к контакту, или все если нет привязанных
+        $contactDeals = array_filter($allDeals, function($deal) use ($selectedContact) {
+            $dealContactId = $deal['contact_id'] ?? null;
+            $contactBitrixId = $selectedContact['bitrix_id'] ?? null;
+            return !empty($dealContactId) && !empty($contactBitrixId) && $dealContactId == $contactBitrixId;
         });
+        $bitrixData['deals'] = !empty($contactDeals) ? $contactDeals : $allDeals;
 
         // Получаем все проекты, менеджеров, контакты и компании для отображения
         $bitrixData['projects'] = $localStorage->getAllProjects();
@@ -331,6 +455,7 @@ function getProjectStageText($stageId) {
                                         <li><strong>Компаний:</strong> <?php echo count($bitrixData['companies'] ?? []); ?> (связаны с контактами)</li>
                                         <li><strong>Проектов:</strong> <?php echo count($bitrixData['projects'] ?? []); ?> (по клиентам)</li>
                                         <li><strong>Менеджеров:</strong> <?php echo count($bitrixData['managers'] ?? []); ?> (справочно)</li>
+                                        <li><strong>Сделок:</strong> <?php echo count($bitrixData['deals'] ?? []); ?> (показаны для контакта)</li>
                                     </ul>
                                 </div>
                                 <div class="col-md-6">
@@ -426,15 +551,8 @@ function getProjectStageText($stageId) {
                         <?php if ($hasBitrixData): ?>
                         <h5>Bitrix24 - Контакт</h5>
                         <table class="table table-sm data-table">
-                            <tr><th>ID:</th><td><?php echo htmlspecialchars($bitrixData['contact']['ID']); ?> <span class="bitrix-badge">BX24</span></td></tr>
-                            <tr><th>Имя:</th><td><?php echo htmlspecialchars($bitrixData['contact']['NAME']); ?></td></tr>
-                            <tr><th>Фамилия:</th><td><?php echo htmlspecialchars($bitrixData['contact']['LAST_NAME'] ?? ''); ?></td></tr>
-                            <tr><th>Email:</th><td><?php echo htmlspecialchars($bitrixData['contact']['EMAIL'] ? $bitrixData['contact']['EMAIL'][0]['VALUE'] : $userData['email']); ?></td></tr>
-                            <tr><th>Телефон:</th><td><?php echo htmlspecialchars($bitrixData['contact']['PHONE'] ? $bitrixData['contact']['PHONE'][0]['VALUE'] : 'Не указан'); ?></td></tr>
-                            <tr><th>Должность:</th><td><?php echo htmlspecialchars($bitrixData['contact']['POST'] ?? 'Не указана'); ?></td></tr>
-                            <tr><th>Компания:</th><td><?php echo htmlspecialchars($bitrixData['contact']['COMPANY_ID'] ? 'ID: ' . $bitrixData['contact']['COMPANY_ID'] : 'Не указана'); ?></td></tr>
-                            <tr><th>Создан:</th><td><?php echo formatBitrixDate($bitrixData['contact']['DATE_CREATE'] ?? $userData['created_at']); ?></td></tr>
-                            <tr><th>Изменен:</th><td><?php echo formatBitrixDate($bitrixData['contact']['DATE_MODIFY'] ?? date('Y-m-d H:i:s')); ?></td></tr>
+                            <?php renderEntityFields($bitrixData['contact'], 'contact', $config); ?>
+                            <tr><th>ID:</th><td><?php echo htmlspecialchars($bitrixData['contact']['ID'] ?? ''); ?> <span class="bitrix-badge">BX24</span></td></tr>
                         </table>
                         <?php else: ?>
                         <div class="alert alert-warning">
@@ -481,6 +599,7 @@ function getProjectStageText($stageId) {
         </div>
         <?php endif; ?>
 
+
         <!-- Проекты -->
         <?php if (!empty($bitrixData['projects'])): ?>
         <div class="card mb-4">
@@ -515,11 +634,20 @@ function getProjectStageText($stageId) {
                                 <td><span class="badge bg-<?php echo getProjectStatusColor($project['status']); ?>"><?php echo getProjectStatusText($project['status']); ?></span></td>
                                 <td>
                                     <?php
-                                    $client = isset($bitrixData['contacts'][$project['client_id']]) ? $bitrixData['contacts'][$project['client_id']] : null;
+                                    $client = null;
+                                    if (!empty($project['client_id'])) {
+                                        foreach ($bitrixData['contacts'] as $contact) {
+                                            if (($contact['bitrix_id'] ?? '') == $project['client_id']) {
+                                                $client = $contact;
+                                                break;
+                                            }
+                                        }
+                                    }
                                     if ($client):
-                                        echo htmlspecialchars($client['name'] . ' ' . $client['last_name']);
-                                        if (!empty($client['email'])):
-                                            echo '<br><small class="text-muted">' . htmlspecialchars($client['email']) . '</small>';
+                                        echo htmlspecialchars(($client['name'] ?? '') . ' ' . ($client['last_name'] ?? ''));
+                                        $clientEmail = is_array($client['email'] ?? null) ? ($client['email'][0]['VALUE'] ?? '') : ($client['email'] ?? '');
+                                        if (!empty($clientEmail)):
+                                            echo '<br><small class="text-muted">' . htmlspecialchars($clientEmail) . '</small>';
                                         endif;
                                     else:
                                         echo '-';
@@ -528,9 +656,17 @@ function getProjectStageText($stageId) {
                                 </td>
                                 <td>
                                     <?php
-                                    $manager = isset($bitrixData['managers'][$project['manager_id']]) ? $bitrixData['managers'][$project['manager_id']] : null;
+                                    $manager = null;
+                                    if (!empty($project['manager_id'])) {
+                                        foreach ($bitrixData['managers'] as $mgr) {
+                                            if (($mgr['bitrix_id'] ?? '') == $project['manager_id']) {
+                                                $manager = $mgr;
+                                                break;
+                                            }
+                                        }
+                                    }
                                     if ($manager):
-                                        echo htmlspecialchars($manager['name'] . ' ' . $manager['last_name']);
+                                        echo htmlspecialchars(($manager['name'] ?? '') . ' ' . ($manager['last_name'] ?? ''));
                                         if (!empty($manager['position'])):
                                             echo '<br><small class="text-muted">' . htmlspecialchars($manager['position']) . '</small>';
                                         endif;
@@ -570,12 +706,17 @@ function getProjectStageText($stageId) {
                         <tbody>
                             <?php foreach ($bitrixData['deals'] as $deal): ?>
                             <tr>
-                                <td><?php echo htmlspecialchars($deal['ID']); ?></td>
-                                <td><?php echo htmlspecialchars($deal['TITLE']); ?></td>
-                                <td><span class="badge bg-<?php echo getDealStageColor($deal['STAGE_ID']); ?>"><?php echo getDealStageText($deal['STAGE_ID']); ?></span></td>
-                                <td><?php echo number_format($deal['OPPORTUNITY'], 0, ',', ' '); ?> <?php echo ($deal['CURRENCY_ID'] === 'RUB' ? '₽' : '$'); ?></td>
-                                <td><?php echo $deal['PROBABILITY']; ?>%</td>
-                                <td><?php echo formatBitrixDate($deal['DATE_CREATE']); ?></td>
+                                <td><?php echo htmlspecialchars($deal['id'] ?? $deal['ID'] ?? ''); ?></td>
+                                <td><?php echo htmlspecialchars($deal['title'] ?? $deal['TITLE'] ?? ''); ?></td>
+                                <td><span class="badge bg-<?php echo getDealStageColor($deal['stage'] ?? $deal['STAGE_ID'] ?? ''); ?>"><?php echo getDealStageText($deal['stage'] ?? $deal['STAGE_ID'] ?? ''); ?></span></td>
+                                <td><?php 
+                                    $amount = $deal['opportunity'] ?? $deal['OPPORTUNITY'] ?? 0;
+                                    $currency = $deal['currency'] ?? $deal['CURRENCY_ID'] ?? 'RUB';
+                                    echo number_format($amount, 0, ',', ' '); 
+                                    echo ($currency === 'RUB' || $currency === 'RUR' ? ' ₽' : ' $'); 
+                                ?></td>
+                                <td><?php echo $deal['probability'] ?? $deal['PROBABILITY'] ?? '0'; ?>%</td>
+                                <td><?php echo formatBitrixDate($deal['created_at'] ?? $deal['DATE_CREATE'] ?? ''); ?></td>
                             </tr>
                             <?php endforeach; ?>
                         </tbody>
@@ -585,6 +726,185 @@ function getProjectStageText($stageId) {
         </div>
         <?php endif; ?>
 
+        <!-- Менеджеры -->
+        <?php if (!empty($bitrixData['managers'])): ?>
+        <div class="card mb-4">
+            <div class="profile-header card-header">
+                <h4 class="mb-0"><i class="fas fa-users me-2"></i>Менеджеры (Bitrix24)</h4>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover data-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>ФИО</th>
+                                <th>Email</th>
+                                <th>Телефон</th>
+                                <th>Должность</th>
+                                <th>Создан</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($bitrixData['managers'] as $manager): ?>
+                            <tr>
+                                <td><?php echo htmlspecialchars($manager['bitrix_id']); ?></td>
+                                <td><?php echo htmlspecialchars(($manager['name'] ?? '') . ' ' . ($manager['last_name'] ?? '')); ?></td>
+                                <td><?php echo htmlspecialchars($manager['email'] ?? 'Не указан'); ?></td>
+                                <td><?php echo htmlspecialchars($manager['phone'] ?? 'Не указан'); ?></td>
+                                <td><?php echo htmlspecialchars($manager['position'] ?? 'Не указана'); ?></td>
+                                <td><?php echo formatBitrixDate($manager['created_at'] ?? 'Неизвестно'); ?></td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <?php endif; ?>
+
+        <!-- Все компании -->
+        <?php if (!empty($bitrixData['companies'])): ?>
+        <div class="card mb-4">
+            <div class="profile-header card-header">
+                <h4 class="mb-0"><i class="fas fa-building me-2"></i>Все компании (Bitrix24)</h4>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover data-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Название</th>
+                                <th>Тип</th>
+                                <th>Email</th>
+                                <th>Телефон</th>
+                                <th>Отрасль</th>
+                                <th>Создан</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($bitrixData['companies'] as $company): ?>
+                            <tr>
+                                <td><?php echo htmlspecialchars($company['id'] ?? $company['ID'] ?? ''); ?></td>
+                                <td><?php echo htmlspecialchars($company['title'] ?? $company['TITLE'] ?? ''); ?></td>
+                                <td><?php echo htmlspecialchars($company['type'] ?? $company['COMPANY_TYPE'] ?? 'Не указан'); ?></td>
+                                <td><?php 
+                                    $companyEmail = '';
+                                    if (isset($company['email'])) {
+                                        if (is_array($company['email'])) {
+                                            $companyEmail = $company['email'][0]['VALUE'] ?? '';
+                                        } else {
+                                            $companyEmail = $company['email'];
+                                        }
+                                    } elseif (isset($company['EMAIL'])) {
+                                        if (is_array($company['EMAIL'])) {
+                                            $companyEmail = $company['EMAIL'][0]['VALUE'] ?? '';
+                                        } else {
+                                            $companyEmail = $company['EMAIL'];
+                                        }
+                                    }
+                                    echo htmlspecialchars($companyEmail ?: 'Не указан');
+                                ?></td>
+                                <td><?php 
+                                    $companyPhone = '';
+                                    if (isset($company['phone'])) {
+                                        if (is_array($company['phone'])) {
+                                            $companyPhone = $company['phone'][0]['VALUE'] ?? '';
+                                        } else {
+                                            $companyPhone = $company['phone'];
+                                        }
+                                    } elseif (isset($company['PHONE'])) {
+                                        if (is_array($company['PHONE'])) {
+                                            $companyPhone = $company['PHONE'][0]['VALUE'] ?? '';
+                                        } else {
+                                            $companyPhone = $company['PHONE'];
+                                        }
+                                    }
+                                    echo htmlspecialchars($companyPhone ?: 'Не указан');
+                                ?></td>
+                                <td><?php echo htmlspecialchars($company['industry'] ?? $company['INDUSTRY'] ?? 'Не указана'); ?></td>
+                                <td><?php echo formatBitrixDate($company['created_at'] ?? $company['DATE_CREATE'] ?? ''); ?></td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <?php endif; ?>
+
+        <!-- Все контакты -->
+        <?php if (!empty($bitrixData['contacts'])): ?>
+        <div class="card mb-4">
+            <div class="profile-header card-header">
+                <h4 class="mb-0"><i class="fas fa-address-book me-2"></i>Все контакты (Bitrix24)</h4>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover data-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>ФИО</th>
+                                <th>Email</th>
+                                <th>Телефон</th>
+                                <th>Тип</th>
+                                <th>Компания</th>
+                                <th>Статус</th>
+                                <th>Обновлен</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($bitrixData['contacts'] as $contact): ?>
+                            <tr>
+                                <td><?php echo htmlspecialchars($contact['bitrix_id'] ?? $contact['id'] ?? ''); ?></td>
+                                <td><?php echo htmlspecialchars(trim(($contact['name'] ?? '') . ' ' . ($contact['second_name'] ?? '') . ' ' . ($contact['last_name'] ?? ''))); ?></td>
+                                <td><?php 
+                                    $contactEmail = '';
+                                    if (isset($contact['email'])) {
+                                        if (is_array($contact['email'])) {
+                                            $contactEmail = $contact['email'][0]['VALUE'] ?? '';
+                                        } else {
+                                            $contactEmail = $contact['email'];
+                                        }
+                                    }
+                                    echo htmlspecialchars($contactEmail ?: 'Не указан');
+                                ?></td>
+                                <td><?php 
+                                    $contactPhone = '';
+                                    if (isset($contact['phone'])) {
+                                        if (is_array($contact['phone'])) {
+                                            $contactPhone = $contact['phone'][0]['VALUE'] ?? '';
+                                        } else {
+                                            $contactPhone = $contact['phone'];
+                                        }
+                                    }
+                                    echo htmlspecialchars($contactPhone ?: 'Не указан');
+                                ?></td>
+                                <td><?php echo htmlspecialchars($contact['type_id'] ?? 'Не указан'); ?></td>
+                                <td><?php 
+                                    $companyName = '-';
+                                    if (!empty($contact['company'])) {
+                                        $company = $localStorage->getCompany($contact['company']);
+                                        if ($company) {
+                                            $companyName = htmlspecialchars($company['title'] ?? $company['TITLE'] ?? $contact['company']);
+                                        } else {
+                                            $companyName = htmlspecialchars($contact['company']);
+                                        }
+                                    }
+                                    echo $companyName;
+                                ?></td>
+                                <td><span class="badge bg-<?php echo ($contact['status'] ?? '') === 'active' ? 'success' : 'secondary'; ?>"><?php echo htmlspecialchars($contact['status'] ?? 'Не указан'); ?></span></td>
+                                <td><?php echo formatBitrixDate($contact['updated_at'] ?? $contact['created_at'] ?? ''); ?></td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <?php endif; ?>
         <?php else: ?>
         <!-- Сообщение о недоступности данных -->
         <div class="card mb-4">
@@ -593,6 +913,39 @@ function getProjectStageText($stageId) {
             </div>
             <div class="card-body">
                 <div class="alert alert-info">
+
+        <!-- RAW JSON данные -->
+        <div class="card">
+            <div class="profile-header card-header">
+                <h4 class="mb-0"><i class="fas fa-code me-2"></i>RAW данные из Bitrix24</h4>
+            </div>
+            <div class="card-body">
+                <?php if ($hasBitrixData): ?>
+                    <div class="alert alert-info mb-3">
+                        <small>Показаны локальные данные личного кабинета.</small>
+                    </div>
+                    <div class="json-viewer"><?php echo json_encode($bitrixData, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE); ?></div>
+                <?php else: ?>
+                    <div class="alert alert-warning mb-3">
+                        <small>Данные из Bitrix24 недоступны. <?php
+                            if ($userData['status'] === 'not_found') {
+                                echo 'Контакт с указанным email не найден в системе.';
+                            } elseif ($userData['status'] === 'api_error') {
+                                echo 'Ошибка подключения к API Bitrix24.';
+                            } else {
+                                echo 'Проверьте настройки интеграции.';
+                            }
+                        ?></small>
+                    </div>
+                    <div class="json-viewer"><?php echo json_encode($bitrixData, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE); ?></div>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
                     <h5><i class="fas fa-info-circle me-2"></i>Причина отсутствия данных</h5>
                     <ul class="mb-0">
                         <?php if ($userData['status'] === 'not_found'): ?>
@@ -645,35 +998,3 @@ function getProjectStageText($stageId) {
         </div>
         <?php endif; ?>
 
-        <!-- RAW JSON данные -->
-        <div class="card">
-            <div class="profile-header card-header">
-                <h4 class="mb-0"><i class="fas fa-code me-2"></i>RAW данные из Bitrix24</h4>
-            </div>
-            <div class="card-body">
-                <?php if ($hasBitrixData): ?>
-                    <div class="alert alert-info mb-3">
-                        <small>Показаны локальные данные личного кабинета.</small>
-                    </div>
-                    <div class="json-viewer"><?php echo json_encode($bitrixData, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE); ?></div>
-                <?php else: ?>
-                    <div class="alert alert-warning mb-3">
-                        <small>Данные из Bitrix24 недоступны. <?php
-                            if ($userData['status'] === 'not_found') {
-                                echo 'Контакт с указанным email не найден в системе.';
-                            } elseif ($userData['status'] === 'api_error') {
-                                echo 'Ошибка подключения к API Bitrix24.';
-                            } else {
-                                echo 'Проверьте настройки интеграции.';
-                            }
-                        ?></small>
-                    </div>
-                    <div class="json-viewer"><?php echo json_encode($bitrixData, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE); ?></div>
-                <?php endif; ?>
-            </div>
-        </div>
-    </div>
-
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>

@@ -122,20 +122,11 @@ class Bitrix24API
 
         // Получаем список полей для выборки из конфига маппинга
         $selectFields = $this->getMappedFieldsForEntity($entityType);
+
         $params = ['id' => $entityId];
 
         // Для смарт-процессов добавляем entityTypeId
-        if ($entityType === 'smart_process') {
-            $smartProcessId = $this->config['bitrix24']['smart_process_id'] ?? '';
-            if (!empty($smartProcessId)) {
-                $params['entityTypeId'] = $smartProcessId;
-                $this->logger->debug('Using smart process entityTypeId', [
-                    'entity_type_id' => $smartProcessId
-                ]);
-            } else {
-                $this->logger->warning('Smart process ID not configured in config');
-            }
-        }
+        $this->addSmartProcessParams($entityType, $params);
 
         if (!empty($selectFields)) {
             $params['select'] = $selectFields;
@@ -184,31 +175,76 @@ class Bitrix24API
         if (!empty($filter)) {
             $params['filter'] = $filter;
         }
+        
+        // Если select не передан, используем поля из конфигурации
+        if (empty($select)) {
+            $select = $this->getMappedFieldsForEntity($entityType);
+        }
+        
         if (!empty($select)) {
             $params['select'] = $select;
+            $this->logger->debug('Using mapped fields for entity list retrieval', [
+                'entity_type' => $entityType,
+                'select_fields' => $select
+            ]);
         }
+
+        // Для смарт-процессов добавляем entityTypeId
+        $this->addSmartProcessParams($entityType, $params);
 
         return $this->makeApiCall($method, $params);
     }
 
     /**
-     * Обновление данных сущности
+     * Получение связанных контактов компании
+     * В Bitrix24 компания может быть связана с контактами через множественную связь
+     * 
+     * @param int $companyId ID компании
+     * @return array|false Массив контактов или false при ошибке
      */
-    public function updateEntity($entityType, $entityId, $fields)
+    public function getCompanyContacts($companyId)
     {
-        $method = $this->getApiMethodForEntity($entityType, 'update');
+        $this->logger->info('Getting company contacts from Bitrix24 API', [
+            'company_id' => $companyId
+        ]);
 
-        if (!$method) {
-            $this->logger->error('Unsupported entity type for update API call', ['entity_type' => $entityType]);
+        $method = 'crm.company.contact.items.get';
+        $params = ['id' => $companyId];
+
+        $result = $this->makeApiCall($method, $params);
+
+        if ($result && isset($result['result'])) {
+            $contacts = $result['result'];
+            
+            // Логируем структуру ответа для отладки
+            $this->logger->debug('Company contacts API response structure', [
+                'company_id' => $companyId,
+                'result_type' => gettype($contacts),
+                'is_array' => is_array($contacts),
+                'contacts_count' => is_array($contacts) ? count($contacts) : 0,
+                'first_item_keys' => is_array($contacts) && !empty($contacts) && isset($contacts[0]) ? array_keys($contacts[0]) : 'not_array_or_empty'
+            ]);
+            
+            if (is_array($contacts) && !empty($contacts)) {
+                $this->logger->info('Successfully retrieved company contacts', [
+                    'company_id' => $companyId,
+                    'contacts_count' => count($contacts)
+                ]);
+                return $contacts;
+            } else {
+                $this->logger->info('Company contacts list is empty', [
+                    'company_id' => $companyId
+                ]);
+                return [];
+            }
+        } else {
+            $this->logger->warning('Failed to retrieve company contacts or no contacts found', [
+                'company_id' => $companyId,
+                'result_type' => gettype($result),
+                'result_keys' => is_array($result) ? array_keys($result) : 'not_array'
+            ]);
             return false;
         }
-
-        $params = [
-            'id' => $entityId,
-            'fields' => $fields
-        ];
-
-        return $this->makeApiCall($method, $params);
     }
 
     /**
@@ -237,7 +273,7 @@ class Bitrix24API
                 'Content-Type: application/json; charset=utf-8',
                 'Accept: application/json'
             ],
-            CURLOPT_TIMEOUT => $this->config['lk']['timeout'],
+            CURLOPT_TIMEOUT => $this->config['bitrix24']['timeout'],
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_ENCODING => '', // Автоматическая декомпрессия
@@ -293,6 +329,24 @@ class Bitrix24API
         ]);
 
         return $result;
+    }
+
+    /**
+     * Добавление параметров для смарт-процессов (entityTypeId)
+     */
+    private function addSmartProcessParams($entityType, &$params)
+    {
+        if ($entityType === 'smart_process') {
+            $smartProcessId = $this->config['bitrix24']['smart_process_id'] ?? '';
+            if (!empty($smartProcessId)) {
+                $params['entityTypeId'] = $smartProcessId;
+                $this->logger->debug('Using smart process entityTypeId', [
+                    'entity_type_id' => $smartProcessId
+                ]);
+            } else {
+                $this->logger->warning('Smart process ID not configured in config');
+            }
+        }
     }
 
     /**
@@ -353,11 +407,11 @@ class Bitrix24API
             return [];
         }
 
-        // Собираем все поля из маппинга, кроме служебных (lk_client_values)
+        // Собираем все поля из маппинга, кроме служебных (lk_client_values, lk_client_field)
         $fields = [];
         foreach ($mapping as $key => $value) {
             // Пропускаем служебные поля
-            if ($key === 'lk_client_values') {
+            if ($key === 'lk_client_values' || $key === 'lk_client_field') {
                 continue;
             }
 
@@ -372,13 +426,23 @@ class Bitrix24API
             $fields[] = 'ID';
         }
 
+        // Для компаний и сделок добавляем CONTACT_ID, если он используется для связи
+        if (($entityType === 'company' || $entityType === 'deal') && !in_array('CONTACT_ID', $fields)) {
+            if (isset($mapping['contact_id']) && !empty($mapping['contact_id'])) {
+                $fields[] = $mapping['contact_id'];
+            }
+        }
+
+        // Удаляем дубликаты и переиндексируем массив для корректной JSON сериализации
+        $fields = array_values(array_unique($fields));
+
         $this->logger->debug('Extracted mapped fields for entity', [
             'entity_type' => $entityType,
             'mapped_fields' => $fields,
             'mapping_keys' => array_keys($mapping)
         ]);
 
-        return array_unique($fields);
+        return $fields;
     }
 
     /**
@@ -400,6 +464,170 @@ class Bitrix24API
         }
 
         return false;
+    }
+
+    /**
+     * Создание элемента смарт-процесса
+     * 
+     * @param int $entityTypeId ID смарт-процесса в Bitrix24
+     * @param array $fields Поля для создания элемента
+     * @return array|false Результат создания или false при ошибке
+     */
+    public function addSmartProcessItem($entityTypeId, $fields = [])
+    {
+        $this->logger->info('Creating smart process item', [
+            'entity_type_id' => $entityTypeId,
+            'fields_count' => count($fields),
+            'fields_keys' => array_keys($fields)
+        ]);
+
+        $method = 'crm.item.add';
+        $params = [
+            'entityTypeId' => $entityTypeId,
+            'fields' => $fields
+        ];
+
+        $result = $this->makeApiCall($method, $params);
+
+        if ($result && isset($result['result']['item'])) {
+            $itemId = $result['result']['item']['id'] ?? null;
+            $this->logger->info('Smart process item created successfully', [
+                'entity_type_id' => $entityTypeId,
+                'item_id' => $itemId
+            ]);
+            return $result['result']['item'];
+        } else {
+            $this->logger->error('Failed to create smart process item', [
+                'entity_type_id' => $entityTypeId,
+                'result' => $result
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * Создание карточки в смарт-процессе "Изменение данных в ЛК"
+     * 
+     * @param array $data Данные для создания карточки
+     * @return array|false Результат создания или false при ошибке
+     */
+    public function createChangeDataCard($data)
+    {
+        $smartProcessId = $this->config['bitrix24']['smart_process_change_data_id'] ?? '';
+        
+        if (empty($smartProcessId)) {
+            $this->logger->warning('Smart process ID for change data not configured');
+            return false;
+        }
+
+        $mapping = $this->config['field_mapping']['smart_process_change_data'] ?? [];
+        
+        if (empty($mapping)) {
+            $this->logger->warning('Field mapping for change data smart process not configured');
+            return false;
+        }
+
+        // Формируем поля для создания карточки на основе маппинга
+        $fields = [];
+        
+        // Базовые поля (контакт, компания, менеджер)
+        if (isset($data['contact_id']) && !empty($mapping['contact_id'])) {
+            $fields[$mapping['contact_id']] = $data['contact_id'];
+        }
+        
+        if (isset($data['company_id']) && !empty($mapping['company_id'])) {
+            $fields[$mapping['company_id']] = $data['company_id'];
+        }
+        
+        if (isset($data['manager_id']) && !empty($mapping['manager_id'])) {
+            $fields[$mapping['manager_id']] = $data['manager_id'];
+        }
+
+        // Поля для изменения личных данных
+        if (isset($data['new_email']) && !empty($mapping['new_email'])) {
+            $fields[$mapping['new_email']] = $data['new_email'];
+        }
+        
+        if (isset($data['new_phone']) && !empty($mapping['new_phone'])) {
+            $fields[$mapping['new_phone']] = $data['new_phone'];
+        }
+        
+        if (isset($data['change_reason_personal']) && !empty($mapping['change_reason_personal'])) {
+            $fields[$mapping['change_reason_personal']] = $data['change_reason_personal'];
+        }
+
+        // Поля для изменения данных о компании
+        if (isset($data['new_company_name']) && !empty($mapping['new_company_name'])) {
+            $fields[$mapping['new_company_name']] = $data['new_company_name'];
+        }
+        
+        if (isset($data['new_company_website']) && !empty($mapping['new_company_website'])) {
+            $fields[$mapping['new_company_website']] = $data['new_company_website'];
+        }
+        
+        if (isset($data['new_company_inn']) && !empty($mapping['new_company_inn'])) {
+            $fields[$mapping['new_company_inn']] = $data['new_company_inn'];
+        }
+        
+        if (isset($data['new_company_phone']) && !empty($mapping['new_company_phone'])) {
+            $fields[$mapping['new_company_phone']] = $data['new_company_phone'];
+        }
+        
+        if (isset($data['change_reason_company']) && !empty($mapping['change_reason_company'])) {
+            $fields[$mapping['change_reason_company']] = $data['change_reason_company'];
+        }
+
+        $this->logger->debug('Prepared fields for change data card', [
+            'smart_process_id' => $smartProcessId,
+            'fields' => $fields
+        ]);
+
+        return $this->addSmartProcessItem($smartProcessId, $fields);
+    }
+
+    /**
+     * Создание карточки в смарт-процессе "Удаление пользовательских данных"
+     * 
+     * @param array $data Данные для создания карточки
+     * @return array|false Результат создания или false при ошибке
+     */
+    public function createDeleteDataCard($data)
+    {
+        $smartProcessId = $this->config['bitrix24']['smart_process_delete_data_id'] ?? '';
+        
+        if (empty($smartProcessId)) {
+            $this->logger->warning('Smart process ID for delete data not configured');
+            return false;
+        }
+
+        $mapping = $this->config['field_mapping']['smart_process_delete_data'] ?? [];
+        
+        if (empty($mapping)) {
+            $this->logger->warning('Field mapping for delete data smart process not configured');
+            return false;
+        }
+
+        // Формируем поля для создания карточки на основе маппинга
+        $fields = [];
+        
+        if (isset($data['contact_id']) && !empty($mapping['contact_id'])) {
+            $fields[$mapping['contact_id']] = $data['contact_id'];
+        }
+        
+        if (isset($data['company_id']) && !empty($mapping['company_id'])) {
+            $fields[$mapping['company_id']] = $data['company_id'];
+        }
+        
+        if (isset($data['manager_id']) && !empty($mapping['manager_id'])) {
+            $fields[$mapping['manager_id']] = $data['manager_id'];
+        }
+
+        $this->logger->debug('Prepared fields for delete data card', [
+            'smart_process_id' => $smartProcessId,
+            'fields' => $fields
+        ]);
+
+        return $this->addSmartProcessItem($smartProcessId, $fields);
     }
 }
 

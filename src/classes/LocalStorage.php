@@ -12,8 +12,8 @@ class LocalStorage
     private $contactsFile;
     private $companiesFile;
     private $dealsFile;
-    private $projectsFile; // ДОБАВИТЬ ДЛЯ ПРОЕКТОВ
-    private $managersFile; // ДОБАВИТЬ ДЛЯ МЕНЕДЖЕРОВ
+    private $projectsFile;
+    private $managersFile;
 
     public function __construct($logger)
     {
@@ -22,8 +22,10 @@ class LocalStorage
         $this->contactsFile = $this->dataDir . '/contacts.json';
         $this->companiesFile = $this->dataDir . '/companies.json';
         $this->dealsFile = $this->dataDir . '/deals.json';
-        $this->projectsFile = $this->dataDir . '/projects.json'; // ДОБАВИТЬ
-        $this->managersFile = $this->dataDir . '/managers.json'; // ДОБАВИТЬ
+        $this->projectsFile = $this->dataDir . '/projects.json';
+        $this->managersFile = $this->dataDir . '/managers.json';
+        $this->projectsFile = $this->dataDir . '/projects.json';
+        $this->managersFile = $this->dataDir . '/managers.json';
 
         $this->ensureDataDirectory();
     }
@@ -111,13 +113,16 @@ class LocalStorage
         // Генерируем ID ЛК
         $lkId = 'LK-' . time() . '-' . $contactData['ID'];
 
+        // Сохраняем информацию из Bitrix24 согласно маппингу
         $lkData = [
             'id' => $lkId,
             'bitrix_id' => $contactData['ID'],
             'name' => $contactData['NAME'] ?? '',
             'last_name' => $contactData['LAST_NAME'] ?? '',
+            'second_name' => $contactData['SECOND_NAME'] ?? '',
             'email' => $contactData['EMAIL'] ?? '',
             'phone' => $contactData['PHONE'] ?? '',
+            'type_id' => $contactData['TYPE_ID'] ?? '',
             'company' => $contactData['COMPANY_ID'] ?? null,
             'status' => 'active',
             'created_at' => date('Y-m-d H:i:s'),
@@ -134,12 +139,76 @@ class LocalStorage
     }
 
     /**
+     * Создание компании
+     */
+    public function createCompany($companyData)
+    {
+        // Извлекаем ID компании, проверяя разные возможные форматы
+        $companyId = $companyData['ID'] ?? $companyData['id'] ?? null;
+        
+        if (empty($companyId)) {
+            $this->logger->error('Company ID is missing in company data', [
+                'data_keys' => array_keys($companyData),
+                'has_id' => isset($companyData['ID']),
+                'has_lowercase_id' => isset($companyData['id'])
+            ]);
+            return false;
+        }
+
+        $this->logger->info('Creating company locally', ['company_id' => $companyId]);
+
+        $companies = $this->readData($this->companiesFile);
+
+        $companies[$companyId] = [
+            'id' => $companyId,
+            'title' => $companyData['TITLE'] ?? $companyData['title'] ?? '',
+            'email' => $companyData['EMAIL'] ?? $companyData['email'] ?? '',
+            'phone' => $companyData['PHONE'] ?? $companyData['phone'] ?? '',
+            'type' => $companyData['COMPANY_TYPE'] ?? $companyData['company_type'] ?? '',
+            'industry' => $companyData['INDUSTRY'] ?? $companyData['industry'] ?? '',
+            'employees' => $companyData['EMPLOYEES'] ?? $companyData['employees'] ?? '',
+            'revenue' => $companyData['REVENUE'] ?? $companyData['revenue'] ?? '',
+            'address' => $companyData['ADDRESS'] ?? $companyData['address'] ?? '',
+            'contact_id' => $companyData['CONTACT_ID'] ?? null,
+            'created_at' => date('Y-m-d H:i:s'),
+            'updated_at' => date('Y-m-d H:i:s'),
+            'source' => 'bitrix24_webhook'
+        ];
+
+        $this->writeData($this->companiesFile, $companies);
+
+        $this->logger->info('Company created successfully', ['company_id' => $companyId]);
+
+        return true;
+    }
+
+    /**
+     * Синхронизация данных контакта по Bitrix ID
+     */
+    public function syncContactByBitrixId($contactId, $contactData)
+    {
+        // Находим контакт по Bitrix ID
+        $existingContact = $this->getContact($contactId);
+
+        if (!$existingContact) {
+            $this->logger->warning('Contact not found for sync by Bitrix ID', [
+                'contact_id' => $contactId
+            ]);
+            return false;
+        }
+
+        // Используем LK ID для синхронизации
+        return $this->syncContact($existingContact['id'], $contactData);
+    }
+
+    /**
      * Синхронизация данных контакта
      */
-    public function syncContactByBitrixId($bitrixId, $contactData)
+    public function syncContact($lkId, $contactData)
     {
-        $this->logger->info('Syncing contact data locally by bitrix_id - START', [
-            'contact_bitrix_id' => $bitrixId,
+        $this->logger->info('Syncing contact data locally - START', [
+            'lk_id' => $lkId,
+            'contact_id' => $contactData['ID'],
             'contact_name' => $contactData['NAME'] ?? 'N/A',
             'contact_last_name' => $contactData['LAST_NAME'] ?? 'N/A'
         ]);
@@ -167,11 +236,13 @@ class LocalStorage
             'old_updated_at' => $oldData['updated_at'] ?? 'N/A'
         ]);
 
-        // Обновляем данные контакта
+        // Обновляем данные контакта согласно маппингу
         $contacts[$contactData['ID']]['name'] = $contactData['NAME'] ?? $contacts[$contactData['ID']]['name'];
         $contacts[$contactData['ID']]['last_name'] = $contactData['LAST_NAME'] ?? $contacts[$contactData['ID']]['last_name'];
+        $contacts[$contactData['ID']]['second_name'] = $contactData['SECOND_NAME'] ?? $contacts[$contactData['ID']]['second_name'];
         $contacts[$contactData['ID']]['email'] = $contactData['EMAIL'] ?? $contacts[$contactData['ID']]['email'];
         $contacts[$contactData['ID']]['phone'] = $contactData['PHONE'] ?? $contacts[$contactData['ID']]['phone'];
+        $contacts[$contactData['ID']]['type_id'] = $contactData['TYPE_ID'] ?? $contacts[$contactData['ID']]['type_id'];
         $contacts[$contactData['ID']]['company'] = $contactData['COMPANY_ID'] ?? $contacts[$contactData['ID']]['company'];
         $newUpdatedAt = date('Y-m-d H:i:s');
         $contacts[$contactData['ID']]['updated_at'] = $newUpdatedAt;
@@ -210,9 +281,9 @@ class LocalStorage
     /**
      * Синхронизация данных компании
      */
-    public function syncCompanyByBitrixId($bitrixId, $companyData)
+    public function syncCompany($lkId, $companyData)
     {
-        $this->logger->info('Syncing company data locally by bitrix_id', ['company_bitrix_id' => $bitrixId, 'company_title' => $companyData['TITLE'] ?? 'N/A']);
+        $this->logger->info('Syncing company data locally', ['lk_id' => $lkId, 'company_id' => $companyData['ID']]);
 
         $companies = $this->readData($this->companiesFile);
 
@@ -225,6 +296,7 @@ class LocalStorage
             'employees' => $companyData['EMPLOYEES'] ?? '',
             'revenue' => $companyData['REVENUE'] ?? '',
             'address' => $companyData['ADDRESS'] ?? '',
+            'contact_id' => $companyData['CONTACT_ID'] ?? null,
             'created_at' => $companyData['DATE_CREATE'] ?? date('Y-m-d H:i:s'),
             'updated_at' => date('Y-m-d H:i:s'),
             'source' => 'bitrix24_webhook'
@@ -339,6 +411,225 @@ class LocalStorage
     }
 
     /**
+     * Получение всех проектов
+     */
+    public function getAllProjects()
+    {
+        return $this->readData($this->projectsFile);
+    }
+
+    /**
+     * Получение всех менеджеров
+     */
+    public function getAllManagers()
+    {
+        return $this->readData($this->managersFile);
+    }
+
+    /**
+     * Добавление проекта
+     */
+    public function addProject($projectData)
+    {
+        $this->logger->info('Adding project locally', ['project_id' => $projectData['id'] ?? $projectData['ID'] ?? 'unknown']);
+
+        $projects = $this->readData($this->projectsFile);
+
+        $projectId = $projectData['id'] ?? $projectData['ID'] ?? $projectData['bitrix_id'] ?? null;
+        if (!$projectId) {
+            $this->logger->error('Project ID not found in data', ['project_data_keys' => array_keys($projectData)]);
+            return false;
+        }
+
+        $projects[$projectId] = [
+            'bitrix_id' => $projectId,
+            'organization_name' => $projectData['organization_name'] ?? '',
+            'object_name' => $projectData['object_name'] ?? '',
+            'system_type' => $projectData['system_type'] ?? '',
+            'location' => $projectData['location'] ?? '',
+            'implementation_date' => $projectData['implementation_date'] ?? null,
+            'status' => $projectData['status'] ?? '',
+            'client_id' => $projectData['client_id'] ?? null,
+            'manager_id' => $projectData['manager_id'] ?? null,
+            'created_at' => $projectData['created_at'] ?? date('Y-m-d H:i:s'),
+            'updated_at' => date('Y-m-d H:i:s'),
+            'source' => 'bitrix24_webhook'
+        ];
+        
+        $this->logger->debug('Project data being saved', [
+            'project_id' => $projectId,
+            'organization_name' => $projects[$projectId]['organization_name'],
+            'client_id' => $projects[$projectId]['client_id'],
+            'status' => $projects[$projectId]['status']
+        ]);
+
+        $this->writeData($this->projectsFile, $projects);
+
+        $this->logger->info('Project added successfully', ['project_id' => $projectId]);
+
+        return true;
+    }
+
+    /**
+     * Добавление менеджера
+     */
+    public function addManager($managerData)
+    {
+        $this->logger->info('Adding manager locally', ['manager_id' => $managerData['ID'] ?? 'unknown']);
+
+        $managers = $this->readData($this->managersFile);
+
+        $managerId = $managerData['ID'] ?? $managerData['bitrix_id'] ?? null;
+        if (!$managerId) {
+            $this->logger->error('Manager ID not found in data', ['manager_data_keys' => array_keys($managerData)]);
+            return false;
+        }
+
+        $managers[$managerId] = [
+            'bitrix_id' => $managerId,
+            'name' => $managerData['NAME'] ?? '',
+            'last_name' => $managerData['LAST_NAME'] ?? '',
+            'email' => $managerData['EMAIL'] ?? '',
+            'phone' => $managerData['PHONE'] ?? '',
+            'position' => $managerData['WORK_POSITION'] ?? '',
+            'photo' => $managerData['PERSONAL_PHOTO'] ?? '',
+            'created_at' => date('Y-m-d H:i:s'),
+            'updated_at' => date('Y-m-d H:i:s'),
+            'source' => 'bitrix24_webhook'
+        ];
+
+        $this->writeData($this->managersFile, $managers);
+
+        $this->logger->info('Manager added successfully', ['manager_id' => $managerId]);
+
+        return true;
+    }
+
+    /**
+     * Синхронизация данных компании по Bitrix ID
+     */
+    public function syncCompanyByBitrixId($companyId, $companyData)
+    {
+        // Находим компанию по Bitrix ID
+        $existingCompany = $this->getCompany($companyId);
+
+        if (!$existingCompany) {
+            $this->logger->warning('Company not found for sync by Bitrix ID, creating new', [
+                'company_id' => $companyId
+            ]);
+            return $this->createCompany($companyData);
+        }
+
+        // Используем company ID для синхронизации
+        return $this->syncCompany($companyId, $companyData);
+    }
+
+    /**
+     * Синхронизация данных проекта по Bitrix ID
+     */
+    public function syncProjectByBitrixId($projectId, $projectData)
+    {
+        $this->logger->info('Syncing project by Bitrix ID', ['project_id' => $projectId]);
+
+        $projects = $this->readData($this->projectsFile);
+
+        if (!isset($projects[$projectId])) {
+            $this->logger->warning('Project not found for sync by Bitrix ID, creating new', [
+                'project_id' => $projectId
+            ]);
+            return $this->addProject($projectData);
+        }
+
+        // Обновляем данные проекта
+        $projects[$projectId]['organization_name'] = $projectData['organization_name'] ?? $projects[$projectId]['organization_name'] ?? '';
+        $projects[$projectId]['object_name'] = $projectData['object_name'] ?? $projects[$projectId]['object_name'] ?? '';
+        $projects[$projectId]['system_type'] = $projectData['system_type'] ?? $projects[$projectId]['system_type'] ?? '';
+        $projects[$projectId]['location'] = $projectData['location'] ?? $projects[$projectId]['location'] ?? '';
+        $projects[$projectId]['implementation_date'] = $projectData['implementation_date'] ?? $projects[$projectId]['implementation_date'] ?? null;
+        $projects[$projectId]['status'] = $projectData['status'] ?? $projects[$projectId]['status'] ?? 'NEW';
+        $projects[$projectId]['client_id'] = $projectData['client_id'] ?? $projects[$projectId]['client_id'] ?? null;
+        $projects[$projectId]['manager_id'] = $projectData['manager_id'] ?? $projects[$projectId]['manager_id'] ?? null;
+        $projects[$projectId]['updated_at'] = date('Y-m-d H:i:s');
+        
+        $this->logger->debug('Project data being updated', [
+            'project_id' => $projectId,
+            'organization_name' => $projects[$projectId]['organization_name'],
+            'client_id' => $projects[$projectId]['client_id'],
+            'status' => $projects[$projectId]['status']
+        ]);
+
+        $this->writeData($this->projectsFile, $projects);
+
+        $this->logger->info('Project synced successfully', ['project_id' => $projectId]);
+
+        return true;
+    }
+
+    /**
+     * Синхронизация данных менеджера по Bitrix ID
+     */
+    public function syncManagerByBitrixId($managerId, $managerData)
+    {
+        $this->logger->info('Syncing manager by Bitrix ID', ['manager_id' => $managerId]);
+
+        $managers = $this->readData($this->managersFile);
+
+        if (!isset($managers[$managerId])) {
+            $this->logger->warning('Manager not found for sync by Bitrix ID, creating new', [
+                'manager_id' => $managerId
+            ]);
+            return $this->addManager($managerData);
+        }
+
+        // Обновляем данные менеджера
+        $managers[$managerId]['name'] = $managerData['NAME'] ?? $managers[$managerId]['name'];
+        $managers[$managerId]['last_name'] = $managerData['LAST_NAME'] ?? $managers[$managerId]['last_name'];
+        $managers[$managerId]['email'] = $managerData['EMAIL'] ?? $managers[$managerId]['email'];
+        $managers[$managerId]['phone'] = $managerData['PHONE'] ?? $managers[$managerId]['phone'];
+        $managers[$managerId]['position'] = $managerData['WORK_POSITION'] ?? $managers[$managerId]['position'];
+        $managers[$managerId]['photo'] = $managerData['PERSONAL_PHOTO'] ?? $managers[$managerId]['photo'];
+        $managers[$managerId]['updated_at'] = date('Y-m-d H:i:s');
+
+        $this->writeData($this->managersFile, $managers);
+
+        $this->logger->info('Manager synced successfully', ['manager_id' => $managerId]);
+
+        return true;
+    }
+
+    /**
+     * Синхронизация данных сделки по Bitrix ID
+     */
+    public function syncDealByBitrixId($dealId, $dealData)
+    {
+        $this->logger->info('Syncing deal by Bitrix ID', ['deal_id' => $dealId]);
+
+        $deals = $this->readData($this->dealsFile);
+
+        if (!isset($deals[$dealId])) {
+            $this->logger->warning('Deal not found for sync by Bitrix ID, creating new', [
+                'deal_id' => $dealId
+            ]);
+            return $this->addDeal($dealData);
+        }
+
+        // Обновляем данные сделки
+        $deals[$dealId]['title'] = $dealData['TITLE'] ?? ($deals[$dealId]['title'] ?? '');
+        $deals[$dealId]['stage'] = $dealData['STAGE_ID'] ?? ($deals[$dealId]['stage'] ?? '');
+        $deals[$dealId]['opportunity'] = $dealData['OPPORTUNITY'] ?? ($deals[$dealId]['opportunity'] ?? '');
+        $deals[$dealId]['currency'] = $dealData['CURRENCY_ID'] ?? ($deals[$dealId]['currency'] ?? '');
+        $deals[$dealId]['contact_id'] = $dealData['CONTACT_ID'] ?? ($deals[$dealId]['contact_id'] ?? null);
+        $deals[$dealId]['company_id'] = $dealData['COMPANY_ID'] ?? ($deals[$dealId]['company_id'] ?? null);
+        $deals[$dealId]['updated_at'] = date('Y-m-d H:i:s');
+
+        $this->writeData($this->dealsFile, $deals);
+
+        $this->logger->info('Deal synced successfully', ['deal_id' => $dealId]);
+
+        return true;
+    }
+
+    /**
      * Добавление сделки
      */
     public function addDeal($dealData)
@@ -366,94 +657,137 @@ class LocalStorage
     }
 
     /**
-     * Получение всех проектов
+     * Удаление всех данных контакта из базы данных
+     * Удаляет контакт и все связанные с ним сущности: компании, сделки и проекты
+     * 
+     * @param string $contactId ID контакта в Bitrix24
+     * @return bool true при успешном удалении, false при ошибке
      */
-    public function getAllProjects()
+    public function deleteContactData($contactId)
     {
-        return $this->readData($this->projectsFile);
-    }
+        $this->logger->info('Starting deletion of contact data and all related entities', ['contact_id' => $contactId]);
 
-    /**
-     * Получение проекта по ID
-     */
-    public function getProject($projectId)
-    {
+        // Приводим contactId к строке для корректного сравнения
+        $contactId = (string)$contactId;
+        
+        $deletedCompanies = [];
+        $deletedDeals = [];
+        $deletedProjects = [];
+        $contactDeleted = false;
+
+        // Удаляем контакт
+        $contacts = $this->readData($this->contactsFile);
+        if (isset($contacts[$contactId])) {
+            unset($contacts[$contactId]);
+            $writeResult = $this->writeData($this->contactsFile, $contacts);
+            if ($writeResult !== false) {
+                $contactDeleted = true;
+                $this->logger->info('Contact deleted from local storage', ['contact_id' => $contactId]);
+            } else {
+                $this->logger->error('Failed to write contacts file after deletion', ['contact_id' => $contactId]);
+            }
+        } else {
+            $this->logger->warning('Contact not found in local storage', ['contact_id' => $contactId]);
+        }
+
+        // Удаляем связанные компании
+        $companies = $this->readData($this->companiesFile);
+        foreach ($companies as $companyId => $company) {
+            $companyContactId = $company['contact_id'] ?? null;
+            
+            // Проверяем связь через contact_id (может быть строкой, числом или массивом)
+            $shouldDelete = false;
+            if (is_array($companyContactId)) {
+                // Если это массив, проверяем наличие contactId в массиве
+                $shouldDelete = in_array($contactId, array_map('strval', $companyContactId), true);
+            } else {
+                // Приводим к строке для сравнения
+                $shouldDelete = ((string)$companyContactId === $contactId);
+            }
+            
+            if ($shouldDelete) {
+                unset($companies[$companyId]);
+                $deletedCompanies[] = $companyId;
+            }
+        }
+        if (!empty($deletedCompanies)) {
+            $writeResult = $this->writeData($this->companiesFile, $companies);
+            if ($writeResult !== false) {
+                $this->logger->info('Related companies deleted', [
+                    'contact_id' => $contactId,
+                    'deleted_companies' => $deletedCompanies,
+                    'count' => count($deletedCompanies)
+                ]);
+            } else {
+                $this->logger->error('Failed to write companies file after deletion', [
+                    'contact_id' => $contactId,
+                    'deleted_companies' => $deletedCompanies
+                ]);
+            }
+        }
+
+        // Удаляем связанные сделки
+        $deals = $this->readData($this->dealsFile);
+        foreach ($deals as $dealId => $deal) {
+            $dealContactId = $deal['contact_id'] ?? null;
+            // Приводим к строке для сравнения
+            if ((string)$dealContactId === $contactId) {
+                unset($deals[$dealId]);
+                $deletedDeals[] = $dealId;
+            }
+        }
+        if (!empty($deletedDeals)) {
+            $writeResult = $this->writeData($this->dealsFile, $deals);
+            if ($writeResult !== false) {
+                $this->logger->info('Related deals deleted', [
+                    'contact_id' => $contactId,
+                    'deleted_deals' => $deletedDeals,
+                    'count' => count($deletedDeals)
+                ]);
+            } else {
+                $this->logger->error('Failed to write deals file after deletion', [
+                    'contact_id' => $contactId,
+                    'deleted_deals' => $deletedDeals
+                ]);
+            }
+        }
+
+        // Удаляем связанные проекты
         $projects = $this->readData($this->projectsFile);
-        return $projects[$projectId] ?? null;
-    }
+        foreach ($projects as $projectId => $project) {
+            $projectClientId = $project['client_id'] ?? null;
+            // Приводим к строке для сравнения
+            if ((string)$projectClientId === $contactId) {
+                unset($projects[$projectId]);
+                $deletedProjects[] = $projectId;
+            }
+        }
+        if (!empty($deletedProjects)) {
+            $writeResult = $this->writeData($this->projectsFile, $projects);
+            if ($writeResult !== false) {
+                $this->logger->info('Related projects deleted', [
+                    'contact_id' => $contactId,
+                    'deleted_projects' => $deletedProjects,
+                    'count' => count($deletedProjects)
+                ]);
+            } else {
+                $this->logger->error('Failed to write projects file after deletion', [
+                    'contact_id' => $contactId,
+                    'deleted_projects' => $deletedProjects
+                ]);
+            }
+        }
 
-    /**
-     * Добавление/обновление проекта
-     */
-    public function addProject($projectData)
-    {
-        $projects = $this->readData($this->projectsFile);
-
-        $projectId = $projectData['bitrix_id'] ?? $projectData['id'] ?? $projectData['ID'] ?? null;
-
-        $projects[$projectId] = [
-            'bitrix_id' => $projectId,
-            'organization_name' => $projectData['organization_name'] ?? '',
-            'object_name' => $projectData['object_name'] ?? '',
-            'system_type' => $projectData['system_type'] ?? '',
-            'location' => $projectData['location'] ?? '',
-            'implementation_date' => $projectData['implementation_date'] ?? null,
-            'status' => $projectData['status'] ?? '',
-            'client_id' => $projectData['client_id'] ?? null,
-            'manager_id' => $projectData['manager_id'] ?? null,
-            'lk_id' => $projectData['lk_id'] ?? null,
-            'created_at' => $projectData['created_at'] ?? $projectData['DATE_CREATE'] ?? date('Y-m-d H:i:s'),
-            'updated_at' => $projectData['updated_at'] ?? $projectData['DATE_MODIFY'] ?? date('Y-m-d H:i:s'),
-            'source' => 'bitrix24_webhook'
-        ];
-
-        $this->writeData($this->projectsFile, $projects);
-
-        $this->logger->info('Project data stored locally', ['project_id' => $projectId]);
-
-        return true;
-    }
-
-    /**
-     * Получение всех менеджеров
-     */
-    public function getAllManagers()
-    {
-        return $this->readData($this->managersFile);
-    }
-
-    /**
-     * Получение менеджера по ID
-     */
-    public function getManager($managerId)
-    {
-        $managers = $this->readData($this->managersFile);
-        return $managers[$managerId] ?? null;
-    }
-
-    /**
-     * Добавление/обновление менеджера
-     */
-    public function addManager($managerData)
-    {
-        $managers = $this->readData($this->managersFile);
-
-        $managers[$managerData['ID']] = [
-            'bitrix_id' => $managerData['ID'],
-            'name' => $managerData['name'] ?? '',
-            'last_name' => $managerData['last_name'] ?? '',
-            'email' => $managerData['email'] ?? '',
-            'phone' => $managerData['phone'] ?? '',
-            'position' => $managerData['position'] ?? '',
-            'photo' => $managerData['photo'] ?? '',
-            'created_at' => $managerData['created_at'] ?? date('Y-m-d H:i:s'),
-            'updated_at' => $managerData['updated_at'] ?? date('Y-m-d H:i:s'),
-            'source' => 'bitrix24_webhook'
-        ];
-
-        $this->writeData($this->managersFile, $managers);
-
-        $this->logger->info('Manager data stored locally', ['manager_id' => $managerData['ID']]);
+        $totalDeleted = count($deletedCompanies) + count($deletedDeals) + count($deletedProjects);
+        
+        $this->logger->info('Contact data deletion completed', [
+            'contact_id' => $contactId,
+            'contact_deleted' => $contactDeleted,
+            'companies_deleted' => count($deletedCompanies),
+            'deals_deleted' => count($deletedDeals),
+            'projects_deleted' => count($deletedProjects),
+            'total_related_entities_deleted' => $totalDeleted
+        ]);
 
         return true;
     }
