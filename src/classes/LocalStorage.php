@@ -126,6 +126,7 @@ class LocalStorage
             'phone' => $contactData['PHONE'] ?? '',
             'type_id' => $contactData['TYPE_ID'] ?? '',
             'company' => $contactData['COMPANY_ID'] ?? null,
+            'agent_contract_status' => $contactData['UF_CRM_65CA1E9F08E72'] ?? null,
             'status' => 'active',
             'created_at' => date('Y-m-d H:i:s'),
             'updated_at' => date('Y-m-d H:i:s'),
@@ -171,6 +172,7 @@ class LocalStorage
             'revenue' => $companyData['REVENUE'] ?? $companyData['revenue'] ?? '',
             'address' => $companyData['ADDRESS'] ?? $companyData['address'] ?? '',
             'contact_id' => $companyData['CONTACT_ID'] ?? null,
+            'partner_contract_status' => $companyData['UF_CRM_65CA23468EF2E'] ?? null,
             'created_at' => date('Y-m-d H:i:s'),
             'updated_at' => date('Y-m-d H:i:s'),
             'source' => 'bitrix24_webhook'
@@ -232,6 +234,7 @@ class LocalStorage
         $contacts[$contactData['ID']]['phone'] = $contactData['PHONE'] ?? $contacts[$contactData['ID']]['phone'];
         $contacts[$contactData['ID']]['type_id'] = $contactData['TYPE_ID'] ?? $contacts[$contactData['ID']]['type_id'];
         $contacts[$contactData['ID']]['company'] = $contactData['COMPANY_ID'] ?? $contacts[$contactData['ID']]['company'];
+        $contacts[$contactData['ID']]['agent_contract_status'] = $contactData['UF_CRM_65CA1E9F08E72'] ?? $contacts[$contactData['ID']]['agent_contract_status'] ?? null;
         $newUpdatedAt = date('Y-m-d H:i:s');
         $contacts[$contactData['ID']]['updated_at'] = $newUpdatedAt;
 
@@ -269,6 +272,7 @@ class LocalStorage
             'revenue' => $companyData['REVENUE'] ?? '',
             'address' => $companyData['ADDRESS'] ?? '',
             'contact_id' => $companyData['CONTACT_ID'] ?? null,
+            'partner_contract_status' => $companyData['UF_CRM_65CA23468EF2E'] ?? null,
             'created_at' => $companyData['DATE_CREATE'] ?? date('Y-m-d H:i:s'),
             'updated_at' => date('Y-m-d H:i:s'),
             'source' => 'bitrix24_webhook'
