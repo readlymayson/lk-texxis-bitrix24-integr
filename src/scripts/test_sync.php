@@ -2,7 +2,7 @@
 
 /**
  * Скрипт для тестовой синхронизации одного ЛК с его связанными сущностями
- * Синхронизирует контакт, его компании, проекты, сделки и менеджера
+ * Синхронизирует контакт, его компании, проекты и менеджера
  * 
  * Использование:
  * php test_sync.php [contact_id]
@@ -42,13 +42,70 @@ function mapProjectData($projectData, $mapping, $logger)
     $projectId = $projectData['id'] ?? $projectData['ID'] ?? null;
     $clientId = extractContactId($projectData[$mapping['client_id']] ?? null);
     
+    // Обработка списочного поля "Тип запросов"
+    $requestTypeRaw = $projectData[$mapping['request_type']] ?? null;
+    $requestType = '';
+    if (!empty($requestTypeRaw)) {
+        if (is_array($requestTypeRaw)) {
+            $requestType = $requestTypeRaw[0] ?? $requestTypeRaw['ID'] ?? '';
+        } else {
+            $requestType = (string)$requestTypeRaw;
+        }
+    }
+    
+    // Обработка поля файла "Перечень оборудования"
+    $equipmentListRaw = $projectData[$mapping['equipment_list']] ?? null;
+    $equipmentList = null;
+    if (!empty($equipmentListRaw)) {
+        if (is_array($equipmentListRaw)) {
+            $equipmentList = [];
+            foreach ($equipmentListRaw as $file) {
+                if (is_array($file)) {
+                    $equipmentList[] = [
+                        'id' => $file['id'] ?? $file['ID'] ?? null,
+                        'name' => $file['name'] ?? $file['NAME'] ?? null,
+                        'url' => $file['downloadUrl'] ?? $file['DOWNLOAD_URL'] ?? null,
+                        'size' => $file['size'] ?? $file['SIZE'] ?? null
+                    ];
+                } else {
+                    $equipmentList[] = ['id' => $file];
+                }
+            }
+        } else {
+            $equipmentList = [['id' => $equipmentListRaw]];
+        }
+    }
+    
+    // Обработка чекбокса "Маркетинговая скидка"
+    $marketingDiscountRaw = $projectData[$mapping['marketing_discount']] ?? null;
+    $marketingDiscount = false;
+    if (!empty($marketingDiscountRaw)) {
+        if (is_bool($marketingDiscountRaw)) {
+            $marketingDiscount = $marketingDiscountRaw;
+        } elseif (is_numeric($marketingDiscountRaw)) {
+            $marketingDiscount = (int)$marketingDiscountRaw === 1;
+        } elseif (is_string($marketingDiscountRaw)) {
+            $marketingDiscount = in_array(strtoupper($marketingDiscountRaw), ['Y', 'YES', 'TRUE', '1']);
+        }
+    }
+    
+    // Техническое описание проекта (многострочный текст)
+    $technicalDescription = $projectData[$mapping['technical_description']] ?? '';
+    
     return [
         'bitrix_id' => $projectId,
         'organization_name' => $projectData[$mapping['organization_name']] ?? '',
         'object_name' => $projectData[$mapping['object_name']] ?? '',
-        'system_type' => $projectData[$mapping['system_type']] ?? '',
+        'system_types' => is_array($projectData[$mapping['system_types']] ?? null) 
+            ? $projectData[$mapping['system_types']] 
+            : (!empty($projectData[$mapping['system_types']]) ? [$projectData[$mapping['system_types']]] : []),
         'location' => $projectData[$mapping['location']] ?? '',
         'implementation_date' => $projectData[$mapping['implementation_date']] ?? null,
+        'request_type' => $requestType,
+        'equipment_list' => $equipmentList,
+        'competitors' => $projectData[$mapping['competitors']] ?? '',
+        'marketing_discount' => $marketingDiscount,
+        'technical_description' => $technicalDescription,
         'status' => $projectData[$mapping['status']] ?? 'NEW',
         'client_id' => $clientId,
         'manager_id' => $projectData['assignedById'] ?? $projectData['ASSIGNED_BY_ID'] ?? null
@@ -62,30 +119,39 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
 {
     $results = [
         'companies' => ['count' => 0, 'success' => 0, 'failed' => 0],
-        'projects' => ['count' => 0, 'success' => 0, 'failed' => 0],
-        'deals' => ['count' => 0, 'success' => 0, 'failed' => 0]
+        'projects' => ['count' => 0, 'success' => 0, 'failed' => 0]
     ];
 
     $logger->info('Checking for related companies for contact', ['contact_id' => $contactId]);
     try {
-        $companies = $bitrixAPI->getEntityList('company', [
-            'filter' => ['CONTACT_ID' => $contactId]
-        ]);
+        $companies = $bitrixAPI->getEntityList('company', ['CONTACT_ID' => $contactId]);
 
         if ($companies && isset($companies['result'])) {
             $companyList = $companies['result'];
-            $results['companies']['count'] = count($companyList);
             $logger->info('Found related companies for contact', [
                 'contact_id' => $contactId,
                 'companies_count' => count($companyList)
             ]);
 
+            $results['companies']['count'] = 0;
             foreach ($companyList as $company) {
                 $companyId = $company['ID'];
                 $fullCompanyData = $bitrixAPI->getEntityData('company', $companyId);
                 if ($fullCompanyData && isset($fullCompanyData['result'])) {
                     $companyData = $fullCompanyData['result'];
-                    $companyData['CONTACT_ID'] = $contactId;
+
+                    // Проверяем фактическую привязку к контакту
+                    $companyContactId = extractContactId($companyData['CONTACT_ID'] ?? null);
+                    if (empty($companyContactId) || (string)$companyContactId !== (string)$contactId) {
+                        $logger->info('Skipping company - contact mismatch or empty', [
+                            'company_id' => $companyId,
+                            'expected_contact_id' => $contactId,
+                            'actual_contact_id' => $companyContactId
+                        ]);
+                        continue;
+                    }
+
+                    $results['companies']['count']++;
                     $syncResult = $localStorage->syncCompanyByBitrixId($companyId, $companyData);
                     if ($syncResult) {
                         $results['companies']['success']++;
@@ -106,16 +172,17 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
             $mapping = $config['field_mapping']['smart_process'];
             $clientFieldName = $mapping['client_id'] ?? 'contactId';
             
-            $projects = $bitrixAPI->getEntityList('smart_process', [
-                'filter' => [$clientFieldName => $contactId]
-            ]);
+            $projects = $bitrixAPI->getEntityList('smart_process', [$clientFieldName => $contactId]);
 
             if ($projects && isset($projects['result'])) {
-                $projectList = $projects['result'];
+                // crm.item.list для смарт-процессов возвращает элементы в result.items
+                $projectList = isset($projects['result']['items'])
+                    ? $projects['result']['items']
+                    : $projects['result'];
                 $results['projects']['count'] = is_array($projectList) ? count($projectList) : 0;
 
                 foreach ($projectList as $project) {
-                    $projectId = $project['ID'] ?? null;
+                    $projectId = $project['ID'] ?? $project['id'] ?? null;
                     if (empty($projectId)) {
                         continue;
                     }
@@ -135,7 +202,7 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
 
                     if ($projectData) {
                         $projectContactId = extractContactId($projectData[$mapping['client_id']] ?? null);
-                        if ($projectContactId === $contactId) {
+                        if ((string)$projectContactId === (string)$contactId) {
                             $mappedProjectData = mapProjectData($projectData, $mapping, $logger);
                             $syncResult = $localStorage->syncProjectByBitrixId($projectId, $mappedProjectData);
                             if ($syncResult) {
@@ -150,34 +217,6 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
         }
     } catch (Exception $e) {
         $logger->error('Error syncing related projects', ['contact_id' => $contactId, 'error' => $e->getMessage()]);
-    }
-
-    $logger->info('Checking for related deals for contact', ['contact_id' => $contactId]);
-    try {
-        $deals = $bitrixAPI->getEntityList('deal', [
-            'filter' => ['CONTACT_ID' => $contactId]
-        ]);
-
-        if ($deals && isset($deals['result'])) {
-            $dealList = $deals['result'];
-            $results['deals']['count'] = count($dealList);
-
-            foreach ($dealList as $deal) {
-                $dealId = $deal['ID'];
-                $fullDealData = $bitrixAPI->getEntityData('deal', $dealId);
-                if ($fullDealData && isset($fullDealData['result'])) {
-                    $dealData = $fullDealData['result'];
-                    $syncResult = $localStorage->syncDealByBitrixId($dealId, $dealData);
-                    if ($syncResult) {
-                        $results['deals']['success']++;
-                    } else {
-                        $results['deals']['failed']++;
-                    }
-                }
-            }
-        }
-    } catch (Exception $e) {
-        $logger->error('Error syncing related deals', ['contact_id' => $contactId, 'error' => $e->getMessage()]);
     }
 
     return $results;
@@ -318,7 +357,6 @@ try {
     
     echo "  Компании: найдено {$relatedResults['companies']['count']}, успешно {$relatedResults['companies']['success']}, ошибок {$relatedResults['companies']['failed']}\n";
     echo "  Проекты: найдено {$relatedResults['projects']['count']}, успешно {$relatedResults['projects']['success']}, ошибок {$relatedResults['projects']['failed']}\n";
-    echo "  Сделки: найдено {$relatedResults['deals']['count']}, успешно {$relatedResults['deals']['success']}, ошибок {$relatedResults['deals']['failed']}\n";
     
 } catch (Exception $e) {
     echo "  ✗ ОШИБКА: " . $e->getMessage() . "\n";
@@ -352,7 +390,6 @@ if ($results['related']) {
     echo "Связанные сущности:\n";
     echo "  Компании: {$results['related']['companies']['success']}/{$results['related']['companies']['count']}\n";
     echo "  Проекты: {$results['related']['projects']['success']}/{$results['related']['projects']['count']}\n";
-    echo "  Сделки: {$results['related']['deals']['success']}/{$results['related']['deals']['count']}\n";
     echo "\n";
 }
 

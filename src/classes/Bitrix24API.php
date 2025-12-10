@@ -22,70 +22,160 @@ class Bitrix24API
     {
         try {
             $userAgent = $headers['User-Agent'] ?? $headers['user-agent'] ?? '';
-            if (empty($userAgent) ||
-                (!str_contains($userAgent, 'Bitrix24') && !str_contains($userAgent, 'Bitrix24 Webhook Engine'))) {
-                $this->logger->warning('Invalid User-Agent in webhook request', [
+            
+            $isValidUserAgent = false;
+            if (!empty($userAgent)) {
+                $userAgentLower = strtolower($userAgent);
+                $validPatterns = [
+                    'bitrix24',
+                    'bitrix24 webhook',
+                    'bitrix24 webhook engine',
+                    'bitrix24hook'
+                ];
+                
+                foreach ($validPatterns as $pattern) {
+                    if (str_contains($userAgentLower, strtolower($pattern))) {
+                        $isValidUserAgent = true;
+                        break;
+                    }
+                }
+            }
+            
+            if (!$isValidUserAgent) {
+                $this->logger->warning('Unexpected User-Agent in webhook request', [
                     'user_agent' => $userAgent,
-                    'headers' => $headers
+                    'headers' => $headers,
+                    'note' => 'Request will be processed, but may not be from Bitrix24'
                 ]);
-                return false;
             }
 
             $contentType = $headers['Content-Type'] ?? $headers['content-type'] ?? '';
+            
+            $contentTypeLower = strtolower($contentType);
+            $contentTypeParts = explode(';', $contentTypeLower);
+            $contentTypeBase = trim($contentTypeParts[0]);
 
-            if (str_contains($contentType, 'application/json')) {
+            $data = null;
+            
+            if (str_contains($contentTypeBase, 'application/json')) {
                 $data = json_decode($body, true);
                 if (json_last_error() !== JSON_ERROR_NONE) {
                     $this->logger->error('Invalid JSON in webhook body', [
                         'error' => json_last_error_msg(),
-                        'body' => $body,
+                        'body_preview' => substr($body, 0, 500),
                         'content_type' => $contentType
                     ]);
                     return false;
                 }
-            } elseif (str_contains($contentType, 'application/x-www-form-urlencoded')) {
+            } elseif (str_contains($contentTypeBase, 'application/x-www-form-urlencoded')) {
                 parse_str($body, $data);
                 if (empty($data)) {
                     $this->logger->error('Failed to parse URL-encoded webhook body', [
-                        'body' => $body,
+                        'body_preview' => substr($body, 0, 500),
                         'content_type' => $contentType
                     ]);
                     return false;
+                }
+            } elseif (empty($contentType) || $contentType === 'UNKNOWN') {
+                $this->logger->warning('Content-Type not specified, attempting auto-detection', [
+                    'body_preview' => substr($body, 0, 200),
+                    'headers' => $headers
+                ]);
+                
+                $jsonData = json_decode($body, true);
+                if (json_last_error() === JSON_ERROR_NONE && is_array($jsonData) && !empty($jsonData)) {
+                    $data = $jsonData;
+                    $this->logger->debug('Auto-detected JSON format');
+                } else {
+                    parse_str($body, $urlData);
+                    if (!empty($urlData)) {
+                        $data = $urlData;
+                        $this->logger->debug('Auto-detected URL-encoded format');
+                    } else {
+                        $this->logger->error('Failed to auto-detect webhook body format', [
+                            'body_preview' => substr($body, 0, 500),
+                            'headers' => $headers
+                        ]);
+                        return false;
+                    }
                 }
             } else {
                 $this->logger->warning('Unsupported Content-Type in webhook request', [
                     'content_type' => $contentType,
                     'supported_types' => ['application/json', 'application/x-www-form-urlencoded'],
+                    'body_preview' => substr($body, 0, 200),
                     'headers' => $headers
                 ]);
                 return false;
             }
 
-            $expectedToken = $this->config['bitrix24']['application_token'];
+            // Проверка наличия обязательных полей в данных
+            if (!is_array($data) || empty($data)) {
+                $this->logger->error('Invalid webhook data structure', [
+                    'data_type' => gettype($data),
+                    'body_preview' => substr($body, 0, 500)
+                ]);
+                return false;
+            }
+
+            // Проверка application_token (опционально, только если настроен)
+            $expectedToken = $this->config['bitrix24']['application_token'] ?? '';
             $receivedToken = $data['auth']['application_token'] ?? '';
 
-            if (!empty($expectedToken) && $receivedToken !== $expectedToken) {
-                $this->logger->error('Invalid application token in webhook request', [
-                    'expected_token' => substr($expectedToken, 0, 8) . '...', // Логируем только начало токена
-                    'received_token' => substr($receivedToken, 0, 8) . '...',
-                    'auth_data' => $data['auth'] ?? []
+            if (!empty($expectedToken)) {
+                // Если токен настроен, проверяем его
+                if (empty($receivedToken)) {
+                    $this->logger->warning('Application token expected but not received', [
+                        'auth_data' => $data['auth'] ?? [],
+                        'data_keys' => array_keys($data)
+                    ]);
+                    // Не блокируем, возможно это старый формат запроса
+                } elseif ($receivedToken !== $expectedToken) {
+                    $this->logger->error('Invalid application token in webhook request', [
+                        'expected_token_prefix' => substr($expectedToken, 0, 8) . '...',
+                        'received_token_prefix' => substr($receivedToken, 0, 8) . '...',
+                        'token_length_match' => strlen($expectedToken) === strlen($receivedToken),
+                        'auth_data' => isset($data['auth']) ? array_keys($data['auth']) : []
+                    ]);
+                    return false;
+                }
+            } else {
+                // Если токен не настроен, просто логируем
+                if (!empty($receivedToken)) {
+                    $this->logger->debug('Application token received but not configured for validation', [
+                        'received_token_prefix' => substr($receivedToken, 0, 8) . '...'
+                    ]);
+                }
+            }
+
+            // Проверка наличия ключевых полей события
+            if (empty($data['event'])) {
+                $this->logger->error('Missing event field in webhook data', [
+                    'data_keys' => array_keys($data),
+                    'body_preview' => substr($body, 0, 500)
                 ]);
                 return false;
             }
 
             $this->logger->debug('Webhook request validated successfully', [
                 'content_type' => $contentType,
-                'format' => str_contains($contentType, 'json') ? 'json' : 'url-encoded',
+                'format' => str_contains($contentTypeBase, 'json') ? 'json' : 'url-encoded',
                 'data_keys' => array_keys($data),
-                'application_token_valid' => !empty($expectedToken) ? 'checked' : 'not_configured'
+                'event' => $data['event'] ?? 'UNKNOWN',
+                'application_token_valid' => !empty($expectedToken) ? ($receivedToken === $expectedToken ? 'valid' : 'invalid') : 'not_configured',
+                'user_agent_valid' => $isValidUserAgent
             ]);
             return $data;
 
         } catch (Exception $e) {
             $this->logger->error('Error validating webhook request', [
                 'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
                 'headers' => $headers,
-                'body_length' => strlen($body)
+                'body_length' => strlen($body),
+                'body_preview' => substr($body, 0, 500),
+                'trace' => $e->getTraceAsString()
             ]);
             return false;
         }
@@ -153,6 +243,23 @@ class Bitrix24API
         if (!$method) {
             $this->logger->error('Unsupported entity type for list API call', ['entity_type' => $entityType]);
             return false;
+        }
+
+        // Нормализация формы фильтра: поддерживаем оба варианта передачи
+        // - ['CONTACT_ID' => 1]
+        // - ['filter' => ['CONTACT_ID' => 1]]
+        if (isset($filter['filter']) && is_array($filter['filter'])) {
+            $this->logger->debug('Normalizing nested filter parameter for getEntityList', [
+                'entity_type' => $entityType,
+                'original_keys' => array_keys($filter)
+            ]);
+            $filter = $filter['filter'];
+        }
+
+        // Если фильтр содержит select, выделяем его как отдельный параметр
+        if (isset($filter['select']) && empty($select)) {
+            $select = $filter['select'];
+            unset($filter['select']);
         }
 
         $params = [];
@@ -233,13 +340,55 @@ class Bitrix24API
      */
     private function makeApiCall($method, $params = [])
     {
-        $url = $this->config['bitrix24']['webhook_url'] . $method . '.json';
+        $webhookUrl = $this->config['bitrix24']['webhook_url'] ?? '';
+        
+        // Валидация URL
+        if (empty($webhookUrl)) {
+            $this->logger->error('Webhook URL is not configured');
+            return false;
+        }
+        
+        // Проверка формата URL
+        if (!filter_var($webhookUrl, FILTER_VALIDATE_URL)) {
+            $this->logger->error('Invalid webhook URL format', [
+                'webhook_url' => substr($webhookUrl, 0, 50) . '...'
+            ]);
+            return false;
+        }
+        
+        // Проверка протокола (должен быть HTTPS)
+        if (!str_starts_with(strtolower($webhookUrl), 'https://')) {
+            $this->logger->warning('Webhook URL is not using HTTPS', [
+                'webhook_url' => substr($webhookUrl, 0, 50) . '...'
+            ]);
+        }
+        
+        $url = rtrim($webhookUrl, '/') . '/' . $method . '.json';
+        
+        // Дополнительная валидация полного URL
+        if (!filter_var($url, FILTER_VALIDATE_URL)) {
+            $this->logger->error('Invalid constructed URL', [
+                'method' => $method,
+                'url' => substr($url, 0, 100) . '...'
+            ]);
+            return false;
+        }
 
         $postData = json_encode($params, JSON_UNESCAPED_UNICODE);
+        
+        // Проверка результата json_encode
+        if ($postData === false) {
+            $this->logger->error('JSON encoding failed in API call', [
+                'method' => $method,
+                'json_error' => json_last_error_msg(),
+                'params_keys' => array_keys($params)
+            ]);
+            return false;
+        }
 
         $this->logger->debug('Making API call', [
             'method' => $method,
-            'url' => $url,
+            'url' => preg_replace('/\/[^\/]+\/[^\/]+\//', '/***/', $url), // Скрываем токен в логах
             'params' => $params
         ]);
 
@@ -270,21 +419,40 @@ class Bitrix24API
             $this->logger->error('CURL error in API call', [
                 'method' => $method,
                 'error' => $error,
-                'url' => $url
-            ]);
-            return false;
-        }
-
-        if ($httpCode !== 200) {
-            $this->logger->error('API call returned non-200 status code', [
-                'method' => $method,
-                'http_code' => $httpCode,
-                'response' => $response
+                'url' => preg_replace('/\/[^\/]+\/[^\/]+\//', '/***/', $url) // Скрываем токен в логах
             ]);
             return false;
         }
 
         $result = json_decode($response, true);
+
+        if ($httpCode !== 200) {
+            // Проверяем, является ли это ошибкой "Not found"
+            $isNotFound = false;
+            if ($result && isset($result['error_description'])) {
+                $errorDesc = strtolower($result['error_description']);
+                $isNotFound = (
+                    str_contains($errorDesc, 'not found') ||
+                    str_contains($errorDesc, 'не найден') ||
+                    ($result['error'] === '' && str_contains($errorDesc, 'not found'))
+                );
+            }
+            
+            $this->logger->error('API call returned non-200 status code', [
+                'method' => $method,
+                'http_code' => $httpCode,
+                'url' => preg_replace('/\/[^\/]+\/[^\/]+\//', '/***/', $url), // Скрываем токен в логах
+                'response' => $response,
+                'is_not_found' => $isNotFound
+            ]);
+            
+            // Возвращаем специальное значение для "Not found"
+            if ($isNotFound) {
+                return ['error' => 'NOT_FOUND', 'http_code' => $httpCode];
+            }
+            
+            return false;
+        }
 
         if (json_last_error() !== JSON_ERROR_NONE) {
             $this->logger->error('Invalid JSON response from API', [
@@ -296,11 +464,26 @@ class Bitrix24API
         }
 
         if (isset($result['error'])) {
+            // Проверяем, является ли это ошибкой "Not found"
+            $errorDesc = strtolower($result['error_description'] ?? '');
+            $isNotFound = (
+                str_contains($errorDesc, 'not found') ||
+                str_contains($errorDesc, 'не найден') ||
+                ($result['error'] === '' && str_contains($errorDesc, 'not found'))
+            );
+            
             $this->logger->error('API returned error', [
                 'method' => $method,
                 'error' => $result['error'],
-                'error_description' => $result['error_description'] ?? ''
+                'error_description' => $result['error_description'] ?? '',
+                'is_not_found' => $isNotFound
             ]);
+            
+            // Возвращаем специальное значение для "Not found"
+            if ($isNotFound) {
+                return ['error' => 'NOT_FOUND', 'http_code' => $httpCode];
+            }
+            
             return false;
         }
 
@@ -350,13 +533,6 @@ class Bitrix24API
                 'add' => 'crm.company.add',
                 'delete' => 'crm.company.delete'
             ],
-            'deal' => [
-                'get' => 'crm.deal.get',
-                'list' => 'crm.deal.list',
-                'update' => 'crm.deal.update',
-                'add' => 'crm.deal.add',
-                'delete' => 'crm.deal.delete'
-            ],
             'smart_process' => [
                 'get' => 'crm.item.get',
                 'list' => 'crm.item.list',
@@ -388,11 +564,39 @@ class Bitrix24API
         }
 
         $fields = [];
+        // Список служебных ключей, которые не являются именами полей в Bitrix24
+        $skipKeys = [
+            'lk_client_values',      // Массив допустимых значений
+            'agent_contract_values', // Массив значений статуса агентского договора
+            'partner_contract_values', // Массив значений статуса партнерского договора
+            'lk_delete_value'        // Числовое значение для проверки удаления
+        ];
+        
         foreach ($mapping as $key => $value) {
-            if ($key === 'lk_client_values' || $key === 'lk_client_field') {
+            // Пропускаем служебные ключи (не являются именами полей)
+            if (in_array($key, $skipKeys)) {
+                continue;
+            }
+            
+            // Обрабатываем массивы, которые содержат названия полей (например, мессенджеры)
+            if (is_array($value)) {
+                foreach ($value as $nestedValue) {
+                    if (is_string($nestedValue) && !empty($nestedValue)) {
+                        $fields[] = $nestedValue;
+                    } elseif (is_array($nestedValue)) {
+                        foreach ($nestedValue as $deepValue) {
+                            if (is_string($deepValue) && !empty($deepValue)) {
+                                $fields[] = $deepValue;
+                            }
+                        }
+                    }
+                }
                 continue;
             }
 
+            // Добавляем все строковые значения из маппинга в SELECT
+            // Это имена полей в Bitrix24 (EMAIL, PHONE, NAME, UF_CRM_*, и т.д.)
+            // Включая lk_client_field => 'UF_CRM_1765110404000'
             if (is_string($value) && !empty($value)) {
                 $fields[] = $value;
             }
@@ -402,7 +606,7 @@ class Bitrix24API
             $fields[] = 'ID';
         }
 
-        if (($entityType === 'company' || $entityType === 'deal') && !in_array('CONTACT_ID', $fields)) {
+        if ($entityType === 'company' && !in_array('CONTACT_ID', $fields)) {
             if (isset($mapping['contact_id']) && !empty($mapping['contact_id'])) {
                 $fields[] = $mapping['contact_id'];
             }
@@ -427,7 +631,6 @@ class Bitrix24API
         $mapping = [
             'ONCRMCONTACT' => 'contact',
             'ONCRMCOMPANY' => 'company',
-            'ONCRMDEAL' => 'deal',
             'ONCRMDYNAMICITEM' => 'smart_process'
         ];
 
@@ -438,6 +641,450 @@ class Bitrix24API
         }
 
         return false;
+    }
+
+    /**
+     * Получение ID корневой папки пользователя на Диске Bitrix24
+     * 
+     * @return int|false ID папки или false при ошибке
+     */
+    private function getRootFolderId()
+    {
+        // Метод 1: disk.folder.getforupload - специальный метод для получения папки для загрузки
+        $method1 = 'disk.folder.getforupload';
+        $result1 = $this->makeApiCall($method1, []);
+        
+        if ($result1 && isset($result1['result'])) {
+            $folderId = $result1['result']['FOLDER_ID'] ?? $result1['result']['folder_id'] ?? 
+                       $result1['result']['ID'] ?? $result1['result']['id'] ?? null;
+            if ($folderId) {
+                $this->logger->debug('Root folder ID obtained via getforupload', [
+                    'method' => $method1,
+                    'folder_id' => $folderId,
+                    'result_structure' => json_encode($result1['result'], JSON_UNESCAPED_UNICODE)
+                ]);
+                return $folderId;
+            }
+        }
+        
+        // Метод 2: disk.storage.get - получаем хранилище и извлекаем ROOT_FOLDER_ID
+        // Пробуем сначала с ID=1, если не работает - получаем список всех хранилищ
+        $method2 = 'disk.storage.get';
+        
+        // Сначала пробуем получить конкретное хранилище
+        $result2 = $this->makeApiCall($method2, ['id' => 1]);
+        
+        // Если не получилось, пробуем получить список хранилищ
+        if (!$result2 || !isset($result2['result'])) {
+            $result2 = $this->makeApiCall($method2, []);
+        }
+        
+        if ($result2 && isset($result2['result'])) {
+            $resultData = $result2['result'];
+            $this->logger->debug('disk.storage.get response structure', [
+                'result_type' => gettype($resultData),
+                'is_array' => is_array($resultData),
+                'array_count' => is_array($resultData) ? count($resultData) : 0,
+                'is_numeric_array' => is_array($resultData) && (empty($resultData) || array_keys($resultData) === range(0, count($resultData) - 1)),
+                'keys' => is_array($resultData) ? array_keys($resultData) : 'not_array',
+                'sample' => is_array($resultData) ? json_encode(array_slice($resultData, 0, 10), JSON_UNESCAPED_UNICODE) : json_encode($resultData, JSON_UNESCAPED_UNICODE)
+            ]);
+            
+            $folderId = null;
+            
+            // Проверяем, является ли result массивом с числовыми индексами (список хранилищ)
+            // или ассоциативным массивом/объектом (одно хранилище)
+            $isNumericArray = is_array($resultData) && !empty($resultData) && array_keys($resultData) === range(0, count($resultData) - 1);
+            
+            if ($isNumericArray) {
+                // Если result - это массив хранилищ (числовые индексы)
+                foreach ($resultData as $index => $storage) {
+                    if (is_array($storage)) {
+                        // Пробуем разные варианты ключей
+                        $folderId = $storage['ROOT_FOLDER_ID'] ?? 
+                                   $storage['root_folder_id'] ?? 
+                                   $storage['ROOT_FOLDER']['ID'] ?? 
+                                   $storage['root_folder']['id'] ?? null;
+                        
+                        // Если не нашли, логируем структуру для отладки
+                        if (!$folderId) {
+                            $this->logger->debug('Storage item structure', [
+                                'index' => $index,
+                                'storage_keys' => array_keys($storage),
+                                'has_root_folder' => isset($storage['ROOT_FOLDER']),
+                                'has_root_folder_id' => isset($storage['ROOT_FOLDER_ID']),
+                                'storage_sample' => json_encode(array_slice($storage, 0, 15), JSON_UNESCAPED_UNICODE)
+                            ]);
+                        } else {
+                            $this->logger->debug('Found root folder ID in storage', [
+                                'storage_index' => $index,
+                                'storage_id' => $storage['ID'] ?? $storage['id'] ?? 'unknown',
+                                'folder_id' => $folderId
+                            ]);
+                            break;
+                        }
+                    }
+                }
+            } elseif (is_array($resultData) && empty($resultData)) {
+                $this->logger->warning('disk.storage.get returned empty array');
+            } else {
+                // Если result - это объект хранилища (ассоциативный массив)
+                // Пробуем разные варианты получения ROOT_FOLDER_ID
+                $folderId = $resultData['ROOT_FOLDER_ID'] ?? 
+                           $resultData['root_folder_id'] ?? null;
+                
+                // Если не нашли напрямую, проверяем вложенный объект ROOT_FOLDER
+                if (!$folderId && isset($resultData['ROOT_FOLDER'])) {
+                    $rootFolder = $resultData['ROOT_FOLDER'];
+                    if (is_array($rootFolder)) {
+                        $folderId = $rootFolder['ID'] ?? $rootFolder['id'] ?? null;
+                    }
+                }
+                
+                // Если не нашли ROOT_FOLDER_ID, пробуем использовать ROOT_OBJECT_ID
+                // В некоторых версиях Bitrix24 ROOT_OBJECT_ID может быть ID корневой папки
+                if (!$folderId && isset($resultData['ROOT_OBJECT_ID'])) {
+                    $folderId = $resultData['ROOT_OBJECT_ID'];
+                    $this->logger->debug('Using ROOT_OBJECT_ID as folder ID', [
+                        'root_object_id' => $folderId
+                    ]);
+                }
+                
+                // Логируем структуру для отладки, если не нашли
+                if (!$folderId) {
+                    $this->logger->debug('Storage object structure', [
+                        'storage_keys' => is_array($resultData) ? array_keys($resultData) : 'not_array',
+                        'has_root_folder' => isset($resultData['ROOT_FOLDER']),
+                        'has_root_folder_id' => isset($resultData['ROOT_FOLDER_ID']),
+                        'has_root_object_id' => isset($resultData['ROOT_OBJECT_ID']),
+                        'root_object_id' => $resultData['ROOT_OBJECT_ID'] ?? 'not_set',
+                        'root_folder_type' => isset($resultData['ROOT_FOLDER']) ? gettype($resultData['ROOT_FOLDER']) : 'not_set',
+                        'root_folder_keys' => (isset($resultData['ROOT_FOLDER']) && is_array($resultData['ROOT_FOLDER'])) 
+                            ? array_keys($resultData['ROOT_FOLDER']) : 'not_array',
+                        'storage_sample' => json_encode(array_slice(is_array($resultData) ? $resultData : [], 0, 20), JSON_UNESCAPED_UNICODE)
+                    ]);
+                }
+            }
+            
+            if ($folderId) {
+                $this->logger->debug('Root folder ID obtained via storage.get', [
+                    'method' => $method2,
+                    'folder_id' => $folderId
+                ]);
+                return $folderId;
+            } else {
+                // Детальное логирование для отладки структуры ответа
+                $debugInfo = [
+                    'result_type' => gettype($resultData),
+                    'is_array' => is_array($resultData),
+                    'array_count' => is_array($resultData) ? count($resultData) : 0
+                ];
+                
+                if (is_array($resultData) && !empty($resultData)) {
+                    // Логируем информацию о каждом элементе массива
+                    $debugInfo['items_info'] = [];
+                    foreach (array_slice($resultData, 0, 3) as $idx => $item) {
+                        $itemInfo = [
+                            'index' => $idx,
+                            'type' => gettype($item),
+                            'is_array' => is_array($item)
+                        ];
+                        if (is_array($item)) {
+                            $itemInfo['keys'] = array_keys($item);
+                            $itemInfo['has_root_folder_id'] = isset($item['ROOT_FOLDER_ID']);
+                            $itemInfo['has_root_folder'] = isset($item['ROOT_FOLDER']);
+                            $itemInfo['sample'] = json_encode(array_slice($item, 0, 20), JSON_UNESCAPED_UNICODE);
+                        } else {
+                            $itemInfo['value'] = $item;
+                        }
+                        $debugInfo['items_info'][] = $itemInfo;
+                    }
+                } else {
+                    $debugInfo['result_value'] = is_array($resultData) ? 'empty_array' : json_encode($resultData, JSON_UNESCAPED_UNICODE);
+                }
+                
+                $this->logger->warning('disk.storage.get returned result but ROOT_FOLDER_ID not found', $debugInfo);
+            }
+        }
+        
+        // Метод 3: disk.folder.getchildren - получаем список дочерних папок корневой папки
+        // Пробуем с ID=0 (корневая папка) или без параметров
+        $method3 = 'disk.folder.getchildren';
+        $result3 = $this->makeApiCall($method3, ['id' => 0]);
+        
+        // Если не получилось с ID=0, пробуем без параметров
+        if (!$result3 || !isset($result3['result'])) {
+            $result3 = $this->makeApiCall($method3, []);
+        }
+        
+        if ($result3 && isset($result3['result'])) {
+            $this->logger->debug('disk.folder.getchildren response', [
+                'result_type' => gettype($result3['result']),
+                'is_array' => is_array($result3['result']),
+                'has_items' => is_array($result3['result']) && !empty($result3['result'])
+            ]);
+            // Этот метод возвращает список папок, но не ID корневой папки напрямую
+            // Поэтому используем его только для проверки доступности API
+        }
+        
+        $this->logger->warning('Failed to get root folder ID using all methods', [
+            'method1_result' => isset($result1) ? (is_array($result1) ? 'array' : gettype($result1)) : 'not_called',
+            'method2_result' => isset($result2) ? (is_array($result2) ? 'array' : gettype($result2)) : 'not_called',
+            'method3_result' => isset($result3) ? (is_array($result3) ? 'array' : gettype($result3)) : 'not_called'
+        ]);
+        return false;
+    }
+
+    /**
+     * Загрузка файла в Bitrix24
+     * 
+     * @param string $filePath Путь к локальному файлу
+     * @param int $folderId ID папки на Диске Bitrix24 (опционально, будет получен автоматически)
+     * @return array|false Результат загрузки с ID файла или false при ошибке
+     */
+    public function uploadFile($filePath, $folderId = null)
+    {
+        if (!file_exists($filePath)) {
+            $this->logger->error('File not found for upload', ['file_path' => $filePath]);
+            return false;
+        }
+
+        $this->logger->debug('Uploading file to Bitrix24', [
+            'file_path' => $filePath,
+            'file_size' => filesize($filePath),
+            'folder_id' => $folderId
+        ]);
+
+        // Если folderId не указан, получаем ID корневой папки
+        if ($folderId === null) {
+            $folderId = $this->getRootFolderId();
+            if ($folderId === false) {
+                $this->logger->warning('Cannot get root folder ID, will try alternative upload method');
+                // Не прерываем выполнение, попробуем альтернативный метод загрузки
+                $folderId = null;
+            }
+        }
+
+        $fileContent = file_get_contents($filePath);
+        $originalFileName = basename($filePath);
+        $fileSize = filesize($filePath);
+        
+        // Добавляем timestamp к имени файла, чтобы избежать конфликтов при повторной загрузке
+        $pathInfo = pathinfo($originalFileName);
+        $fileName = $pathInfo['filename'] . '_' . time() . '.' . ($pathInfo['extension'] ?? 'txt');
+        
+        // Если folderId не получен, пробуем использовать ROOT_OBJECT_ID из storage
+        if ($folderId === null || $folderId === false) {
+            // Пробуем получить ROOT_OBJECT_ID из storage
+            $storageResult = $this->makeApiCall('disk.storage.get', ['id' => 1]);
+            if ($storageResult && isset($storageResult['result']['ROOT_OBJECT_ID'])) {
+                $folderId = $storageResult['result']['ROOT_OBJECT_ID'];
+                $this->logger->debug('Using ROOT_OBJECT_ID as folder ID for upload', [
+                    'root_object_id' => $folderId
+                ]);
+            }
+        }
+        
+        // Если folderId все еще не получен, пробуем альтернативные методы
+        if ($folderId === null || $folderId === false) {
+            $this->logger->debug('Trying alternative upload methods since folder ID not available');
+            
+            // Метод 1: disk.file.upload (без указания папки)
+            $method = 'disk.file.upload';
+            $params = [
+                'data' => [
+                    'NAME' => $fileName
+                ],
+                'fileContent' => base64_encode($fileContent)
+            ];
+            
+            $this->logger->debug('Attempting file upload (method 1: disk.file.upload)', [
+                'method' => $method,
+                'file_name' => $fileName,
+                'file_size' => $fileSize
+            ]);
+            
+            $result = $this->makeApiCall($method, $params);
+            
+            // Если не сработало, пробуем метод 2
+            if ($result === false || (isset($result['error']) && str_contains($result['error'], 'NOT_FOUND'))) {
+                $this->logger->debug('Method 1 failed, trying method 2: disk.file.uploadfile');
+                
+                // Метод 2: disk.file.uploadfile (с ID хранилища)
+                $method = 'disk.file.uploadfile';
+                $params = [
+                    'id' => 1, // ID хранилища
+                    'data' => [
+                        'NAME' => $fileName
+                    ],
+                    'fileContent' => base64_encode($fileContent)
+                ];
+                
+                $result = $this->makeApiCall($method, $params);
+            }
+        } else {
+            // Используем disk.folder.uploadfile для загрузки файла
+            $method = 'disk.folder.uploadfile';
+            
+            // Bitrix24 требует передавать файл через fileContent в base64
+            // Формат: id - ID папки, data[NAME] - имя файла, fileContent - содержимое в base64
+            $params = [
+                'id' => $folderId,
+                'data' => [
+                    'NAME' => $fileName
+                ],
+                'fileContent' => base64_encode($fileContent)
+            ];
+
+            $this->logger->debug('Attempting file upload to Bitrix24', [
+                'method' => $method,
+                'file_name' => $fileName,
+                'file_size' => $fileSize,
+                'folder_id' => $folderId,
+                'params_keys' => array_keys($params)
+            ]);
+
+            $result = $this->makeApiCall($method, $params);
+            
+            // Если загрузка не удалась из-за ошибки "файл уже существует", 
+            // это не критично - файл уже загружен, можно использовать существующий
+            if (isset($result['error']) && str_contains($result['error_description'] ?? '', 'уже есть')) {
+                $this->logger->info('File already exists in Bitrix24, this is acceptable', [
+                    'file_name' => $fileName,
+                    'error' => $result['error'] ?? 'unknown'
+                ]);
+                // Продолжаем обработку - возможно, в ответе есть информация о существующем файле
+                // Если нет, вернем false и попробуем альтернативный метод
+            } elseif ($result === false || (isset($result['error']) && (str_contains($result['error'], 'NOT_FOUND') || str_contains($result['error'], 'ERROR')))) {
+                $this->logger->warning('Primary upload method failed, trying alternative', [
+                    'error' => $result['error'] ?? 'unknown',
+                    'error_description' => $result['error_description'] ?? ''
+                ]);
+                
+                // Альтернативный метод: disk.file.uploadfile (загрузка в корень хранилища)
+                $altMethod = 'disk.file.uploadfile';
+                $altParams = [
+                    'id' => 1, // ID хранилища (обычно 1 для личного)
+                    'data' => [
+                        'NAME' => $fileName
+                    ],
+                    'fileContent' => base64_encode($fileContent)
+                ];
+                
+                $this->logger->debug('Trying alternative upload method', [
+                    'method' => $altMethod,
+                    'storage_id' => 1
+                ]);
+                
+                $result = $this->makeApiCall($altMethod, $altParams);
+            }
+        }
+
+        $this->logger->debug('File upload API response', [
+            'file_path' => $filePath,
+            'has_result' => isset($result['result']),
+            'result_type' => gettype($result),
+            'result_keys' => is_array($result) ? array_keys($result) : 'not_array',
+            'result_structure' => is_array($result) ? json_encode($result, JSON_UNESCAPED_UNICODE) : 'not_array'
+        ]);
+
+        if ($result && isset($result['result'])) {
+            // Для поля типа "Ссылка" нужен ID объекта на диске, а не FILE_ID
+            // ID объекта на диске используется для создания внутренней ссылки
+            $diskObjectId = null;
+            $fileId = null;
+            
+            // Сначала получаем ID объекта на диске (для ссылки)
+            if (isset($result['result']['ID'])) {
+                $diskObjectId = $result['result']['ID'];
+            } elseif (isset($result['result']['id'])) {
+                $diskObjectId = $result['result']['id'];
+            }
+            
+            // Также сохраняем FILE_ID для совместимости
+            if (isset($result['result']['FILE_ID'])) {
+                $fileId = $result['result']['FILE_ID'];
+            } elseif (isset($result['result']['file_id'])) {
+                $fileId = $result['result']['file_id'];
+            }
+            
+            // Для поля типа "Ссылка" используем ID объекта на диске
+            // Формат: disk_file_<ID> или просто ID
+            $linkId = $diskObjectId;
+            
+            if ($linkId) {
+                // Формируем внутреннюю ссылку на файл в формате Bitrix24
+                $internalLink = $this->getInternalFileLink($diskObjectId);
+                
+                $this->logger->info('File uploaded successfully', [
+                    'file_path' => $filePath,
+                    'disk_object_id' => $diskObjectId,
+                    'file_id' => $fileId,
+                    'link_id' => $linkId,
+                    'internal_link' => $internalLink,
+                    'file_name' => $fileName,
+                    'file_size' => $fileSize
+                ]);
+                return [
+                    'id' => $linkId,  // ID объекта на диске для ссылки
+                    'internal_link' => $internalLink,  // Полная внутренняя ссылка
+                    'disk_object_id' => $diskObjectId,
+                    'file_id' => $fileId,
+                    'name' => $fileName,
+                    'size' => $fileSize
+                ];
+            } else {
+                $this->logger->warning('File upload response received but disk object ID not found', [
+                    'file_path' => $filePath,
+                    'result_structure' => json_encode($result['result'], JSON_UNESCAPED_UNICODE)
+                ]);
+            }
+        } elseif ($result && isset($result['error'])) {
+            $this->logger->error('Bitrix24 API returned error during file upload', [
+                'file_path' => $filePath,
+                'error' => $result['error'],
+                'error_description' => $result['error_description'] ?? '',
+                'error_exclamation' => $result['error_exclamation'] ?? ''
+            ]);
+        }
+
+        $this->logger->error('Failed to upload file', [
+            'file_path' => $filePath,
+            'file_name' => $fileName,
+            'file_size' => $fileSize,
+            'result' => $result,
+            'result_type' => gettype($result)
+        ]);
+        return false;
+    }
+
+    /**
+     * Формирование внутренней ссылки на файл в Bitrix24
+     * 
+     * @param int $objectId ID объекта на диске
+     * @return string Внутренняя ссылка на файл
+     */
+    private function getInternalFileLink($objectId)
+    {
+        $webhookUrl = $this->config['bitrix24']['webhook_url'] ?? '';
+        
+        // Извлекаем домен из webhook URL
+        // Формат: https://domain/rest/user/webhook/...
+        $domain = '';
+        if (preg_match('#https?://([^/]+)#', $webhookUrl, $matches)) {
+            $domain = $matches[1];
+        }
+        
+        if (empty($domain)) {
+            $this->logger->warning('Cannot extract domain from webhook URL for internal link', [
+                'webhook_url' => substr($webhookUrl, 0, 50) . '...'
+            ]);
+            // Возвращаем формат без домена, Bitrix24 может обработать
+            return "bitrix/tools/disk/focus.php?objectId={$objectId}&cmd=show&action=showObjectInGrid&ncc=1";
+        }
+        
+        // Формируем полную внутреннюю ссылку
+        return "https://{$domain}/bitrix/tools/disk/focus.php?objectId={$objectId}&cmd=show&action=showObjectInGrid&ncc=1";
     }
 
     /**
@@ -478,12 +1125,141 @@ class Bitrix24API
     }
 
     /**
+     * Создание карточки проекта в смарт-процессе
+     *
+     * Логика перенесена из скрипта test_project_creation.php:
+     * - подтягиваем mapping из конфига
+     * - принимает значения полей из формы (без автоподстановок списков)
+     * - при необходимости подтягивает manager через локальное хранилище/Bitrix24, если не передан
+     * - при необходимости загружает файл и использует internal_link
+     * - вызывает addSmartProcessItem
+     *
+     * @param string|int $contactId ID контакта (обязательно)
+     * @param array $formFields значения полей формы по ключам маппинга (кроме contact_id)
+     * @param int|null $fileId ID уже загруженного файла (если есть)
+     * @param string|null $filePath путь к файлу для загрузки (если нужно загрузить)
+     * @param object|null $localStorage экземпляр LocalStorage для получения данных из ЛК базы
+     * @return array|false
+     */
+    public function createProjectCard($contactId, array $formFields = [], $fileId = null, $filePath = null, $localStorage = null)
+    {
+        $smartProcessId = $this->config['bitrix24']['smart_process_id'] ?? '';
+        if (empty($smartProcessId)) {
+            $this->logger->warning('Smart process ID for projects not configured');
+            return false;
+        }
+
+        $mapping = $this->config['field_mapping']['smart_process'] ?? [];
+        if (empty($mapping)) {
+            $this->logger->warning('Field mapping for project smart process not configured');
+            return false;
+        }
+
+        if (empty($contactId)) {
+            $this->logger->error('Contact ID is required for creating project card');
+            return false;
+        }
+
+        // Получаем managerId только из локального хранилища
+        $managerId = null;
+        if ($localStorage !== null) {
+            $contact = $localStorage->getContact($contactId);
+            if ($contact && !empty($contact['manager_id'])) {
+                $managerId = $contact['manager_id'];
+                $this->logger->debug('Manager ID found in local storage', [
+                    'contact_id' => $contactId,
+                    'manager_id' => $managerId
+                ]);
+            }
+        }
+
+        $projectFields = [];
+
+        // Обязательные привязки
+        if (!empty($mapping['client_id'])) {
+            $projectFields[$mapping['client_id']] = $contactId;
+        }
+
+        // Значения из формы (кроме contact_id): ожидаем ключи по маппингу (organization_name, object_name, system_types, location и т.д.)
+        foreach ($mapping as $fieldKey => $bitrixField) {
+            if ($fieldKey === 'client_id') {
+                continue;
+            }
+            // manager_id заполнится ниже, если не пришёл из формы
+            if ($fieldKey === 'manager_id' && empty($formFields[$fieldKey])) {
+                continue;
+            }
+            if (array_key_exists($fieldKey, $formFields) && $formFields[$fieldKey] !== null && $formFields[$fieldKey] !== '') {
+                $projectFields[$bitrixField] = $formFields[$fieldKey];
+            }
+        }
+
+        // Менеджер: если не передан, пробуем подтянуть
+        if (!isset($projectFields[$mapping['manager_id'] ?? '']) && !empty($managerId) && !empty($mapping['manager_id'])) {
+            $projectFields[$mapping['manager_id']] = $managerId;
+        }
+
+        // Файл "Перечень оборудования"
+        $finalFileId = null;
+        $internalLink = null;
+        if (!empty($mapping['equipment_list'])) {
+            if (!empty($fileId)) {
+                $finalFileId = (int)$fileId;
+                $this->logger->debug('Using provided file ID for equipment list', [
+                    'file_id' => $finalFileId
+                ]);
+            } elseif (!empty($filePath) && file_exists($filePath)) {
+                $this->logger->debug('Uploading equipment list file', [
+                    'file_path' => $filePath,
+                    'file_size' => filesize($filePath)
+                ]);
+                $uploadResult = $this->uploadFile($filePath);
+                if (is_array($uploadResult)) {
+                    $finalFileId = $uploadResult['id'] ?? null;
+                    $internalLink = $uploadResult['internal_link'] ?? null;
+                    $this->logger->debug('Upload result', [
+                        'file_id' => $finalFileId,
+                        'internal_link' => $internalLink
+                    ]);
+                } else {
+                    $this->logger->error('Upload file failed', [
+                        'file_path' => $filePath,
+                        'result' => $uploadResult
+                    ]);
+                }
+            }
+
+            if ($finalFileId) {
+                if (empty($internalLink) && isset($uploadResult) && is_array($uploadResult)) {
+                    $internalLink = $uploadResult['internal_link'] ?? null;
+                }
+                if ($internalLink) {
+                    $projectFields[$mapping['equipment_list']] = $internalLink;
+                } else {
+                    $projectFields[$mapping['equipment_list']] = 'disk_file_' . $finalFileId;
+                }
+            }
+        }
+
+        $this->logger->info('Prepared project fields for smart process creation', [
+            'contact_id' => $contactId,
+            'smart_process_id' => $smartProcessId,
+            'has_manager' => !empty($managerId),
+            'fields_keys' => array_keys($projectFields)
+        ]);
+
+        return $this->addSmartProcessItem($smartProcessId, $projectFields);
+    }
+
+    /**
      * Создание карточки в смарт-процессе "Изменение данных в ЛК"
      * 
-     * @param array $data Данные для создания карточки
+     * @param string|int $contactId ID контакта (обязательно)
+     * @param array $additionalData Дополнительные данные (new_email, new_phone, и т.д.)
+     * @param object|null $localStorage Экземпляр LocalStorage для получения данных из ЛК базы
      * @return array|false Результат создания или false при ошибке
      */
-    public function createChangeDataCard($data)
+    public function createChangeDataCard($contactId, $additionalData = [], $localStorage = null)
     {
         $smartProcessId = $this->config['bitrix24']['smart_process_change_data_id'] ?? '';
         
@@ -501,52 +1277,85 @@ class Bitrix24API
 
         $fields = [];
         
-        if (isset($data['contact_id']) && !empty($mapping['contact_id'])) {
-            $fields[$mapping['contact_id']] = $data['contact_id'];
+        // Обязательное поле - contact_id
+        if (empty($contactId)) {
+            $this->logger->error('Contact ID is required for creating change data card');
+            return false;
         }
         
-        if (isset($data['company_id']) && !empty($mapping['company_id'])) {
-            $fields[$mapping['company_id']] = $data['company_id'];
+        if (!empty($mapping['contact_id'])) {
+            $fields[$mapping['contact_id']] = $contactId;
         }
         
-        if (isset($data['manager_id']) && !empty($mapping['manager_id'])) {
-            $fields[$mapping['manager_id']] = $data['manager_id'];
+        // Получаем данные из локального хранилища, если передан LocalStorage
+        if ($localStorage !== null) {
+            $contact = $localStorage->getContact($contactId);
+            
+            if ($contact) {
+                // Получаем company_id из контакта
+                if (!empty($contact['company']) && !empty($mapping['company_id'])) {
+                    $fields[$mapping['company_id']] = $contact['company'];
+                    $this->logger->debug('Retrieved company_id from local storage', [
+                        'contact_id' => $contactId,
+                        'company_id' => $contact['company']
+                    ]);
+                }
+                
+                // Получаем manager_id из Bitrix24 API (ASSIGNED_BY_ID)
+                $contactData = $this->getEntityData('contact', $contactId);
+                if ($contactData && isset($contactData['result']['ASSIGNED_BY_ID'])) {
+                    $managerId = $contactData['result']['ASSIGNED_BY_ID'];
+                    if (!empty($managerId) && !empty($mapping['manager_id'])) {
+                        $fields[$mapping['manager_id']] = $managerId;
+                        $this->logger->debug('Retrieved manager_id from Bitrix24 API', [
+                            'contact_id' => $contactId,
+                            'manager_id' => $managerId
+                        ]);
+                    }
+                }
+            } else {
+                $this->logger->warning('Contact not found in local storage', [
+                    'contact_id' => $contactId
+                ]);
+            }
         }
 
-        if (isset($data['new_email']) && !empty($mapping['new_email'])) {
-            $fields[$mapping['new_email']] = $data['new_email'];
+        // Добавляем дополнительные данные (new_email, new_phone, и т.д.)
+        if (isset($additionalData['new_email']) && !empty($mapping['new_email'])) {
+            $fields[$mapping['new_email']] = $additionalData['new_email'];
         }
         
-        if (isset($data['new_phone']) && !empty($mapping['new_phone'])) {
-            $fields[$mapping['new_phone']] = $data['new_phone'];
+        if (isset($additionalData['new_phone']) && !empty($mapping['new_phone'])) {
+            $fields[$mapping['new_phone']] = $additionalData['new_phone'];
         }
         
-        if (isset($data['change_reason_personal']) && !empty($mapping['change_reason_personal'])) {
-            $fields[$mapping['change_reason_personal']] = $data['change_reason_personal'];
+        if (isset($additionalData['change_reason_personal']) && !empty($mapping['change_reason_personal'])) {
+            $fields[$mapping['change_reason_personal']] = $additionalData['change_reason_personal'];
         }
 
-        if (isset($data['new_company_name']) && !empty($mapping['new_company_name'])) {
-            $fields[$mapping['new_company_name']] = $data['new_company_name'];
+        if (isset($additionalData['new_company_name']) && !empty($mapping['new_company_name'])) {
+            $fields[$mapping['new_company_name']] = $additionalData['new_company_name'];
         }
         
-        if (isset($data['new_company_website']) && !empty($mapping['new_company_website'])) {
-            $fields[$mapping['new_company_website']] = $data['new_company_website'];
+        if (isset($additionalData['new_company_website']) && !empty($mapping['new_company_website'])) {
+            $fields[$mapping['new_company_website']] = $additionalData['new_company_website'];
         }
         
-        if (isset($data['new_company_inn']) && !empty($mapping['new_company_inn'])) {
-            $fields[$mapping['new_company_inn']] = $data['new_company_inn'];
+        if (isset($additionalData['new_company_inn']) && !empty($mapping['new_company_inn'])) {
+            $fields[$mapping['new_company_inn']] = $additionalData['new_company_inn'];
         }
         
-        if (isset($data['new_company_phone']) && !empty($mapping['new_company_phone'])) {
-            $fields[$mapping['new_company_phone']] = $data['new_company_phone'];
+        if (isset($additionalData['new_company_phone']) && !empty($mapping['new_company_phone'])) {
+            $fields[$mapping['new_company_phone']] = $additionalData['new_company_phone'];
         }
         
-        if (isset($data['change_reason_company']) && !empty($mapping['change_reason_company'])) {
-            $fields[$mapping['change_reason_company']] = $data['change_reason_company'];
+        if (isset($additionalData['change_reason_company']) && !empty($mapping['change_reason_company'])) {
+            $fields[$mapping['change_reason_company']] = $additionalData['change_reason_company'];
         }
 
         $this->logger->debug('Prepared fields for change data card', [
             'smart_process_id' => $smartProcessId,
+            'contact_id' => $contactId,
             'fields' => $fields
         ]);
 
@@ -556,10 +1365,11 @@ class Bitrix24API
     /**
      * Создание карточки в смарт-процессе "Удаление пользовательских данных"
      * 
-     * @param array $data Данные для создания карточки
+     * @param string|int $contactId ID контакта (обязательно)
+     * @param object|null $localStorage Экземпляр LocalStorage для получения данных из ЛК базы
      * @return array|false Результат создания или false при ошибке
      */
-    public function createDeleteDataCard($data)
+    public function createDeleteDataCard($contactId, $localStorage = null)
     {
         $smartProcessId = $this->config['bitrix24']['smart_process_delete_data_id'] ?? '';
         
@@ -577,24 +1387,268 @@ class Bitrix24API
 
         $fields = [];
         
-        if (isset($data['contact_id']) && !empty($mapping['contact_id'])) {
-            $fields[$mapping['contact_id']] = $data['contact_id'];
+        // Обязательное поле - contact_id
+        if (empty($contactId)) {
+            $this->logger->error('Contact ID is required for creating delete data card');
+            return false;
         }
         
-        if (isset($data['company_id']) && !empty($mapping['company_id'])) {
-            $fields[$mapping['company_id']] = $data['company_id'];
+        if (!empty($mapping['contact_id'])) {
+            $fields[$mapping['contact_id']] = $contactId;
         }
         
-        if (isset($data['manager_id']) && !empty($mapping['manager_id'])) {
-            $fields[$mapping['manager_id']] = $data['manager_id'];
+        // Получаем данные из локального хранилища, если передан LocalStorage
+        if ($localStorage !== null) {
+            $contact = $localStorage->getContact($contactId);
+            
+            if ($contact) {
+                // Получаем company_id из контакта
+                if (!empty($contact['company']) && !empty($mapping['company_id'])) {
+                    $fields[$mapping['company_id']] = $contact['company'];
+                    $this->logger->debug('Retrieved company_id from local storage', [
+                        'contact_id' => $contactId,
+                        'company_id' => $contact['company']
+                    ]);
+                }
+                
+                // Получаем manager_id из Bitrix24 API (ASSIGNED_BY_ID)
+                $contactData = $this->getEntityData('contact', $contactId);
+                if ($contactData && isset($contactData['result']['ASSIGNED_BY_ID'])) {
+                    $managerId = $contactData['result']['ASSIGNED_BY_ID'];
+                    if (!empty($managerId) && !empty($mapping['manager_id'])) {
+                        $fields[$mapping['manager_id']] = $managerId;
+                        $this->logger->debug('Retrieved manager_id from Bitrix24 API', [
+                            'contact_id' => $contactId,
+                            'manager_id' => $managerId
+                        ]);
+                    }
+                }
+            } else {
+                $this->logger->warning('Contact not found in local storage', [
+                    'contact_id' => $contactId
+                ]);
+            }
         }
 
         $this->logger->debug('Prepared fields for delete data card', [
             'smart_process_id' => $smartProcessId,
+            'contact_id' => $contactId,
             'fields' => $fields
         ]);
 
         return $this->addSmartProcessItem($smartProcessId, $fields);
+    }
+
+    /**
+     * Получение полей типа списка смарт-процесса для проекта
+     * 
+     * @param int|null $entityTypeId ID смарт-процесса (если не указан, берется из конфига)
+     * @return array|false Массив с полями типа списка и их значениями или false при ошибке
+     * 
+     * Формат возвращаемых данных:
+     * [
+     *   'field_id' => [
+     *     'name' => 'Название поля',
+     *     'type' => 'enum',
+     *     'values' => [
+     *       'ID' => 'Название значения',
+     *       ...
+     *     ]
+     *   ],
+     *   ...
+     * ]
+     */
+    public function getSmartProcessListFields($entityTypeId = null)
+    {
+        // Если entityTypeId не указан, берем из конфига
+        if ($entityTypeId === null) {
+            $entityTypeId = $this->config['bitrix24']['smart_process_id'] ?? '';
+        }
+        
+        if (empty($entityTypeId)) {
+            $this->logger->error('Smart process ID is not configured');
+            return false;
+        }
+
+        $this->logger->debug('Getting smart process list fields', [
+            'entity_type_id' => $entityTypeId
+        ]);
+
+        // Получаем все поля смарт-процесса (включая пользовательские поля)
+        // Используем crm.item.fields для получения всех полей элемента смарт-процесса
+        $method = 'crm.item.fields';
+        $params = [
+            'entityTypeId' => $entityTypeId
+        ];
+
+        $result = $this->makeApiCall($method, $params);
+
+        if (!$result || !isset($result['result'])) {
+            $this->logger->error('Failed to get smart process fields', [
+                'entity_type_id' => $entityTypeId,
+                'result' => $result
+            ]);
+            return false;
+        }
+
+        // Структура ответа зависит от метода API
+        // crm.item.fields возвращает поля напрямую в result
+        // crm.type.fields возвращает поля в result.fields
+        $resultData = $result['result'];
+        $fields = $resultData;
+        
+        // Если это crm.type.fields, поля могут быть в result.fields
+        if (isset($resultData['fields']) && is_array($resultData['fields'])) {
+            $fields = $resultData['fields'];
+        }
+        
+        // Детальное логирование структуры ответа для отладки
+        $this->logger->debug('Smart process fields API response structure', [
+            'entity_type_id' => $entityTypeId,
+            'method' => $method,
+            'result_keys' => array_keys($resultData),
+            'has_fields_key' => isset($resultData['fields']),
+            'fields_count' => is_array($fields) ? count($fields) : 0,
+            'fields_type' => gettype($fields),
+            'is_array' => is_array($fields),
+            'sample_fields' => is_array($fields) ? array_slice(array_keys($fields), 0, 10) : 'not_array'
+        ]);
+        
+        if (!is_array($fields)) {
+            $this->logger->error('Fields data is not an array', [
+                'entity_type_id' => $entityTypeId,
+                'fields_type' => gettype($fields)
+            ]);
+            return false;
+        }
+        
+        $listFields = [];
+
+        // Фильтруем поля типа списка (enum, list)
+        foreach ($fields as $fieldId => $fieldData) {
+            if (!is_array($fieldData)) {
+                continue;
+            }
+            
+            $fieldType = $fieldData['type'] ?? '';
+            $fieldTitle = $fieldData['title'] ?? $fieldData['name'] ?? $fieldId;
+            
+            // Детальное логирование для каждого поля
+            $this->logger->debug('Processing field', [
+                'field_id' => $fieldId,
+                'field_title' => $fieldTitle,
+                'field_type' => $fieldType,
+                'has_items' => isset($fieldData['items']),
+                'has_options' => isset($fieldData['options']),
+                'has_values' => isset($fieldData['values']),
+                'field_keys' => array_keys($fieldData)
+            ]);
+            
+            // Проверяем, является ли поле типом списка
+            // В Bitrix24 поля типа списка имеют type = 'enum', 'enumeration', 'list', 'crm_status', 'crm_category'
+            if (in_array(strtolower($fieldType), ['enum', 'enumeration', 'list', 'crm_status', 'crm_category'])) {
+                $fieldName = $fieldData['title'] ?? $fieldData['name'] ?? $fieldId;
+                $fieldValues = [];
+                
+                // Получаем значения списка
+                // Пробуем разные форматы ответа от Bitrix24 API
+                if (isset($fieldData['items']) && is_array($fieldData['items'])) {
+                    // Детальное логирование структуры items
+                    $this->logger->debug('Processing field items', [
+                        'field_id' => $fieldId,
+                        'items_count' => count($fieldData['items']),
+                        'first_item_structure' => !empty($fieldData['items']) ? json_encode(array_slice($fieldData['items'], 0, 1, true), JSON_UNESCAPED_UNICODE) : 'empty',
+                        'items_type' => gettype($fieldData['items'][0] ?? null)
+                    ]);
+                    
+                    // Формат: items содержит массив значений
+                    foreach ($fieldData['items'] as $item) {
+                        if (is_array($item)) {
+                            $itemId = $item['ID'] ?? $item['id'] ?? $item['VALUE'] ?? $item['value'] ?? null;
+                            $itemName = $item['VALUE'] ?? $item['value'] ?? $item['NAME'] ?? $item['name'] ?? $item['TITLE'] ?? $item['title'] ?? '';
+                        } else {
+                            // Если items - это простой массив строк/чисел
+                            $itemId = $item;
+                            $itemName = (string)$item;
+                        }
+                        
+                        if ($itemId !== null) {
+                            $fieldValues[$itemId] = $itemName;
+                        }
+                    }
+                } elseif (isset($fieldData['options']) && is_array($fieldData['options'])) {
+                    // Альтернативный формат: options содержит массив значений
+                    foreach ($fieldData['options'] as $itemId => $itemName) {
+                        if (is_array($itemName)) {
+                            $itemName = $itemName['VALUE'] ?? $itemName['value'] ?? $itemName['NAME'] ?? $itemName['name'] ?? (string)$itemId;
+                        }
+                        $fieldValues[$itemId] = $itemName;
+                    }
+                } elseif (isset($fieldData['values']) && is_array($fieldData['values'])) {
+                    // Еще один вариант формата
+                    foreach ($fieldData['values'] as $itemId => $itemName) {
+                        if (is_array($itemName)) {
+                            $itemName = $itemName['VALUE'] ?? $itemName['value'] ?? $itemName['NAME'] ?? $itemName['name'] ?? (string)$itemId;
+                        }
+                        $fieldValues[$itemId] = $itemName;
+                    }
+                }
+                
+                // Если значения не найдены в структуре поля, пробуем получить через отдельный API метод
+                if (empty($fieldValues)) {
+                    // Для enum полей используем crm.enum.fields
+                    if (strtolower($fieldType) === 'enum') {
+                        $enumMethod = 'crm.enum.fields';
+                        $enumParams = [
+                            'entityTypeId' => $entityTypeId,
+                            'fieldId' => $fieldId
+                        ];
+                        
+                        $enumResult = $this->makeApiCall($enumMethod, $enumParams);
+                        
+                        if ($enumResult && isset($enumResult['result']) && is_array($enumResult['result'])) {
+                            foreach ($enumResult['result'] as $enumItem) {
+                                if (is_array($enumItem)) {
+                                    $itemId = $enumItem['ID'] ?? $enumItem['id'] ?? $enumItem['VALUE'] ?? null;
+                                    $itemName = $enumItem['VALUE'] ?? $enumItem['value'] ?? $enumItem['NAME'] ?? $enumItem['name'] ?? '';
+                                    
+                                    if ($itemId !== null) {
+                                        $fieldValues[$itemId] = $itemName;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                $this->logger->debug('Extracted field values', [
+                    'field_id' => $fieldId,
+                    'values_count' => count($fieldValues),
+                    'values_sample' => array_slice($fieldValues, 0, 3, true)
+                ]);
+                
+                $listFields[$fieldId] = [
+                    'name' => $fieldName,
+                    'type' => $fieldType,
+                    'values' => $fieldValues
+                ];
+                
+                $this->logger->debug('Found list field', [
+                    'field_id' => $fieldId,
+                    'field_name' => $fieldName,
+                    'field_type' => $fieldType,
+                    'values_count' => count($fieldValues)
+                ]);
+            }
+        }
+
+        $this->logger->info('Retrieved smart process list fields', [
+            'entity_type_id' => $entityTypeId,
+            'list_fields_count' => count($listFields),
+            'field_ids' => array_keys($listFields)
+        ]);
+
+        return $listFields;
     }
 }
 
