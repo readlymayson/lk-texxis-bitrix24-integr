@@ -32,7 +32,9 @@ function getFieldDisplayName($fieldKey) {
         'implementation_date' => 'Дата реализации',
         'status' => 'Статус',
         'client_id' => 'Клиент',
-        'manager_id' => 'Менеджер'
+        'manager_id' => 'Менеджер',
+        'partner_contract_status' => 'Статус партнерского договора',
+        'agent_contract_status' => 'Статус агентского договора'
     ];
 
     return $fieldNames[$fieldKey] ?? ucfirst(str_replace('_', ' ', $fieldKey));
@@ -73,6 +75,28 @@ function formatFieldValue($value, $fieldKey) {
         }
     }
 
+    // Форматирование для статуса партнерского договора
+    if ($fieldKey === 'partner_contract_status') {
+        $statusMap = [
+            '1102' => 'Да',
+            '1104' => 'Нет',
+            '1106' => 'Не применим'
+        ];
+        $valueStr = (string)$value;
+        return htmlspecialchars($statusMap[$valueStr] ?? ($valueStr === '' ? 'не выбрано' : $value));
+    }
+
+    // Форматирование для статуса агентского договора
+    if ($fieldKey === 'agent_contract_status') {
+        $statusMap = [
+            '702' => 'Да',
+            '704' => 'Нет',
+            '706' => 'Не применим'
+        ];
+        $valueStr = (string)$value;
+        return htmlspecialchars($statusMap[$valueStr] ?? ($valueStr === '' ? 'не выбрано' : $value));
+    }
+
     return htmlspecialchars($value);
 }
 
@@ -102,12 +126,29 @@ function loadContactData($contact, $localStorage, $config) {
             ($contactMapping['phone'] ?? 'PHONE') => is_array($contact['phone']) ? $contact['phone'] : [['VALUE' => $contact['phone']]],
             ($contactMapping['post'] ?? 'POST') => $contact['post'] ?? null,
             ($contactMapping['company_title'] ?? 'COMPANY_TITLE') => $contact['company_title'] ?? null,
-            'COMPANY_ID' => $contact['company']
+            'COMPANY_ID' => $contact['company'],
+            'UF_CRM_65CA1E9F08E72' => $contact['agent_contract_status'] ?? null
         ];
     }
 
     if (!empty($contact['company'])) {
-        $bitrixData['company'] = $localStorage->getCompany($contact['company']);
+        $companyData = $localStorage->getCompany($contact['company']);
+        if ($companyData) {
+            $bitrixData['company'] = [
+                'ID' => $companyData['id'],
+                'TITLE' => $companyData['title'],
+                'EMAIL' => $companyData['email'],
+                'PHONE' => $companyData['phone'],
+                'INDUSTRY' => $companyData['industry'] ?? '',
+                'EMPLOYEES' => $companyData['employees'] ?? '',
+                'REVENUE' => $companyData['revenue'] ?? '',
+                'ADDRESS' => $companyData['address'] ?? '',
+                'COMPANY_TYPE' => $companyData['type'] ?? '',
+                'CONTACT_ID' => $companyData['contact_id'] ?? null,
+                'UF_CRM_65CA23468EF2E' => $companyData['partner_contract_status'] ?? null,
+                'DATE_CREATE' => $companyData['created_at'] ?? null
+            ];
+        }
     }
 
     $bitrixData['projects'] = $localStorage->getAllProjects();
