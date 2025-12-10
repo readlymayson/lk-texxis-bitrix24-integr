@@ -7,27 +7,26 @@
 class LocalStorage
 {
     private $logger;
+    private $config;
     private $dataDir;
     private $contactsFile;
     private $companiesFile;
-    private $dealsFile;
     private $projectsFile;
     private $managersFile;
     private $cachedData = [
         'contacts' => null,
         'companies' => null,
-        'deals' => null,
         'projects' => null,
         'managers' => null
     ];
 
-    public function __construct($logger)
+    public function __construct($logger, $config = null)
     {
         $this->logger = $logger;
+        $this->config = $config;
         $this->dataDir = __DIR__ . '/../data';
         $this->contactsFile = $this->dataDir . '/contacts.json';
         $this->companiesFile = $this->dataDir . '/companies.json';
-        $this->dealsFile = $this->dataDir . '/deals.json';
         $this->projectsFile = $this->dataDir . '/projects.json';
         $this->managersFile = $this->dataDir . '/managers.json';
 
@@ -116,6 +115,9 @@ class LocalStorage
 
         $lkId = 'LK-' . time() . '-' . $contactData['ID'];
 
+        // Получаем значение поля агентского договора
+        $agentContractValue = $this->getFieldValue($contactData, 'contact', 'agent_contract_status');
+
         $lkData = [
             'id' => $lkId,
             'bitrix_id' => $contactData['ID'],
@@ -126,6 +128,7 @@ class LocalStorage
             'phone' => $contactData['PHONE'] ?? '',
             'type_id' => $contactData['TYPE_ID'] ?? '',
             'company' => $contactData['COMPANY_ID'] ?? null,
+            'agent_contract_status' => $agentContractValue,
             'status' => 'active',
             'created_at' => date('Y-m-d H:i:s'),
             'updated_at' => date('Y-m-d H:i:s'),
@@ -160,6 +163,9 @@ class LocalStorage
 
         $companies = $this->readData($this->companiesFile, 'companies');
 
+        // Получаем значение поля партнерского договора
+        $partnerContractValue = $this->getFieldValue($companyData, 'company', 'partner_contract_status');
+
         $companies[$companyId] = [
             'id' => $companyId,
             'title' => $companyData['TITLE'] ?? $companyData['title'] ?? '',
@@ -171,6 +177,7 @@ class LocalStorage
             'revenue' => $companyData['REVENUE'] ?? $companyData['revenue'] ?? '',
             'address' => $companyData['ADDRESS'] ?? $companyData['address'] ?? '',
             'contact_id' => $companyData['CONTACT_ID'] ?? null,
+            'partner_contract_status' => $partnerContractValue,
             'created_at' => date('Y-m-d H:i:s'),
             'updated_at' => date('Y-m-d H:i:s'),
             'source' => 'bitrix24_webhook'
@@ -232,6 +239,13 @@ class LocalStorage
         $contacts[$contactData['ID']]['phone'] = $contactData['PHONE'] ?? $contacts[$contactData['ID']]['phone'];
         $contacts[$contactData['ID']]['type_id'] = $contactData['TYPE_ID'] ?? $contacts[$contactData['ID']]['type_id'];
         $contacts[$contactData['ID']]['company'] = $contactData['COMPANY_ID'] ?? $contacts[$contactData['ID']]['company'];
+        
+        // Обновляем поле агентского договора
+        $agentContractValue = $this->getFieldValue($contactData, 'contact', 'agent_contract_status');
+        if ($agentContractValue !== null) {
+            $contacts[$contactData['ID']]['agent_contract_status'] = $agentContractValue;
+        }
+        
         $newUpdatedAt = date('Y-m-d H:i:s');
         $contacts[$contactData['ID']]['updated_at'] = $newUpdatedAt;
 
@@ -259,6 +273,9 @@ class LocalStorage
 
         $companies = $this->readData($this->companiesFile, 'companies');
 
+        // Получаем значение поля партнерского договора
+        $partnerContractValue = $this->getFieldValue($companyData, 'company', 'partner_contract_status');
+
         $companies[$companyData['ID']] = [
             'id' => $companyData['ID'],
             'title' => $companyData['TITLE'] ?? '',
@@ -269,6 +286,7 @@ class LocalStorage
             'revenue' => $companyData['REVENUE'] ?? '',
             'address' => $companyData['ADDRESS'] ?? '',
             'contact_id' => $companyData['CONTACT_ID'] ?? null,
+            'partner_contract_status' => $partnerContractValue,
             'created_at' => $companyData['DATE_CREATE'] ?? date('Y-m-d H:i:s'),
             'updated_at' => date('Y-m-d H:i:s'),
             'source' => 'bitrix24_webhook'
@@ -376,14 +394,6 @@ class LocalStorage
     }
 
     /**
-     * Получение всех сделок
-     */
-    public function getAllDeals()
-    {
-        return $this->readData($this->dealsFile, 'deals');
-    }
-
-    /**
      * Получение всех проектов
      */
     public function getAllProjects()
@@ -418,9 +428,14 @@ class LocalStorage
             'bitrix_id' => $projectId,
             'organization_name' => $projectData['organization_name'] ?? '',
             'object_name' => $projectData['object_name'] ?? '',
-            'system_type' => $projectData['system_type'] ?? '',
+            'system_types' => is_array($projectData['system_types'] ?? null) ? $projectData['system_types'] : (!empty($projectData['system_types']) ? [$projectData['system_types']] : []),
             'location' => $projectData['location'] ?? '',
             'implementation_date' => $projectData['implementation_date'] ?? null,
+            'request_type' => $projectData['request_type'] ?? '',
+            'equipment_list' => $projectData['equipment_list'] ?? null,
+            'competitors' => $projectData['competitors'] ?? '',
+            'marketing_discount' => $projectData['marketing_discount'] ?? false,
+            'technical_description' => $projectData['technical_description'] ?? '',
             'status' => $projectData['status'] ?? '',
             'client_id' => $projectData['client_id'] ?? null,
             'manager_id' => $projectData['manager_id'] ?? null,
@@ -467,9 +482,10 @@ class LocalStorage
             'name' => $managerData['NAME'] ?? '',
             'last_name' => $managerData['LAST_NAME'] ?? '',
             'email' => $managerData['EMAIL'] ?? '',
-            'phone' => $managerData['PHONE'] ?? '',
+            'phone' => $this->extractManagerPhone($managerData),
             'position' => $managerData['WORK_POSITION'] ?? '',
-            'photo' => $managerData['PERSONAL_PHOTO'] ?? '',
+            'photo' => $this->extractManagerPhoto($managerData),
+            'messengers' => $this->extractManagerMessengers($managerData),
             'created_at' => date('Y-m-d H:i:s'),
             'updated_at' => date('Y-m-d H:i:s'),
             'source' => 'bitrix24_webhook'
@@ -521,9 +537,15 @@ class LocalStorage
 
         $projects[$projectId]['organization_name'] = $projectData['organization_name'] ?? $projects[$projectId]['organization_name'] ?? '';
         $projects[$projectId]['object_name'] = $projectData['object_name'] ?? $projects[$projectId]['object_name'] ?? '';
-        $projects[$projectId]['system_type'] = $projectData['system_type'] ?? $projects[$projectId]['system_type'] ?? '';
+        $systemTypesValue = $projectData['system_types'] ?? $projects[$projectId]['system_types'] ?? [];
+        $projects[$projectId]['system_types'] = is_array($systemTypesValue) ? $systemTypesValue : (!empty($systemTypesValue) ? [$systemTypesValue] : []);
         $projects[$projectId]['location'] = $projectData['location'] ?? $projects[$projectId]['location'] ?? '';
         $projects[$projectId]['implementation_date'] = $projectData['implementation_date'] ?? $projects[$projectId]['implementation_date'] ?? null;
+        $projects[$projectId]['request_type'] = $projectData['request_type'] ?? $projects[$projectId]['request_type'] ?? '';
+        $projects[$projectId]['equipment_list'] = $projectData['equipment_list'] ?? $projects[$projectId]['equipment_list'] ?? null;
+        $projects[$projectId]['competitors'] = $projectData['competitors'] ?? $projects[$projectId]['competitors'] ?? '';
+        $projects[$projectId]['marketing_discount'] = $projectData['marketing_discount'] ?? $projects[$projectId]['marketing_discount'] ?? false;
+        $projects[$projectId]['technical_description'] = $projectData['technical_description'] ?? $projects[$projectId]['technical_description'] ?? '';
         $projects[$projectId]['status'] = $projectData['status'] ?? $projects[$projectId]['status'] ?? 'NEW';
         $projects[$projectId]['client_id'] = $projectData['client_id'] ?? $projects[$projectId]['client_id'] ?? null;
         $projects[$projectId]['manager_id'] = $projectData['manager_id'] ?? $projects[$projectId]['manager_id'] ?? null;
@@ -566,9 +588,15 @@ class LocalStorage
         $managers[$managerId]['name'] = $managerData['NAME'] ?? $managers[$managerId]['name'];
         $managers[$managerId]['last_name'] = $managerData['LAST_NAME'] ?? $managers[$managerId]['last_name'];
         $managers[$managerId]['email'] = $managerData['EMAIL'] ?? $managers[$managerId]['email'];
-        $managers[$managerId]['phone'] = $managerData['PHONE'] ?? $managers[$managerId]['phone'];
+        $managers[$managerId]['phone'] = $this->extractManagerPhone($managerData) ?: ($managers[$managerId]['phone'] ?? '');
         $managers[$managerId]['position'] = $managerData['WORK_POSITION'] ?? $managers[$managerId]['position'];
-        $managers[$managerId]['photo'] = $managerData['PERSONAL_PHOTO'] ?? $managers[$managerId]['photo'];
+        $managers[$managerId]['photo'] = $this->extractManagerPhoto($managerData) ?: ($managers[$managerId]['photo'] ?? '');
+        $messengers = $this->extractManagerMessengers($managerData);
+        if (!empty($messengers)) {
+            $managers[$managerId]['messengers'] = $messengers;
+        } elseif (!isset($managers[$managerId]['messengers'])) {
+            $managers[$managerId]['messengers'] = [];
+        }
         $managers[$managerId]['updated_at'] = date('Y-m-d H:i:s');
 
         $writeResult = $this->writeData($this->managersFile, $managers, 'managers');
@@ -577,72 +605,6 @@ class LocalStorage
             $this->logger->error('Failed to write manager data', ['manager_id' => $managerId]);
         } else {
             $this->logger->info('Manager synced successfully', ['manager_id' => $managerId]);
-        }
-
-        return true;
-    }
-
-    /**
-     * Синхронизация данных сделки по Bitrix ID
-     */
-    public function syncDealByBitrixId($dealId, $dealData)
-    {
-        $this->logger->debug('Syncing deal by Bitrix ID', ['deal_id' => $dealId]);
-
-        $deals = $this->readData($this->dealsFile, 'deals');
-
-        if (!isset($deals[$dealId])) {
-            $this->logger->warning('Deal not found for sync by Bitrix ID, creating new', [
-                'deal_id' => $dealId
-            ]);
-            return $this->addDeal($dealData);
-        }
-
-        $deals[$dealId]['title'] = $dealData['TITLE'] ?? ($deals[$dealId]['title'] ?? '');
-        $deals[$dealId]['stage'] = $dealData['STAGE_ID'] ?? ($deals[$dealId]['stage'] ?? '');
-        $deals[$dealId]['opportunity'] = $dealData['OPPORTUNITY'] ?? ($deals[$dealId]['opportunity'] ?? '');
-        $deals[$dealId]['currency'] = $dealData['CURRENCY_ID'] ?? ($deals[$dealId]['currency'] ?? '');
-        $deals[$dealId]['contact_id'] = $dealData['CONTACT_ID'] ?? ($deals[$dealId]['contact_id'] ?? null);
-        $deals[$dealId]['company_id'] = $dealData['COMPANY_ID'] ?? ($deals[$dealId]['company_id'] ?? null);
-        $deals[$dealId]['updated_at'] = date('Y-m-d H:i:s');
-
-        $writeResult = $this->writeData($this->dealsFile, $deals, 'deals');
-
-        if ($writeResult === false) {
-            $this->logger->error('Failed to write deal data', ['deal_id' => $dealId]);
-        } else {
-            $this->logger->info('Deal synced successfully', ['deal_id' => $dealId]);
-        }
-
-        return true;
-    }
-
-    /**
-     * Добавление сделки
-     */
-    public function addDeal($dealData)
-    {
-        $deals = $this->readData($this->dealsFile, 'deals');
-
-        $deals[$dealData['ID']] = [
-            'id' => $dealData['ID'],
-            'title' => $dealData['TITLE'] ?? '',
-            'stage' => $dealData['STAGE_ID'] ?? '',
-            'opportunity' => $dealData['OPPORTUNITY'] ?? '',
-            'currency' => $dealData['CURRENCY_ID'] ?? '',
-            'contact_id' => $dealData['CONTACT_ID'] ?? null,
-            'company_id' => $dealData['COMPANY_ID'] ?? null,
-            'created_at' => $dealData['DATE_CREATE'] ?? date('Y-m-d H:i:s'),
-            'updated_at' => date('Y-m-d H:i:s'),
-            'source' => 'bitrix24_webhook'
-        ];
-
-        $writeResult = $this->writeData($this->dealsFile, $deals, 'deals');
-
-        if ($writeResult === false) {
-            $this->logger->error('Failed to write deal data', ['deal_id' => $dealData['ID']]);
-        } else {
-            $this->logger->info('Deal stored successfully', ['deal_id' => $dealData['ID']]);
         }
 
         return true;
@@ -662,7 +624,6 @@ class LocalStorage
         $contactId = (string)$contactId;
         
         $deletedCompanies = [];
-        $deletedDeals = [];
         $deletedProjects = [];
         $contactDeleted = false;
 
@@ -715,29 +676,6 @@ class LocalStorage
             }
         }
 
-        $deals = $this->readData($this->dealsFile, 'deals');
-        foreach ($deals as $dealId => $deal) {
-            $dealContactId = $deal['contact_id'] ?? null;
-            if ((string)$dealContactId === $contactId) {
-                unset($deals[$dealId]);
-                $deletedDeals[] = $dealId;
-            }
-        }
-        if (!empty($deletedDeals)) {
-            $writeResult = $this->writeData($this->dealsFile, $deals, 'deals');
-            if ($writeResult !== false) {
-                $this->logger->debug('Related deals deleted', [
-                    'contact_id' => $contactId,
-                    'count' => count($deletedDeals)
-                ]);
-            } else {
-                $this->logger->error('Failed to write deals file after deletion', [
-                    'contact_id' => $contactId,
-                    'deleted_deals' => $deletedDeals
-                ]);
-            }
-        }
-
         $projects = $this->readData($this->projectsFile, 'projects');
         foreach ($projects as $projectId => $project) {
             $projectClientId = $project['client_id'] ?? null;
@@ -761,17 +699,179 @@ class LocalStorage
             }
         }
 
-        $totalDeleted = count($deletedCompanies) + count($deletedDeals) + count($deletedProjects);
+        $totalDeleted = count($deletedCompanies) + count($deletedProjects);
         
         $this->logger->info('Contact data deletion completed', [
             'contact_id' => $contactId,
             'contact_deleted' => $contactDeleted,
             'companies_deleted' => count($deletedCompanies),
-            'deals_deleted' => count($deletedDeals),
             'projects_deleted' => count($deletedProjects),
             'total_related_entities_deleted' => $totalDeleted
         ]);
 
         return true;
+    }
+
+    /**
+     * Удаление компании из локального хранилища
+     * 
+     * @param string $companyId ID компании в Bitrix24
+     * @return bool true при успешном удалении, false при ошибке
+     */
+    public function deleteCompany($companyId)
+    {
+        $this->logger->debug('Starting deletion of company', ['company_id' => $companyId]);
+
+        $companyId = (string)$companyId;
+        $companies = $this->readData($this->companiesFile, 'companies');
+        
+        if (!isset($companies[$companyId])) {
+            $this->logger->warning('Company not found in local storage', ['company_id' => $companyId]);
+            return false;
+        }
+
+        unset($companies[$companyId]);
+        $writeResult = $this->writeData($this->companiesFile, $companies, 'companies');
+        
+        if ($writeResult !== false) {
+            $this->logger->info('Company deleted from local storage', ['company_id' => $companyId]);
+            return true;
+        } else {
+            $this->logger->error('Failed to write companies file after deletion', ['company_id' => $companyId]);
+            return false;
+        }
+    }
+
+    /**
+     * Удаление проекта из локального хранилища
+     * 
+     * @param string $projectId ID проекта в Bitrix24
+     * @return bool true при успешном удалении, false при ошибке
+     */
+    public function deleteProject($projectId)
+    {
+        $this->logger->debug('Starting deletion of project', ['project_id' => $projectId]);
+
+        $projectId = (string)$projectId;
+        $projects = $this->readData($this->projectsFile, 'projects');
+        
+        if (!isset($projects[$projectId])) {
+            $this->logger->warning('Project not found in local storage', ['project_id' => $projectId]);
+            return false;
+        }
+
+        unset($projects[$projectId]);
+        $writeResult = $this->writeData($this->projectsFile, $projects, 'projects');
+        
+        if ($writeResult !== false) {
+            $this->logger->info('Project deleted from local storage', ['project_id' => $projectId]);
+            return true;
+        } else {
+            $this->logger->error('Failed to write projects file after deletion', ['project_id' => $projectId]);
+            return false;
+        }
+    }
+
+    /**
+     * Извлечение ссылки на фото менеджера по маппингу
+     */
+    private function extractManagerPhoto($managerData)
+    {
+        $photoField = $this->config['field_mapping']['user']['photo'] ?? 'PERSONAL_PHOTO';
+        return $managerData[$photoField] ?? '';
+    }
+
+    /**
+     * Извлечение номера телефона менеджера с учетом маппинга
+     */
+    private function extractManagerPhone($managerData)
+    {
+        $phoneField = $this->config['field_mapping']['user']['phone'] ?? 'PERSONAL_PHONE';
+        return $managerData[$phoneField] ?? ($managerData['PHONE'] ?? '');
+    }
+
+    /**
+     * Преобразование полей мессенджеров менеджера в удобный формат
+     */
+    private function extractManagerMessengers($managerData)
+    {
+        $messengerMapping = $this->config['field_mapping']['user']['messengers'] ?? [];
+        $messengers = [];
+
+        foreach ($messengerMapping as $messenger => $fieldCode) {
+            if (empty($fieldCode)) {
+                continue;
+            }
+
+            $rawValue = $managerData[$fieldCode] ?? null;
+            if ($rawValue === null || $rawValue === '') {
+                continue;
+            }
+
+            $messengers[$messenger] = $this->normalizeMessengerLink($messenger, $rawValue);
+        }
+
+        return $messengers;
+    }
+
+    /**
+     * Нормализация ссылок для мессенджеров
+     */
+    private function normalizeMessengerLink($type, $value)
+    {
+        if (is_array($value)) {
+            $value = reset($value);
+        }
+
+        if (!is_string($value)) {
+            return $value;
+        }
+
+        $value = trim($value);
+
+        if ($value === '') {
+            return $value;
+        }
+
+        if (str_starts_with($value, 'http://') || str_starts_with($value, 'https://') || str_contains($value, '://')) {
+            return $value;
+        }
+
+        switch ($type) {
+            case 'telegram':
+                $username = ltrim($value, '@');
+                return 'https://t.me/' . $username;
+            case 'whatsapp':
+                $digits = preg_replace('/\D+/', '', $value);
+                return $digits ? 'https://wa.me/' . $digits : $value;
+            case 'viber':
+                $digits = preg_replace('/\D+/', '', $value);
+                return $digits ? 'viber://chat?number=' . $digits : $value;
+            default:
+                return $value;
+        }
+    }
+
+    /**
+     * Получение значения поля из данных сущности по маппингу конфигурации
+     * 
+     * @param array $entityData Данные сущности из Bitrix24
+     * @param string $entityType Тип сущности ('contact', 'company', etc.)
+     * @param string $fieldKey Ключ поля в маппинге конфигурации
+     * @return mixed Значение поля или null
+     */
+    private function getFieldValue($entityData, $entityType, $fieldKey)
+    {
+        if (!$this->config || !isset($this->config['field_mapping'][$entityType][$fieldKey])) {
+            return null;
+        }
+
+        $fieldName = $this->config['field_mapping'][$entityType][$fieldKey];
+        
+        if (empty($fieldName) || !isset($entityData[$fieldName])) {
+            return null;
+        }
+
+        return $entityData[$fieldName];
     }
 }

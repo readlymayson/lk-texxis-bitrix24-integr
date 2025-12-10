@@ -10,7 +10,6 @@
  * - ONCRMCOMPANYUPDATE - изменение компании
  * - ONCRMCOMPANYADD - создание компании
  * - ONCRMCOMPANYDELETE - удаление компании
- * - ONCRMDEALUPDATE - изменение сделки
  * - ONCRM_DYNAMIC_ITEM_UPDATE - изменение смарт-процесса
  */
 
@@ -19,14 +18,71 @@ require_once __DIR__ . '/../classes/Logger.php';
 require_once __DIR__ . '/../classes/Bitrix24API.php';
 require_once __DIR__ . '/../classes/LocalStorage.php';
 
-$config = require_once __DIR__ . '/../config/bitrix24.php';
+// Проверка доступности необходимых файлов
+$configFile = __DIR__ . '/../config/bitrix24.php';
+if (!file_exists($configFile)) {
+    error_log('ERROR: Config file not found: ' . $configFile);
+    http_response_code(500);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['error' => 'Configuration file not found'], JSON_UNESCAPED_UNICODE);
+    exit;
+}
 
-$logger = new Logger($config);
-$bitrixAPI = new Bitrix24API($config, $logger);
-$localStorage = new LocalStorage($logger);
+$config = require_once $configFile;
+
+if (empty($config)) {
+    error_log('ERROR: Failed to load configuration');
+    http_response_code(500);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['error' => 'Failed to load configuration'], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+// Проверка доступности директории логов
+$logDir = dirname($config['logging']['file'] ?? __DIR__ . '/../logs/bitrix24_webhooks.log');
+if (!is_dir($logDir) || !is_writable($logDir)) {
+    error_log('WARNING: Log directory is not writable: ' . $logDir);
+    // Не блокируем выполнение, но логируем предупреждение
+}
 
 try {
+    $logger = new Logger($config);
+    $bitrixAPI = new Bitrix24API($config, $logger);
+    $localStorage = new LocalStorage($logger, $config);
+} catch (Exception $e) {
+    error_log('ERROR: Failed to initialize classes: ' . $e->getMessage());
+    http_response_code(500);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['error' => 'Internal server error', 'message' => 'Failed to initialize application'], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+try {
+    // Ограничение размера тела запроса (10MB)
+    $maxBodySize = 10 * 1024 * 1024; // 10MB
+    $contentLength = isset($_SERVER['CONTENT_LENGTH']) ? (int)$_SERVER['CONTENT_LENGTH'] : 0;
+    
+    if ($contentLength > $maxBodySize) {
+        $logger->warning('Request body too large', [
+            'content_length' => $contentLength,
+            'max_size' => $maxBodySize
+        ]);
+        sendResponse(413, ['error' => 'Request entity too large']);
+        exit;
+    }
+    
     $rawBody = file_get_contents('php://input');
+    
+    // Дополнительная проверка размера после чтения
+    if (strlen($rawBody) > $maxBodySize) {
+        $logger->warning('Request body too large after reading', [
+            'body_size' => strlen($rawBody),
+            'max_size' => $maxBodySize
+        ]);
+        sendResponse(413, ['error' => 'Request entity too large']);
+        exit;
+    }
+    
     $headers = getRequestHeaders();
 
     $logger->info('=== WEBHOOK REQUEST RECEIVED ===', [
@@ -67,11 +123,17 @@ try {
 
     $webhookData = $bitrixAPI->validateWebhookRequest($headers, $rawBody);
     if ($webhookData === false) {
-        $logger->error('Webhook validation failed', [
-            'raw_body' => $rawBody,
-            'headers' => $headers
+        $logger->error('=== WEBHOOK VALIDATION FAILED ===', [
+            'raw_body_preview' => strlen($rawBody) > 500 ? substr($rawBody, 0, 500) . '...' : $rawBody,
+            'raw_body_size' => strlen($rawBody),
+            'headers' => $headers,
+            'content_type' => $_SERVER['CONTENT_TYPE'] ?? 'UNKNOWN',
+            'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? 'UNKNOWN',
+            'request_method' => $_SERVER['REQUEST_METHOD'] ?? 'UNKNOWN',
+            'remote_addr' => $_SERVER['REMOTE_ADDR'] ?? 'UNKNOWN',
+            'note' => 'Check logs above for specific validation errors'
         ]);
-        sendResponse(400, ['error' => 'Invalid webhook request']);
+        sendResponse(400, ['error' => 'Invalid webhook request', 'message' => 'Validation failed. Check server logs for details.']);
         exit;
     }
 
@@ -97,10 +159,17 @@ try {
     }
 
     if (empty($eventName)) {
-        $logger->error('Missing event name in webhook data', [
-            'webhook_data_keys' => array_keys($webhookData)
+        $logger->error('=== MISSING EVENT NAME ===', [
+            'webhook_data_keys' => array_keys($webhookData),
+            'webhook_data_structure' => [
+                'has_event' => isset($webhookData['event']),
+                'event_value' => $webhookData['event'] ?? null,
+                'has_data' => isset($webhookData['data']),
+                'data_keys' => isset($webhookData['data']) ? array_keys($webhookData['data']) : []
+            ],
+            'body_preview' => strlen($rawBody) > 500 ? substr($rawBody, 0, 500) . '...' : $rawBody
         ]);
-        sendResponse(400, ['error' => 'Missing event name']);
+        sendResponse(400, ['error' => 'Missing event name', 'message' => 'Webhook data does not contain event field']);
         exit;
     }
 
@@ -171,15 +240,20 @@ function processEventWithRetry($eventName, $webhookData, $config, $logger, $bitr
                 return true;
             }
 
-            // Если это не последняя попытка, ждем перед следующей
+            // Если это не последняя попытка, логируем задержку
+            // Примечание: sleep() удален, так как блокирует выполнение webhook
+            // Повторные попытки должны обрабатываться внешней системой (очередь, cron)
             if ($attempt < $maxRetries) {
                 $delay = $retryDelays[$attempt] ?? end($retryDelays);
-                $logger->info('Retrying after delay', [
+                $logger->warning('Event processing failed, retry recommended', [
                     'attempt' => $attempt + 1,
-                    'delay' => $delay,
-                    'event' => $eventName
+                    'max_attempts' => $maxRetries + 1,
+                    'recommended_delay' => $delay,
+                    'event' => $eventName,
+                    'note' => 'Retries should be handled by external queue system'
                 ]);
-                sleep($delay);
+                // Не используем sleep() чтобы не блокировать webhook
+                // Внешняя система должна обработать повторную попытку
             }
 
         } catch (Exception $e) {
@@ -215,13 +289,96 @@ function mapProjectData($projectData, $mapping, $logger)
     $projectId = $projectData['id'] ?? $projectData['ID'] ?? null;
     $clientId = extractContactId($projectData[$mapping['client_id']] ?? null);
     
+    // Обработка списочного поля "Тип запросов"
+    $requestTypeRaw = $projectData[$mapping['request_type']] ?? null;
+    $requestType = '';
+    if (!empty($requestTypeRaw)) {
+        if (is_array($requestTypeRaw)) {
+            // Если массив, берем первый элемент или ID
+            $requestType = $requestTypeRaw[0] ?? $requestTypeRaw['ID'] ?? '';
+        } else {
+            $requestType = (string)$requestTypeRaw;
+        }
+    }
+    
+    // Обработка множественного поля "Типы системы" (system_types)
+    $systemTypesRaw = $projectData[$mapping['system_types']] ?? null;
+    $systemTypes = [];
+    if (!empty($systemTypesRaw)) {
+        if (is_array($systemTypesRaw)) {
+            // Если массив, обрабатываем каждый элемент
+            foreach ($systemTypesRaw as $item) {
+                if (is_array($item)) {
+                    // Если элемент - объект, извлекаем ID
+                    $itemId = $item['ID'] ?? $item['id'] ?? $item['VALUE'] ?? $item['value'] ?? null;
+                    if ($itemId !== null) {
+                        $systemTypes[] = (string)$itemId;
+                    }
+                } else {
+                    // Если элемент - простое значение (ID)
+                    $systemTypes[] = (string)$item;
+                }
+            }
+        } else {
+            // Если одиночное значение, преобразуем в массив
+            $systemTypes = [(string)$systemTypesRaw];
+        }
+    }
+    
+    // Обработка поля "Перечень оборудования" (тип: Ссылка)
+    $equipmentListRaw = $projectData[$mapping['equipment_list']] ?? null;
+    $equipmentList = null;
+    if (!empty($equipmentListRaw)) {
+        // Поле теперь типа "Ссылка" - может быть ID файла или объект с данными
+        if (is_array($equipmentListRaw)) {
+            // Если это массив, берем первый элемент (для одиночной ссылки)
+            $fileData = $equipmentListRaw[0] ?? $equipmentListRaw;
+            if (is_array($fileData)) {
+                $equipmentList = [
+                    'id' => $fileData['id'] ?? $fileData['ID'] ?? null,
+                    'name' => $fileData['name'] ?? $fileData['NAME'] ?? null,
+                    'url' => $fileData['downloadUrl'] ?? $fileData['DOWNLOAD_URL'] ?? null,
+                    'size' => $fileData['size'] ?? $fileData['SIZE'] ?? null
+                ];
+            } else {
+                // Если это просто ID в массиве
+                $equipmentList = ['id' => $fileData];
+            }
+        } else {
+            // Если это одиночное значение (ID файла как ссылка)
+            $equipmentList = ['id' => $equipmentListRaw];
+        }
+    }
+    
+    // Обработка чекбокса "Маркетинговая скидка"
+    $marketingDiscountRaw = $projectData[$mapping['marketing_discount']] ?? null;
+    $marketingDiscount = false;
+    if (!empty($marketingDiscountRaw)) {
+        // Bitrix24 может передавать: true, 'Y', 1, '1'
+        if (is_bool($marketingDiscountRaw)) {
+            $marketingDiscount = $marketingDiscountRaw;
+        } elseif (is_numeric($marketingDiscountRaw)) {
+            $marketingDiscount = (int)$marketingDiscountRaw === 1;
+        } elseif (is_string($marketingDiscountRaw)) {
+            $marketingDiscount = in_array(strtoupper($marketingDiscountRaw), ['Y', 'YES', 'TRUE', '1']);
+        }
+    }
+    
+    // Техническое описание проекта (многострочный текст)
+    $technicalDescription = $projectData[$mapping['technical_description']] ?? '';
+    
     return [
         'bitrix_id' => $projectId,
         'organization_name' => $projectData[$mapping['organization_name']] ?? '',
         'object_name' => $projectData[$mapping['object_name']] ?? '',
-        'system_type' => $projectData[$mapping['system_type']] ?? '',
+        'system_types' => $systemTypes,
         'location' => $projectData[$mapping['location']] ?? '',
         'implementation_date' => $projectData[$mapping['implementation_date']] ?? null,
+        'request_type' => $requestType,
+        'equipment_list' => $equipmentList,
+        'competitors' => $projectData[$mapping['competitors']] ?? '',
+        'marketing_discount' => $marketingDiscount,
+        'technical_description' => $technicalDescription,
         'status' => $projectData[$mapping['status']] ?? 'NEW',
         'client_id' => $clientId,
         'manager_id' => $projectData['assignedById'] ?? $projectData['ASSIGNED_BY_ID'] ?? null
@@ -396,10 +553,54 @@ function processEvent($eventName, $webhookData, $bitrixAPI, $localStorage, $logg
     ]);
 
     $entityData = $bitrixAPI->getEntityData($entityType, $entityId);
+    
+    // Проверяем, является ли ошибка "Not found"
+    if (is_array($entityData) && isset($entityData['error']) && $entityData['error'] === 'NOT_FOUND') {
+        $logger->info('Entity not found in Bitrix24, deleting from local storage', [
+            'entity_type' => $entityType,
+            'entity_id' => $entityId
+        ]);
+        
+        // Удаляем элемент из локального хранилища
+        $deleted = false;
+        switch ($entityType) {
+            case 'contact':
+                $deleted = $localStorage->deleteContactData($entityId);
+                break;
+            case 'company':
+                $deleted = $localStorage->deleteCompany($entityId);
+                break;
+            case 'smart_process':
+                $deleted = $localStorage->deleteProject($entityId);
+                break;
+            default:
+                $logger->warning('Unknown entity type for deletion', [
+                    'entity_type' => $entityType,
+                    'entity_id' => $entityId
+                ]);
+        }
+        
+        if ($deleted) {
+            $logger->info('Entity successfully deleted from local storage', [
+                'entity_type' => $entityType,
+                'entity_id' => $entityId
+            ]);
+            return true; // Считаем успешным, так как элемент удален
+        } else {
+            $logger->warning('Failed to delete entity from local storage (may not exist)', [
+                'entity_type' => $entityType,
+                'entity_id' => $entityId
+            ]);
+            return true; // Считаем успешным, элемент мог не существовать
+        }
+    }
+    
     if (!$entityData || !isset($entityData['result'])) {
         $logger->error('Failed to get entity data from Bitrix24', [
             'entity_type' => $entityType,
-            'entity_id' => $entityId
+            'entity_id' => $entityId,
+            'response_type' => gettype($entityData),
+            'has_error_key' => is_array($entityData) && isset($entityData['error'])
         ]);
         return false;
     }
@@ -507,24 +708,6 @@ function handleCreate($entityType, $entityData, $localStorage, $bitrixAPI, $logg
             $localStorage->createCompany($entityData);
             break;
 
-        case 'deal':
-            $contactId = extractContactId($entityData['CONTACT_ID'] ?? null);
-            
-            if (empty($contactId) || !hasContactInLocalStorage($contactId, $localStorage, $logger)) {
-                $logger->info('Skipping deal creation - no contact link or contact not found in local storage', [
-                    'deal_id' => $entityData['ID'],
-                    'contact_id' => $contactId
-                ]);
-                return true;
-            }
-            
-            $logger->info('New deal created', [
-                'deal_id' => $entityData['ID'],
-                'contact_id' => $contactId
-            ]);
-            $localStorage->addDeal($entityData);
-            break;
-
         case 'smart_process':
             $projectId = $entityData['id'] ?? $entityData['ID'] ?? null;
             $logger->info('New smart process created', ['process_id' => $projectId]);
@@ -559,9 +742,6 @@ function handleUpdate($entityType, $entityData, $localStorage, $bitrixAPI, $logg
 
         case 'company':
             return handleCompanyUpdate($entityData, $localStorage, $bitrixAPI, $logger, $config);
-
-        case 'deal':
-            return handleDealUpdate($entityData, $localStorage, $logger, $config);
 
         case 'smart_process':
             return handleSmartProcessUpdate($entityData, $localStorage, $bitrixAPI, $logger, $config);
@@ -792,36 +972,6 @@ function handleCompanyUpdate($companyData, $localStorage, $bitrixAPI, $logger, $
 }
 
 /**
- * Обработка обновления сделки
- */
-function handleDealUpdate($dealData, $localStorage, $logger, $config)
-{
-    // Логика обработки изменений сделок
-    // Может включать обновление статусов проектов в ЛК
-    $dealId = $dealData['ID'];
-    $contactId = $dealData['CONTACT_ID'] ?? null;
-    
-    // Проверяем, привязана ли сделка к контакту с существующим ЛК
-    if (empty($contactId) || !hasContactInLocalStorage($contactId, $localStorage, $logger)) {
-        $logger->info('Skipping deal sync - no contact link or contact not found in local storage', [
-            'deal_id' => $dealId,
-            'contact_id' => $contactId,
-            'stage' => $dealData['STAGE_ID'] ?? 'unknown'
-        ]);
-        return true; // Не считаем это ошибкой, просто пропускаем синхронизацию
-    }
-
-    $logger->info('Deal updated', [
-        'deal_id' => $dealId,
-        'stage' => $dealData['STAGE_ID'] ?? 'unknown',
-        'contact_id' => $contactId
-    ]);
-
-    // Синхронизируем данные сделки локально
-    return $localStorage->syncDealByBitrixId($dealId, $dealData);
-}
-
-/**
  * Обработка обновления смарт-процесса
  */
 function handleSmartProcessUpdate($processData, $localStorage, $bitrixAPI, $logger, $config)
@@ -888,7 +1038,6 @@ function getWebhookEventType($eventName)
     $eventTypes = [
         'CONTACT' => 'contact',
         'COMPANY' => 'company',
-        'DEAL' => 'deal',
         'DYNAMIC_ITEM' => 'smart_process'
     ];
 
@@ -951,9 +1100,7 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
 
     try {
         // Ищем компании, где текущий контакт указан как CONTACT_ID
-        $companies = $bitrixAPI->getEntityList('company', [
-            'filter' => ['CONTACT_ID' => $contactId]
-        ]);
+        $companies = $bitrixAPI->getEntityList('company', ['CONTACT_ID' => $contactId]);
 
         if ($companies && isset($companies['result'])) {
             $companyList = $companies['result'];
@@ -1048,9 +1195,7 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
                     'smart_process_id' => $smartProcessId
                 ]);
                 
-                $projects = $bitrixAPI->getEntityList('smart_process', [
-                    'filter' => [$clientFieldName => $contactId]
-                ]);
+                $projects = $bitrixAPI->getEntityList('smart_process', [$clientFieldName => $contactId]);
 
                 $logger->debug('Projects API response', [
                     'contact_id' => $contactId,
@@ -1060,7 +1205,10 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
                 ]);
 
                 if ($projects && isset($projects['result'])) {
-                    $projectList = $projects['result'];
+                    // crm.item.list для смарт-процессов возвращает массив с ключом items
+                    $projectList = isset($projects['result']['items'])
+                        ? $projects['result']['items']
+                        : $projects['result'];
                     $logger->info('Found related projects for contact', [
                         'contact_id' => $contactId,
                         'projects_count' => is_array($projectList) ? count($projectList) : 0,
@@ -1068,7 +1216,7 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
                     ]);
 
                     foreach ($projectList as $project) {
-                        $projectId = $project['ID'] ?? null;
+                        $projectId = $project['ID'] ?? $project['id'] ?? null;
 
                         // Пропускаем проекты без ID
                         if (empty($projectId)) {
@@ -1161,64 +1309,6 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
             ]);
         }
 
-        // Ищем связанные сделки
-        $logger->info('Checking for related deals for contact', ['contact_id' => $contactId]);
-
-        try {
-            $deals = $bitrixAPI->getEntityList('deal', [
-                'filter' => ['CONTACT_ID' => $contactId]
-            ]);
-
-            if ($deals && isset($deals['result'])) {
-                $dealList = $deals['result'];
-                $logger->info('Found related deals for contact', [
-                    'contact_id' => $contactId,
-                    'deals_count' => count($dealList)
-                ]);
-
-                foreach ($dealList as $deal) {
-                    $dealId = $deal['ID'];
-                    $logger->info('Processing related deal', [
-                        'deal_id' => $dealId,
-                        'deal_title' => $deal['TITLE'] ?? 'N/A',
-                        'contact_id' => $contactId
-                    ]);
-
-                    // Получаем полные данные сделки
-                    $fullDealData = $bitrixAPI->getEntityData('deal', $dealId);
-                    if ($fullDealData && isset($fullDealData['result'])) {
-                        $dealData = $fullDealData['result'];
-
-                        $logger->info('Syncing related deal to contact LK', [
-                            'deal_id' => $dealId,
-                            'deal_title' => $dealData['TITLE'] ?? 'N/A',
-                            'contact_id' => $contactId
-                        ]);
-
-                        $syncResult = $localStorage->syncDealByBitrixId($dealId, $dealData);
-                        if (!$syncResult) {
-                            $logger->error('Failed to sync related deal', [
-                                'deal_id' => $dealId,
-                                'contact_id' => $contactId
-                            ]);
-                        }
-                    } else {
-                        $logger->error('Failed to get deal data from Bitrix24 API', [
-                            'deal_id' => $dealId,
-                            'contact_id' => $contactId
-                        ]);
-                    }
-                }
-            } else {
-                $logger->debug('No related deals found for contact', ['contact_id' => $contactId]);
-            }
-        } catch (Exception $e) {
-            $logger->error('Error syncing related deals for contact', [
-                'contact_id' => $contactId,
-                'error' => $e->getMessage()
-            ]);
-        }
-
     } catch (Exception $e) {
         $logger->error('Error syncing related entities for contact', [
             'contact_id' => $contactId,
@@ -1230,47 +1320,37 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
 /**
  * Создание карточки в смарт-процессе "Изменение данных в ЛК"
  * 
- * @param array $data Данные для создания карточки:
- *   - contact_id (обязательно) - ID контакта
- *   - company_id (опционально) - ID компании
- *   - manager_id (опционально) - ID менеджера
- *   - new_email (опционально) - Новый e-mail
- *   - new_phone (опционально) - Новый телефон
- *   - change_reason_personal (опционально) - Причина изменения личных данных
- *   - new_company_name (опционально) - Название новой компании
- *   - new_company_website (опционально) - Сайт новой компании
- *   - new_company_inn (опционально) - ИНН новой компании
- *   - new_company_phone (опционально) - Телефон новой компании
- *   - change_reason_company (опционально) - Причина изменения данных о компании
+ * @param string|int $contactId ID контакта (обязательно)
+ * @param array $additionalData Дополнительные данные (new_email, new_phone, и т.д.)
  * @param Bitrix24API $bitrixAPI Экземпляр API
+ * @param LocalStorage $localStorage Экземпляр LocalStorage для получения данных из ЛК базы
  * @param Logger $logger Экземпляр логгера
  * @return array|false Результат создания или false при ошибке
  */
-function createChangeDataCard($data, $bitrixAPI, $logger)
+function createChangeDataCard($contactId, $additionalData, $bitrixAPI, $localStorage, $logger)
 {
-    if (empty($data['contact_id'])) {
+    if (empty($contactId)) {
         $logger->error('Contact ID is required for creating change data card');
         return false;
     }
 
     $logger->info('Creating change data card in smart process', [
-        'contact_id' => $data['contact_id'],
-        'has_company_id' => !empty($data['company_id']),
-        'has_manager_id' => !empty($data['manager_id']),
-        'has_personal_changes' => !empty($data['new_email']) || !empty($data['new_phone']),
-        'has_company_changes' => !empty($data['new_company_name']) || !empty($data['new_company_inn'])
+        'contact_id' => $contactId,
+        'has_personal_changes' => !empty($additionalData['new_email']) || !empty($additionalData['new_phone']),
+        'has_company_changes' => !empty($additionalData['new_company_name']) || !empty($additionalData['new_company_inn']),
+        'note' => 'company_id and manager_id will be retrieved from LK database'
     ]);
 
-    $result = $bitrixAPI->createChangeDataCard($data);
+    $result = $bitrixAPI->createChangeDataCard($contactId, $additionalData, $localStorage);
 
     if ($result) {
         $logger->info('Change data card created successfully', [
-            'contact_id' => $data['contact_id'],
+            'contact_id' => $contactId,
             'card_id' => $result['id'] ?? 'unknown'
         ]);
     } else {
         $logger->error('Failed to create change data card', [
-            'contact_id' => $data['contact_id']
+            'contact_id' => $contactId
         ]);
     }
 
@@ -1280,37 +1360,34 @@ function createChangeDataCard($data, $bitrixAPI, $logger)
 /**
  * Создание карточки в смарт-процессе "Удаление пользовательских данных"
  * 
- * @param array $data Данные для создания карточки:
- *   - contact_id (обязательно) - ID контакта
- *   - company_id (опционально) - ID компании
- *   - manager_id (опционально) - ID менеджера
+ * @param string|int $contactId ID контакта (обязательно)
  * @param Bitrix24API $bitrixAPI Экземпляр API
+ * @param LocalStorage $localStorage Экземпляр LocalStorage для получения данных из ЛК базы
  * @param Logger $logger Экземпляр логгера
  * @return array|false Результат создания или false при ошибке
  */
-function createDeleteDataCard($data, $bitrixAPI, $logger)
+function createDeleteDataCard($contactId, $bitrixAPI, $localStorage, $logger)
 {
-    if (empty($data['contact_id'])) {
+    if (empty($contactId)) {
         $logger->error('Contact ID is required for creating delete data card');
         return false;
     }
 
     $logger->info('Creating delete data card in smart process', [
-        'contact_id' => $data['contact_id'],
-        'has_company_id' => !empty($data['company_id']),
-        'has_manager_id' => !empty($data['manager_id'])
+        'contact_id' => $contactId,
+        'note' => 'company_id and manager_id will be retrieved from LK database'
     ]);
 
-    $result = $bitrixAPI->createDeleteDataCard($data);
+    $result = $bitrixAPI->createDeleteDataCard($contactId, $localStorage);
 
     if ($result) {
         $logger->info('Delete data card created successfully', [
-            'contact_id' => $data['contact_id'],
+            'contact_id' => $contactId,
             'card_id' => $result['id'] ?? 'unknown'
         ]);
     } else {
         $logger->error('Failed to create delete data card', [
-            'contact_id' => $data['contact_id']
+            'contact_id' => $contactId
         ]);
     }
 
