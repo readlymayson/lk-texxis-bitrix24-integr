@@ -664,11 +664,24 @@ function getProjectStageText($stageId) {
                                     if (!empty($project['equipment_list']) && is_array($project['equipment_list'])): 
                                         echo '<small>';
                                         foreach ($project['equipment_list'] as $file):
-                                            $fileName = $file['name'] ?? 'Файл #' . ($file['id'] ?? '?');
-                                            if (!empty($file['url'])):
-                                                echo '<a href="' . htmlspecialchars($file['url']) . '" target="_blank" class="text-decoration-none">';
+                                            // Обрабатываем разные форматы данных файла
+                                            if (is_array($file)) {
+                                                $fileName = $file['name'] ?? 'Файл #' . ($file['id'] ?? '?');
+                                                $fileUrl = $file['url'] ?? null;
+                                                $fileId = $file['id'] ?? null;
+                                            } else {
+                                                // Если файл - это просто ID или строка
+                                                $fileName = 'Файл #' . (string)$file;
+                                                $fileUrl = null;
+                                                $fileId = $file;
+                                            }
+                                            
+                                            if (!empty($fileUrl)):
+                                                echo '<a href="' . htmlspecialchars($fileUrl) . '" target="_blank" class="text-decoration-none">';
                                                 echo '<i class="fas fa-file-download"></i> ' . htmlspecialchars($fileName);
                                                 echo '</a>';
+                                            elseif (!empty($fileId)):
+                                                echo '<i class="fas fa-file"></i> ' . htmlspecialchars($fileName);
                                             else:
                                                 echo '<i class="fas fa-file"></i> ' . htmlspecialchars($fileName);
                                             endif;

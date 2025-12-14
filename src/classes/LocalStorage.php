@@ -117,6 +117,9 @@ class LocalStorage
 
         // Получаем значение поля агентского договора
         $agentContractValue = $this->getFieldValue($contactData, 'contact', 'agent_contract_status');
+        
+        // Получаем значение поля ЛК клиента
+        $lkClientValue = $this->getFieldValue($contactData, 'contact', 'lk_client_field');
 
         $lkData = [
             'id' => $lkId,
@@ -129,6 +132,7 @@ class LocalStorage
             'type_id' => $contactData['TYPE_ID'] ?? '',
             'company' => $contactData['COMPANY_ID'] ?? null,
             'agent_contract_status' => $agentContractValue,
+            'lk_client_field' => $lkClientValue,
             'status' => 'active',
             'created_at' => date('Y-m-d H:i:s'),
             'updated_at' => date('Y-m-d H:i:s'),
@@ -244,6 +248,12 @@ class LocalStorage
         $agentContractValue = $this->getFieldValue($contactData, 'contact', 'agent_contract_status');
         if ($agentContractValue !== null) {
             $contacts[$contactData['ID']]['agent_contract_status'] = $agentContractValue;
+        }
+        
+        // Обновляем поле ЛК клиента
+        $lkClientValue = $this->getFieldValue($contactData, 'contact', 'lk_client_field');
+        if ($lkClientValue !== null) {
+            $contacts[$contactData['ID']]['lk_client_field'] = $lkClientValue;
         }
         
         $newUpdatedAt = date('Y-m-d H:i:s');
@@ -424,6 +434,13 @@ class LocalStorage
             return false;
         }
 
+        // Обработка equipment_list - всегда массив файлов
+        $equipmentList = $projectData['equipment_list'] ?? [];
+        if (!is_array($equipmentList)) {
+            // Если это не массив, преобразуем в массив (для обратной совместимости)
+            $equipmentList = !empty($equipmentList) ? [$equipmentList] : [];
+        }
+
         $projects[$projectId] = [
             'bitrix_id' => $projectId,
             'organization_name' => $projectData['organization_name'] ?? '',
@@ -432,7 +449,7 @@ class LocalStorage
             'location' => $projectData['location'] ?? '',
             'implementation_date' => $projectData['implementation_date'] ?? null,
             'request_type' => $projectData['request_type'] ?? '',
-            'equipment_list' => $projectData['equipment_list'] ?? null,
+            'equipment_list' => $equipmentList,
             'competitors' => $projectData['competitors'] ?? '',
             'marketing_discount' => $projectData['marketing_discount'] ?? false,
             'technical_description' => $projectData['technical_description'] ?? '',
@@ -542,7 +559,15 @@ class LocalStorage
         $projects[$projectId]['location'] = $projectData['location'] ?? $projects[$projectId]['location'] ?? '';
         $projects[$projectId]['implementation_date'] = $projectData['implementation_date'] ?? $projects[$projectId]['implementation_date'] ?? null;
         $projects[$projectId]['request_type'] = $projectData['request_type'] ?? $projects[$projectId]['request_type'] ?? '';
-        $projects[$projectId]['equipment_list'] = $projectData['equipment_list'] ?? $projects[$projectId]['equipment_list'] ?? null;
+        
+        // Обработка equipment_list - всегда массив файлов
+        $equipmentList = $projectData['equipment_list'] ?? $projects[$projectId]['equipment_list'] ?? [];
+        if (!is_array($equipmentList)) {
+            // Если это не массив, преобразуем в массив (для обратной совместимости)
+            $equipmentList = !empty($equipmentList) ? [$equipmentList] : [];
+        }
+        $projects[$projectId]['equipment_list'] = $equipmentList;
+        
         $projects[$projectId]['competitors'] = $projectData['competitors'] ?? $projects[$projectId]['competitors'] ?? '';
         $projects[$projectId]['marketing_discount'] = $projectData['marketing_discount'] ?? $projects[$projectId]['marketing_discount'] ?? false;
         $projects[$projectId]['technical_description'] = $projectData['technical_description'] ?? $projects[$projectId]['technical_description'] ?? '';

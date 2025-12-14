@@ -241,8 +241,8 @@ function processEventWithRetry($eventName, $webhookData, $config, $logger, $bitr
             }
 
             // Если это не последняя попытка, логируем задержку
-            // Примечание: sleep() удален, так как блокирует выполнение webhook
             // Повторные попытки должны обрабатываться внешней системой (очередь, cron)
+            // sleep() не используется, чтобы не блокировать webhook
             if ($attempt < $maxRetries) {
                 $delay = $retryDelays[$attempt] ?? end($retryDelays);
                 $logger->warning('Event processing failed, retry recommended', [
@@ -252,8 +252,6 @@ function processEventWithRetry($eventName, $webhookData, $config, $logger, $bitr
                     'event' => $eventName,
                     'note' => 'Retries should be handled by external queue system'
                 ]);
-                // Не используем sleep() чтобы не блокировать webhook
-                // Внешняя система должна обработать повторную попытку
             }
 
         } catch (Exception $e) {
@@ -325,28 +323,35 @@ function mapProjectData($projectData, $mapping, $logger)
         }
     }
     
-    // Обработка поля "Перечень оборудования" (тип: Ссылка)
+    // Обработка поля "Перечень оборудования" (тип: Ссылка) - множественное поле
     $equipmentListRaw = $projectData[$mapping['equipment_list']] ?? null;
-    $equipmentList = null;
+    $equipmentList = [];
     if (!empty($equipmentListRaw)) {
-        // Поле теперь типа "Ссылка" - может быть ID файла или объект с данными
+        // Поле типа "Ссылка" с множественным выбором - может быть массивом файлов
         if (is_array($equipmentListRaw)) {
-            // Если это массив, берем первый элемент (для одиночной ссылки)
-            $fileData = $equipmentListRaw[0] ?? $equipmentListRaw;
-            if (is_array($fileData)) {
-                $equipmentList = [
-                    'id' => $fileData['id'] ?? $fileData['ID'] ?? null,
-                    'name' => $fileData['name'] ?? $fileData['NAME'] ?? null,
-                    'url' => $fileData['downloadUrl'] ?? $fileData['DOWNLOAD_URL'] ?? null,
-                    'size' => $fileData['size'] ?? $fileData['SIZE'] ?? null
-                ];
-            } else {
-                // Если это просто ID в массиве
-                $equipmentList = ['id' => $fileData];
+            // Обрабатываем каждый файл в массиве
+            foreach ($equipmentListRaw as $fileData) {
+                if (is_array($fileData)) {
+                    // Если это объект с данными файла
+                    $fileInfo = [
+                        'id' => $fileData['id'] ?? $fileData['ID'] ?? null,
+                        'name' => $fileData['name'] ?? $fileData['NAME'] ?? null,
+                        'url' => $fileData['downloadUrl'] ?? $fileData['DOWNLOAD_URL'] ?? null,
+                        'size' => $fileData['size'] ?? $fileData['SIZE'] ?? null
+                    ];
+                    if (!empty($fileInfo['id'])) {
+                        $equipmentList[] = $fileInfo;
+                    }
+                } else {
+                    // Если это просто ID файла
+                    if (!empty($fileData)) {
+                        $equipmentList[] = ['id' => $fileData];
+                    }
+                }
             }
         } else {
-            // Если это одиночное значение (ID файла как ссылка)
-            $equipmentList = ['id' => $equipmentListRaw];
+            // Если это одиночное значение (ID файла как ссылка) - преобразуем в массив
+            $equipmentList[] = ['id' => $equipmentListRaw];
         }
     }
     
@@ -367,12 +372,27 @@ function mapProjectData($projectData, $mapping, $logger)
     // Техническое описание проекта (многострочный текст)
     $technicalDescription = $projectData[$mapping['technical_description']] ?? '';
     
+    // Обработка поля "Местоположение" (тип: address)
+    // Bitrix24 возвращает адрес в формате "адрес|;|ID_смартпроцесса"
+    // Нужно извлечь только адресную часть
+    $locationRaw = $projectData[$mapping['location']] ?? '';
+    $location = '';
+    if (!empty($locationRaw)) {
+        // Если адрес содержит разделитель "|;|", берем только часть до разделителя
+        if (str_contains($locationRaw, '|;|')) {
+            $locationParts = explode('|;|', $locationRaw);
+            $location = trim($locationParts[0]);
+        } else {
+            $location = trim($locationRaw);
+        }
+    }
+    
     return [
         'bitrix_id' => $projectId,
         'organization_name' => $projectData[$mapping['organization_name']] ?? '',
         'object_name' => $projectData[$mapping['object_name']] ?? '',
         'system_types' => $systemTypes,
-        'location' => $projectData[$mapping['location']] ?? '',
+        'location' => $location,
         'implementation_date' => $projectData[$mapping['implementation_date']] ?? null,
         'request_type' => $requestType,
         'equipment_list' => $equipmentList,
@@ -458,7 +478,7 @@ function isValidLKClientValue($entityType, $entityData, $config, $logger)
 
     $fieldValue = $entityData[$fieldName] ?? null;
 
-    if (empty($fieldValue)) {
+    if (empty($fieldValue) && $fieldValue !== '0' && $fieldValue !== 0) {
         $logger->debug('LK client field is empty or not set', [
             'entity_type' => $entityType,
             'field_name' => $fieldName,
@@ -467,13 +487,21 @@ function isValidLKClientValue($entityType, $entityData, $config, $logger)
         return false;
     }
 
-    $isValid = in_array($fieldValue, $allowedValues, true);
+    // Нормализуем значения для сравнения (приводим к строкам)
+    // Bitrix24 может возвращать значения как строки или числа
+    $fieldValueNormalized = (string)$fieldValue;
+    $allowedValuesNormalized = array_map('strval', $allowedValues);
+
+    $isValid = in_array($fieldValueNormalized, $allowedValuesNormalized, true);
 
     $logger->debug('LK client field validation', [
         'entity_type' => $entityType,
         'field_name' => $fieldName,
         'field_value' => $fieldValue,
+        'field_value_type' => gettype($fieldValue),
+        'field_value_normalized' => $fieldValueNormalized,
         'allowed_values' => $allowedValues,
+        'allowed_values_normalized' => $allowedValuesNormalized,
         'is_valid' => $isValid
     ]);
 
@@ -492,26 +520,32 @@ function shouldDeleteContactData($entityType, $entityData, $config, $logger)
     $fieldName = $config['field_mapping'][$entityType]['lk_client_field'];
     $deleteValue = $config['field_mapping'][$entityType]['lk_delete_value'] ?? '';
 
-    if (empty($deleteValue)) {
+    if (empty($deleteValue) && $deleteValue !== '0' && $deleteValue !== 0) {
         return false;
     }
 
     $fieldValue = $entityData[$fieldName] ?? null;
 
-    if (empty($fieldValue)) {
+    if (empty($fieldValue) && $fieldValue !== '0' && $fieldValue !== 0) {
         return false;
     }
 
-    $fieldValue = (string)$fieldValue;
-    $deleteValue = (string)$deleteValue;
+    // Нормализуем значения для сравнения (приводим к строкам)
+    // Bitrix24 может возвращать значения как строки или числа
+    $fieldValueNormalized = (string)$fieldValue;
+    $deleteValueNormalized = (string)$deleteValue;
 
-    $shouldDelete = ($fieldValue === $deleteValue);
+    $shouldDelete = ($fieldValueNormalized === $deleteValueNormalized);
 
     $logger->debug('Checking if contact data should be deleted', [
         'entity_type' => $entityType,
         'field_name' => $fieldName,
         'field_value' => $fieldValue,
+        'field_value_type' => gettype($fieldValue),
+        'field_value_normalized' => $fieldValueNormalized,
         'delete_value' => $deleteValue,
+        'delete_value_type' => gettype($deleteValue),
+        'delete_value_normalized' => $deleteValueNormalized,
         'should_delete' => $shouldDelete
     ]);
 

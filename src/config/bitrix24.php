@@ -14,6 +14,7 @@ return [
         'webhook_url' => EnvLoader::get('BITRIX24_WEBHOOK_URL', ''),
         'application_token' => EnvLoader::get('BITRIX24_APPLICATION_TOKEN', ''), // Токен приложения для валидации webhook
         'timeout' => EnvLoader::getInt('BITRIX24_TIMEOUT', 30), // Timeout для API запросов (секунды)
+        'email_from' => 'devilinggaming@mail.ru', // Email адрес отправителя для писем (опционально)
         'smart_process_id' => 1038, // ID смарт-процесса для проектов
         // ID смарт-процессов по ТЗ (разделы 8, 10)
         'smart_process_change_data_id' => 1042, // ID смарт-процесса "Изменение данных в ЛК"
@@ -42,7 +43,7 @@ return [
     'field_mapping' => [
         'contact' => [
             'lk_client_field' => 'UF_CRM_1765110404000', // Поле "ЛК клиента" в контакте
-            'lk_client_values' => ['47','75','3118','3120','3122'], // Допустимые значения поля "ЛК клиента"
+            'lk_client_values' => ['47','63','75','3118','3120','3122'], // Допустимые значения поля "ЛК клиента"
             'lk_delete_value' => 45, // Значение поля ЛК, при котором удаляются данные из БД
             'email' => 'EMAIL',
             'phone' => 'PHONE',
@@ -83,7 +84,7 @@ return [
             'location' => 'ufCrm6_1765128070976',                 // Адрес объекта
             'implementation_date' => 'ufCrm6_1765128232432',      // Дата реализации проекта
             'request_type' => 'ufCrm6_1765128261855',            // Тип запроса (список)
-            'equipment_list' => 'ufCrm6_1765299780',          // Перечень оборудования (ссылка на файл)
+            'equipment_list' => 'ufCrm6_1765551950127',          // Перечень оборудования (ссылка на файл)
             'competitors' => 'ufCrm6_1765128315359',             // Возможные конкуренты
             'marketing_discount' => 'ufCrm6_1765128343798',      // Маркетинговая скидка (чекбокс)
             'technical_description' => 'ufCrm6_1765360431193',             // Техническое описание проекта (многострочный текст)

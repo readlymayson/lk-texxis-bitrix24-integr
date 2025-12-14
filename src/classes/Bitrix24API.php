@@ -129,7 +129,7 @@ class Bitrix24API
                         'auth_data' => $data['auth'] ?? [],
                         'data_keys' => array_keys($data)
                     ]);
-                    // Не блокируем, возможно это старый формат запроса
+                    // Не блокируем запрос - возможно используется старый формат без токена
                 } elseif ($receivedToken !== $expectedToken) {
                     $this->logger->error('Invalid application token in webhook request', [
                         'expected_token_prefix' => substr($expectedToken, 0, 8) . '...',
@@ -489,10 +489,129 @@ class Bitrix24API
 
         $this->logger->debug('API call successful', [
             'method' => $method,
-            'result_count' => isset($result['result']) ? count($result['result']) : 0
+            'result_count' => isset($result['result']) && is_array($result['result']) ? count($result['result']) : (isset($result['result']) ? 1 : 0)
         ]);
 
         return $result;
+    }
+
+    /**
+     * Отправка письма на e-mail контакта через Битрикс24
+     *
+     * @param int|string $contactId ID контакта в Bitrix24
+     * @param string $subject Тема письма
+     * @param string $message Тело письма (HTML)
+     * @param object|null $localStorage Экземпляр LocalStorage для чтения e-mail из ЛК
+     * @return array|false Результат crm.activity.add или false при ошибке
+     */
+    public function sendEmailToContact($contactId, $subject, $message, $localStorage = null)
+    {
+        if (empty($contactId)) {
+            $this->logger->error('Contact ID is required to send email');
+            return false;
+        }
+
+        if (trim((string)$subject) === '' || trim((string)$message) === '') {
+            $this->logger->error('Subject and message are required to send email', [
+                'contact_id' => $contactId
+            ]);
+            return false;
+        }
+
+        // 1. Пытаемся взять e-mail из локального хранилища
+        $email = '';
+        $contactData = null;
+
+        if ($localStorage !== null) {
+            $contactData = $localStorage->getContact($contactId);
+            if ($contactData && !empty($contactData['email'])) {
+                $email = $this->extractEmailValue($contactData['email']);
+            }
+        }
+
+        // 2. Если e-mail не найден в ЛК, берем из Bitrix24
+        if (empty($email)) {
+            $bitrixContact = $this->getEntityData('contact', $contactId);
+            if ($bitrixContact && isset($bitrixContact['result'])) {
+                $contactData = $bitrixContact['result'];
+                $email = $this->extractEmailValue($contactData['EMAIL'] ?? '');
+            }
+        }
+
+        if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $this->logger->error('Valid email not found for contact', [
+                'contact_id' => $contactId,
+                'email' => $email
+            ]);
+            return false;
+        }
+
+        $emailFrom = $this->config['bitrix24']['email_from'] ?? '';
+
+        $fields = [
+            'OWNER_ID' => $contactId,
+            'OWNER_TYPE_ID' => 3, // 3 - контакт
+            'TYPE_ID' => 4,       // 4 - письмо
+            'PROVIDER_ID' => 'crm_email',
+            'PROVIDER_TYPE_ID' => 'EMAIL',
+            'SUBJECT' => $subject,
+            'DESCRIPTION' => $message,
+            'DESCRIPTION_TYPE' => 2, // 2 - HTML
+            'COMMUNICATIONS' => [
+                [
+                    'TYPE' => 'EMAIL',
+                    'VALUE' => $email,
+                    'ENTITY_ID' => $contactId,
+                    'ENTITY_TYPE_ID' => 3
+                ]
+            ],
+            'SETTINGS' => [
+                'MESSAGE_TO' => $email
+            ],
+            'DIRECTION' => 2, // 2 - исходящее
+            'COMPLETED' => 'N'
+        ];
+
+        if (!empty($emailFrom)) {
+            $fields['SETTINGS']['MESSAGE_FROM'] = $emailFrom;
+        }
+
+        // Ответственный приоритетно берем из контакта, если есть
+        if ($contactData && isset($contactData['ASSIGNED_BY_ID'])) {
+            $fields['RESPONSIBLE_ID'] = $contactData['ASSIGNED_BY_ID'];
+        }
+
+        $this->logger->info('Sending email via Bitrix24', [
+            'contact_id' => $contactId,
+            'email' => $email,
+            'subject' => $subject
+        ]);
+
+        return $this->makeApiCall('crm.activity.add', ['fields' => $fields]);
+    }
+
+    /**
+     * Извлекает первый валидный e-mail из строки или массива Bitrix24
+     */
+    private function extractEmailValue($emailData)
+    {
+        if (is_string($emailData)) {
+            return trim($emailData);
+        }
+
+        if (is_array($emailData)) {
+            // Структура Bitrix24: [['VALUE' => 'mail@example.com', ...], ...]
+            foreach ($emailData as $item) {
+                if (is_array($item) && !empty($item['VALUE'])) {
+                    return trim($item['VALUE']);
+                }
+                if (is_string($item) && !empty($item)) {
+                    return trim($item);
+                }
+            }
+        }
+
+        return '';
     }
 
     /**
@@ -606,9 +725,15 @@ class Bitrix24API
             $fields[] = 'ID';
         }
 
+        // Для компаний всегда добавляем CONTACT_ID, если его еще нет
+        // Это необходимо для проверки связи компании с контактом
         if ($entityType === 'company' && !in_array('CONTACT_ID', $fields)) {
+            // Используем значение из маппинга, если оно есть, иначе добавляем напрямую
             if (isset($mapping['contact_id']) && !empty($mapping['contact_id'])) {
                 $fields[] = $mapping['contact_id'];
+            } else {
+                // Если в маппинге нет contact_id, добавляем CONTACT_ID напрямую
+                $fields[] = 'CONTACT_ID';
             }
         }
 
@@ -1059,6 +1184,23 @@ class Bitrix24API
     }
 
     /**
+     * Получение internal_link для файла по его ID
+     * 
+     * @param int $fileId ID файла (может быть disk_object_id или file_id)
+     * @return string|null Внутренняя ссылка на файл или null
+     */
+    private function getFileInternalLink($fileId)
+    {
+        // Если fileId уже в формате disk_file_XXX, извлекаем ID
+        if (is_string($fileId) && strpos($fileId, 'disk_file_') === 0) {
+            $fileId = (int)str_replace('disk_file_', '', $fileId);
+        }
+        
+        // Используем fileId как objectId для формирования ссылки
+        return $this->getInternalFileLink((int)$fileId);
+    }
+
+    /**
      * Формирование внутренней ссылки на файл в Bitrix24
      * 
      * @param int $objectId ID объекта на диске
@@ -1131,13 +1273,13 @@ class Bitrix24API
      * - подтягиваем mapping из конфига
      * - принимает значения полей из формы (без автоподстановок списков)
      * - при необходимости подтягивает manager через локальное хранилище/Bitrix24, если не передан
-     * - при необходимости загружает файл и использует internal_link
+     * - при необходимости загружает файлы и использует internal_link
      * - вызывает addSmartProcessItem
      *
      * @param string|int $contactId ID контакта (обязательно)
      * @param array $formFields значения полей формы по ключам маппинга (кроме contact_id)
-     * @param int|null $fileId ID уже загруженного файла (если есть)
-     * @param string|null $filePath путь к файлу для загрузки (если нужно загрузить)
+     * @param int|array|null $fileId ID уже загруженного файла или массив ID файлов (если есть)
+     * @param string|array|null $filePath путь к файлу для загрузки или массив путей к файлам (если нужно загрузить)
      * @param object|null $localStorage экземпляр LocalStorage для получения данных из ЛК базы
      * @return array|false
      */
@@ -1199,44 +1341,76 @@ class Bitrix24API
             $projectFields[$mapping['manager_id']] = $managerId;
         }
 
-        // Файл "Перечень оборудования"
-        $finalFileId = null;
-        $internalLink = null;
+        // Файлы "Перечень оборудования" (множественное поле)
+        $equipmentFileLinks = [];
         if (!empty($mapping['equipment_list'])) {
+            // Обрабатываем массив fileId или одиночное значение
+            $fileIds = [];
             if (!empty($fileId)) {
-                $finalFileId = (int)$fileId;
-                $this->logger->debug('Using provided file ID for equipment list', [
-                    'file_id' => $finalFileId
-                ]);
-            } elseif (!empty($filePath) && file_exists($filePath)) {
-                $this->logger->debug('Uploading equipment list file', [
-                    'file_path' => $filePath,
-                    'file_size' => filesize($filePath)
-                ]);
-                $uploadResult = $this->uploadFile($filePath);
-                if (is_array($uploadResult)) {
-                    $finalFileId = $uploadResult['id'] ?? null;
-                    $internalLink = $uploadResult['internal_link'] ?? null;
-                    $this->logger->debug('Upload result', [
-                        'file_id' => $finalFileId,
-                        'internal_link' => $internalLink
+                $fileIds = is_array($fileId) ? $fileId : [$fileId];
+            }
+            
+            // Обрабатываем массив filePath или одиночное значение
+            $filePaths = [];
+            if (!empty($filePath)) {
+                $filePaths = is_array($filePath) ? $filePath : [$filePath];
+            }
+            
+            // Используем уже загруженные файлы (fileId)
+            foreach ($fileIds as $id) {
+                $finalFileId = (int)$id;
+                if ($finalFileId > 0) {
+                    $this->logger->debug('Using provided file ID for equipment list', [
+                        'file_id' => $finalFileId
                     ]);
-                } else {
-                    $this->logger->error('Upload file failed', [
-                        'file_path' => $filePath,
-                        'result' => $uploadResult
-                    ]);
+                    // Получаем internal_link для файла
+                    $internalLink = $this->getFileInternalLink($finalFileId);
+                    if ($internalLink) {
+                        $equipmentFileLinks[] = $internalLink;
+                    } else {
+                        $equipmentFileLinks[] = 'disk_file_' . $finalFileId;
+                    }
                 }
             }
-
-            if ($finalFileId) {
-                if (empty($internalLink) && isset($uploadResult) && is_array($uploadResult)) {
-                    $internalLink = $uploadResult['internal_link'] ?? null;
+            
+            // Загружаем новые файлы (filePath)
+            foreach ($filePaths as $path) {
+                if (!empty($path) && file_exists($path)) {
+                    $this->logger->debug('Uploading equipment list file', [
+                        'file_path' => $path,
+                        'file_size' => filesize($path)
+                    ]);
+                    $uploadResult = $this->uploadFile($path);
+                    if (is_array($uploadResult)) {
+                        $finalFileId = $uploadResult['id'] ?? null;
+                        $internalLink = $uploadResult['internal_link'] ?? null;
+                        $this->logger->debug('Upload result', [
+                            'file_id' => $finalFileId,
+                            'internal_link' => $internalLink
+                        ]);
+                        if ($internalLink) {
+                            $equipmentFileLinks[] = $internalLink;
+                        } elseif ($finalFileId) {
+                            $equipmentFileLinks[] = 'disk_file_' . $finalFileId;
+                        }
+                    } else {
+                        $this->logger->error('Upload file failed', [
+                            'file_path' => $path,
+                            'result' => $uploadResult
+                        ]);
+                    }
                 }
-                if ($internalLink) {
-                    $projectFields[$mapping['equipment_list']] = $internalLink;
+            }
+            
+            // Устанавливаем значение поля equipment_list
+            if (!empty($equipmentFileLinks)) {
+                // Bitrix24 для множественного поля типа "Ссылка" ожидает массив ссылок
+                if (count($equipmentFileLinks) === 1) {
+                    // Если один файл, передаем как строку (для обратной совместимости)
+                    $projectFields[$mapping['equipment_list']] = $equipmentFileLinks[0];
                 } else {
-                    $projectFields[$mapping['equipment_list']] = 'disk_file_' . $finalFileId;
+                    // Если несколько файлов, передаем как массив
+                    $projectFields[$mapping['equipment_list']] = $equipmentFileLinks;
                 }
             }
         }
@@ -1644,6 +1818,328 @@ class Bitrix24API
 
         $this->logger->info('Retrieved smart process list fields', [
             'entity_type_id' => $entityTypeId,
+            'list_fields_count' => count($listFields),
+            'field_ids' => array_keys($listFields)
+        ]);
+
+        return $listFields;
+    }
+
+    /**
+     * Получение полей типа списка контакта
+     * 
+     * @return array|false Массив с полями типа списка и их значениями или false при ошибке
+     * 
+     * Формат возвращаемых данных:
+     * [
+     *   'field_id' => [
+     *     'name' => 'Название поля',
+     *     'type' => 'enum',
+     *     'values' => [
+     *       'ID' => 'Название значения',
+     *       ...
+     *     ]
+     *   ],
+     *   ...
+     * ]
+     */
+    public function getContactListFields()
+    {
+        $this->logger->debug('Getting contact list fields');
+
+        // Получаем все поля контакта (включая пользовательские поля)
+        // Используем crm.contact.fields для получения всех полей контакта
+        $method = 'crm.contact.fields';
+        $params = [];
+
+        $result = $this->makeApiCall($method, $params);
+
+        if (!$result || !isset($result['result'])) {
+            $this->logger->error('Failed to get contact fields', [
+                'result' => $result
+            ]);
+            return false;
+        }
+
+        $fields = $result['result'];
+        
+        // Детальное логирование структуры ответа для отладки
+        $this->logger->debug('Contact fields API response structure', [
+            'method' => $method,
+            'result_keys' => is_array($fields) ? array_keys($fields) : 'not_array',
+            'fields_count' => is_array($fields) ? count($fields) : 0,
+            'fields_type' => gettype($fields),
+            'is_array' => is_array($fields),
+            'sample_fields' => is_array($fields) ? array_slice(array_keys($fields), 0, 10) : 'not_array'
+        ]);
+        
+        if (!is_array($fields)) {
+            $this->logger->error('Contact fields data is not an array', [
+                'fields_type' => gettype($fields)
+            ]);
+            return false;
+        }
+        
+        $listFields = [];
+
+        // Фильтруем поля типа списка (enum, list)
+        foreach ($fields as $fieldId => $fieldData) {
+            if (!is_array($fieldData)) {
+                continue;
+            }
+            
+            $fieldType = $fieldData['type'] ?? '';
+            $fieldTitle = $fieldData['title'] ?? $fieldData['name'] ?? $fieldId;
+            
+            // Детальное логирование для каждого поля
+            $this->logger->debug('Processing contact field', [
+                'field_id' => $fieldId,
+                'field_title' => $fieldTitle,
+                'field_type' => $fieldType,
+                'has_items' => isset($fieldData['items']),
+                'has_options' => isset($fieldData['options']),
+                'has_values' => isset($fieldData['values']),
+                'field_keys' => array_keys($fieldData)
+            ]);
+            
+            // Проверяем, является ли поле типом списка
+            // В Bitrix24 поля типа списка имеют type = 'enum', 'enumeration', 'list', 'crm_status', 'crm_category'
+            if (in_array(strtolower($fieldType), ['enum', 'enumeration', 'list', 'crm_status', 'crm_category'])) {
+                $fieldName = $fieldData['title'] ?? $fieldData['name'] ?? $fieldId;
+                $fieldValues = [];
+                
+                // Получаем значения списка
+                // Пробуем разные форматы ответа от Bitrix24 API
+                if (isset($fieldData['items']) && is_array($fieldData['items'])) {
+                    // Детальное логирование структуры items
+                    $this->logger->debug('Processing contact field items', [
+                        'field_id' => $fieldId,
+                        'items_count' => count($fieldData['items']),
+                        'first_item_structure' => !empty($fieldData['items']) ? json_encode(array_slice($fieldData['items'], 0, 1, true), JSON_UNESCAPED_UNICODE) : 'empty',
+                        'items_type' => gettype($fieldData['items'][0] ?? null)
+                    ]);
+                    
+                    // Формат: items содержит массив значений
+                    foreach ($fieldData['items'] as $item) {
+                        if (is_array($item)) {
+                            $itemId = $item['ID'] ?? $item['id'] ?? $item['VALUE'] ?? $item['value'] ?? null;
+                            $itemName = $item['VALUE'] ?? $item['value'] ?? $item['NAME'] ?? $item['name'] ?? $item['TITLE'] ?? $item['title'] ?? '';
+                        } else {
+                            // Если items - это простой массив строк/чисел
+                            $itemId = $item;
+                            $itemName = (string)$item;
+                        }
+                        
+                        if ($itemId !== null) {
+                            $fieldValues[$itemId] = $itemName;
+                        }
+                    }
+                } elseif (isset($fieldData['options']) && is_array($fieldData['options'])) {
+                    // Альтернативный формат: options содержит массив значений
+                    foreach ($fieldData['options'] as $itemId => $itemName) {
+                        if (is_array($itemName)) {
+                            $itemName = $itemName['VALUE'] ?? $itemName['value'] ?? $itemName['NAME'] ?? $itemName['name'] ?? (string)$itemId;
+                        }
+                        $fieldValues[$itemId] = $itemName;
+                    }
+                } elseif (isset($fieldData['values']) && is_array($fieldData['values'])) {
+                    // Еще один вариант формата
+                    foreach ($fieldData['values'] as $itemId => $itemName) {
+                        if (is_array($itemName)) {
+                            $itemName = $itemName['VALUE'] ?? $itemName['value'] ?? $itemName['NAME'] ?? $itemName['name'] ?? (string)$itemId;
+                        }
+                        $fieldValues[$itemId] = $itemName;
+                    }
+                }
+                
+                // Для контактов значения enum полей должны быть в ответе crm.contact.fields
+                // Дополнительный вызов crm.enum.fields не требуется, так как он работает только для смарт-процессов
+                
+                $this->logger->debug('Extracted contact field values', [
+                    'field_id' => $fieldId,
+                    'values_count' => count($fieldValues),
+                    'values_sample' => array_slice($fieldValues, 0, 3, true)
+                ]);
+                
+                if (!empty($fieldValues)) {
+                    $listFields[$fieldId] = [
+                        'name' => $fieldName,
+                        'type' => $fieldType,
+                        'values' => $fieldValues
+                    ];
+                    
+                    $this->logger->debug('Found contact list field', [
+                        'field_id' => $fieldId,
+                        'field_name' => $fieldName,
+                        'field_type' => $fieldType,
+                        'values_count' => count($fieldValues)
+                    ]);
+                }
+            }
+        }
+
+        $this->logger->info('Retrieved contact list fields', [
+            'list_fields_count' => count($listFields),
+            'field_ids' => array_keys($listFields)
+        ]);
+
+        return $listFields;
+    }
+
+    /**
+     * Получение полей типа списка компании
+     * 
+     * @return array|false Массив с полями типа списка и их значениями или false при ошибке
+     * 
+     * Формат возвращаемых данных:
+     * [
+     *   'field_id' => [
+     *     'name' => 'Название поля',
+     *     'type' => 'enum',
+     *     'values' => [
+     *       'ID' => 'Название значения',
+     *       ...
+     *     ]
+     *   ],
+     *   ...
+     * ]
+     */
+    public function getCompanyListFields()
+    {
+        $this->logger->debug('Getting company list fields');
+
+        // Получаем все поля компании (включая пользовательские поля)
+        // Используем crm.company.fields для получения всех полей компании
+        $method = 'crm.company.fields';
+        $params = [];
+
+        $result = $this->makeApiCall($method, $params);
+
+        if (!$result || !isset($result['result'])) {
+            $this->logger->error('Failed to get company fields', [
+                'result' => $result
+            ]);
+            return false;
+        }
+
+        $fields = $result['result'];
+        
+        // Детальное логирование структуры ответа для отладки
+        $this->logger->debug('Company fields API response structure', [
+            'method' => $method,
+            'result_keys' => is_array($fields) ? array_keys($fields) : 'not_array',
+            'fields_count' => is_array($fields) ? count($fields) : 0,
+            'fields_type' => gettype($fields),
+            'is_array' => is_array($fields),
+            'sample_fields' => is_array($fields) ? array_slice(array_keys($fields), 0, 10) : 'not_array'
+        ]);
+        
+        if (!is_array($fields)) {
+            $this->logger->error('Company fields data is not an array', [
+                'fields_type' => gettype($fields)
+            ]);
+            return false;
+        }
+        
+        $listFields = [];
+
+        // Фильтруем поля типа списка (enum, list)
+        foreach ($fields as $fieldId => $fieldData) {
+            if (!is_array($fieldData)) {
+                continue;
+            }
+            
+            $fieldType = $fieldData['type'] ?? '';
+            $fieldTitle = $fieldData['title'] ?? $fieldData['name'] ?? $fieldId;
+            
+            // Детальное логирование для каждого поля
+            $this->logger->debug('Processing company field', [
+                'field_id' => $fieldId,
+                'field_title' => $fieldTitle,
+                'field_type' => $fieldType,
+                'has_items' => isset($fieldData['items']),
+                'has_options' => isset($fieldData['options']),
+                'has_values' => isset($fieldData['values']),
+                'field_keys' => array_keys($fieldData)
+            ]);
+            
+            // Проверяем, является ли поле типом списка
+            // В Bitrix24 поля типа списка имеют type = 'enum', 'enumeration', 'list', 'crm_status', 'crm_category'
+            if (in_array(strtolower($fieldType), ['enum', 'enumeration', 'list', 'crm_status', 'crm_category'])) {
+                $fieldName = $fieldData['title'] ?? $fieldData['name'] ?? $fieldId;
+                $fieldValues = [];
+                
+                // Получаем значения списка
+                // Пробуем разные форматы ответа от Bitrix24 API
+                if (isset($fieldData['items']) && is_array($fieldData['items'])) {
+                    // Детальное логирование структуры items
+                    $this->logger->debug('Processing company field items', [
+                        'field_id' => $fieldId,
+                        'items_count' => count($fieldData['items']),
+                        'first_item_structure' => !empty($fieldData['items']) ? json_encode(array_slice($fieldData['items'], 0, 1, true), JSON_UNESCAPED_UNICODE) : 'empty',
+                        'items_type' => gettype($fieldData['items'][0] ?? null)
+                    ]);
+                    
+                    // Формат: items содержит массив значений
+                    foreach ($fieldData['items'] as $item) {
+                        if (is_array($item)) {
+                            $itemId = $item['ID'] ?? $item['id'] ?? $item['VALUE'] ?? $item['value'] ?? null;
+                            $itemName = $item['VALUE'] ?? $item['value'] ?? $item['NAME'] ?? $item['name'] ?? $item['TITLE'] ?? $item['title'] ?? '';
+                        } else {
+                            // Если items - это простой массив строк/чисел
+                            $itemId = $item;
+                            $itemName = (string)$item;
+                        }
+                        
+                        if ($itemId !== null) {
+                            $fieldValues[$itemId] = $itemName;
+                        }
+                    }
+                } elseif (isset($fieldData['options']) && is_array($fieldData['options'])) {
+                    // Альтернативный формат: options содержит массив значений
+                    foreach ($fieldData['options'] as $itemId => $itemName) {
+                        if (is_array($itemName)) {
+                            $itemName = $itemName['VALUE'] ?? $itemName['value'] ?? $itemName['NAME'] ?? $itemName['name'] ?? (string)$itemId;
+                        }
+                        $fieldValues[$itemId] = $itemName;
+                    }
+                } elseif (isset($fieldData['values']) && is_array($fieldData['values'])) {
+                    // Еще один вариант формата
+                    foreach ($fieldData['values'] as $itemId => $itemName) {
+                        if (is_array($itemName)) {
+                            $itemName = $itemName['VALUE'] ?? $itemName['value'] ?? $itemName['NAME'] ?? $itemName['name'] ?? (string)$itemId;
+                        }
+                        $fieldValues[$itemId] = $itemName;
+                    }
+                }
+                
+                // Для компаний значения enum полей должны быть в ответе crm.company.fields
+                // Дополнительный вызов crm.enum.fields не требуется, так как он работает только для смарт-процессов
+                
+                $this->logger->debug('Extracted company field values', [
+                    'field_id' => $fieldId,
+                    'values_count' => count($fieldValues),
+                    'values_sample' => array_slice($fieldValues, 0, 3, true)
+                ]);
+                
+                if (!empty($fieldValues)) {
+                    $listFields[$fieldId] = [
+                        'name' => $fieldName,
+                        'type' => $fieldType,
+                        'values' => $fieldValues
+                    ];
+                    
+                    $this->logger->debug('Found company list field', [
+                        'field_id' => $fieldId,
+                        'field_name' => $fieldName,
+                        'field_type' => $fieldType,
+                        'values_count' => count($fieldValues)
+                    ]);
+                }
+            }
+        }
+
+        $this->logger->info('Retrieved company list fields', [
             'list_fields_count' => count($listFields),
             'field_ids' => array_keys($listFields)
         ]);

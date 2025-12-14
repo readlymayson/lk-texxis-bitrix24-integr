@@ -4,15 +4,20 @@
  * Скрипт для тестирования создания карточек проектов в смарт-процессе
  * 
  * Использование:
- * php test_project_creation.php [contact_id] [file_id]
+ * php test_project_creation.php [contact_id] [file_id1] [file_id2] ... [file_idN]
+ * php test_project_creation.php [contact_id] --files [file_path1] [file_path2] ... [file_pathN]
  * 
  * Примеры:
  * php test_project_creation.php 3                    # Создание проекта для контакта ID=3 (файл будет загружен автоматически)
  * php test_project_creation.php 3 123                 # Использовать существующий файл с ID=123
+ * php test_project_creation.php 3 123 456 789         # Использовать несколько существующих файлов с ID=123, 456, 789
+ * php test_project_creation.php 3 --files file1.txt file2.txt file3.txt  # Загрузить несколько файлов
  * 
  * Примечание: 
  * - company_id и manager_id автоматически берутся из базы данных ЛК по contact_id
- * - file_id (опционально) - ID уже загруженного файла в Bitrix24. Если не указан, будет создан и загружен тестовый файл
+ * - file_id (опционально) - ID уже загруженного файла в Bitrix24. Можно указать несколько через пробел
+ * - --files - флаг для указания путей к файлам для загрузки (можно указать несколько)
+ * - Если не указаны file_id и --files, будет создан и загружен один тестовый файл
  */
 
 require_once __DIR__ . '/../classes/EnvLoader.php';
@@ -20,14 +25,41 @@ require_once __DIR__ . '/../classes/Logger.php';
 require_once __DIR__ . '/../classes/Bitrix24API.php';
 require_once __DIR__ . '/../classes/LocalStorage.php';
 
+// Вспомогательная функция для проверки абсолютного пути
+function is_absolute_path($path) {
+    return (strpos($path, '/') === 0) || // Unix
+           (preg_match('/^[A-Z]:\\\\/', $path)) || // Windows
+           (strpos($path, '\\\\') === 0); // UNC Windows
+}
+
 $config = require_once __DIR__ . '/../config/bitrix24.php';
 
 $logger = new Logger($config);
 $bitrixAPI = new Bitrix24API($config, $logger);
-$localStorage = new LocalStorage($config, $logger);
+$localStorage = new LocalStorage($logger, $config);
 
 $contactId = $argv[1] ?? null;
-$fileId = $argv[2] ?? null; // Опциональный ID файла для использования
+$fileIds = [];
+$filePaths = [];
+$useFilesFlag = false;
+
+// Парсим аргументы командной строки
+if (count($argv) > 2) {
+    for ($i = 2; $i < count($argv); $i++) {
+        if ($argv[$i] === '--files') {
+            $useFilesFlag = true;
+            continue;
+        }
+        
+        if ($useFilesFlag) {
+            // После флага --files все аргументы - это пути к файлам
+            $filePaths[] = $argv[$i];
+        } else {
+            // До флага --files все аргументы - это ID файлов
+            $fileIds[] = $argv[$i];
+        }
+    }
+}
 
 echo "=== ТЕСТИРОВАНИЕ СОЗДАНИЯ ПРОЕКТА ===\n\n";
 
@@ -50,7 +82,17 @@ if (empty($contactId)) {
 echo "Параметры:\n";
 echo "  Contact ID: {$contactId}\n";
 echo "  Company ID: будет получен из базы ЛК\n";
-echo "  Manager ID: будет получен из Bitrix24 API\n\n";
+echo "  Manager ID: будет получен из базы ЛК\n";
+if (!empty($fileIds)) {
+    echo "  File IDs: " . implode(', ', $fileIds) . "\n";
+}
+if (!empty($filePaths)) {
+    echo "  File Paths: " . implode(', ', $filePaths) . "\n";
+}
+if (empty($fileIds) && empty($filePaths)) {
+    echo "  Files: будет загружен тестовый файл автоматически\n";
+}
+echo "\n";
 
 $projectProcessId = $config['bitrix24']['smart_process_id'] ?? '';
 
@@ -95,29 +137,16 @@ if (!empty($listFields)) {
     echo "\n";
 }
 
-// Получаем данные контакта из локального хранилища
-$contact = $localStorage->getContact($contactId);
-$companyId = $contact['company'] ?? null;
-$managerId = $contact['manager_id'] ?? null;
-
 echo "--- СОЗДАНИЕ КАРТОЧКИ ПРОЕКТА ---\n";
+echo "  Contact ID: {$contactId}\n";
+echo "  Company ID и Manager ID будут получены автоматически через createProjectCard\n\n";
 
 $mapping = $config['field_mapping']['smart_process'] ?? [];
-$projectFields = [];
-
-// Обязательные привязки
-if (!empty($mapping['client_id'])) {
-    $projectFields[$mapping['client_id']] = $contactId;
-}
-if (!empty($managerId) && !empty($mapping['manager_id'])) {
-    $projectFields[$mapping['manager_id']] = $managerId;
-}
 
 // Функция для получения первого значения поля типа списка
 $getFirstListValue = function($fieldId, $listFields) {
     if (isset($listFields[$fieldId]) && !empty($listFields[$fieldId]['values'])) {
         $values = $listFields[$fieldId]['values'];
-        // Получаем первое значение из массива
         $firstValueId = array_key_first($values);
         if ($firstValueId !== null) {
             return [
@@ -129,27 +158,29 @@ $getFirstListValue = function($fieldId, $listFields) {
     return null;
 };
 
+// Подготовка тестовых данных для формы (ключи по маппингу)
+$formFields = [];
+
 // Тестовые данные проекта
 if (!empty($mapping['organization_name'])) {
-    $projectFields[$mapping['organization_name']] = 'Тестовая организация';
+    $formFields['organization_name'] = 'Тестовая организация';
 }
 if (!empty($mapping['object_name'])) {
-    $projectFields[$mapping['object_name']] = 'Тестовый объект';
+    $formFields['object_name'] = 'Тестовый объект';
 }
 if (!empty($mapping['system_types'])) {
     // Поле множественное - используем несколько первых значений из списка
     $systemTypesValues = [];
     if (!empty($listFields[$mapping['system_types']]) && !empty($listFields[$mapping['system_types']]['values'])) {
         $values = $listFields[$mapping['system_types']]['values'];
-        // Берем первые 2-3 значения для теста
         $count = 0;
         foreach ($values as $valueId => $valueName) {
-            if ($count >= 2) break; // Берем максимум 2 значения
+            if ($count >= 2) break;
             $systemTypesValues[] = $valueId;
             $count++;
         }
         if (!empty($systemTypesValues)) {
-            $projectFields[$mapping['system_types']] = $systemTypesValues;
+            $formFields['system_types'] = $systemTypesValues;
             $names = [];
             foreach ($systemTypesValues as $valId) {
                 $names[] = $values[$valId] ?? $valId;
@@ -158,135 +189,120 @@ if (!empty($mapping['system_types'])) {
         }
     }
     
-    // Если не удалось получить из списка, используем тестовое значение
     if (empty($systemTypesValues)) {
-        $projectFields[$mapping['system_types']] = ['Система безопасности'];
+        $formFields['system_types'] = ['Система безопасности'];
         echo "  Поле 'system_types': используется тестовое значение (список не найден)\n";
     }
 }
 if (!empty($mapping['location'])) {
-    $projectFields[$mapping['location']] = 'Москва, ул. Пример, д.1';
+    $formFields['location'] = 'Москва, ул. Пример, д.1';
 }
 if (!empty($mapping['technical_description'])) {
-    $projectFields[$mapping['technical_description']] = "Техническое описание проекта для теста:\n- Система пожарной сигнализации\n- Узлы сопряжения и автоматика";
+    $formFields['technical_description'] = "Техническое описание проекта для теста:\n- Система пожарной сигнализации\n- Узлы сопряжения и автоматика";
 }
 if (!empty($mapping['implementation_date'])) {
-    $projectFields[$mapping['implementation_date']] = date('Y-m-d');
+    $formFields['implementation_date'] = date('Y-m-d');
 }
 if (!empty($mapping['request_type'])) {
-    // Используем первое значение из списка, если поле является списком
     $firstValue = $getFirstListValue($mapping['request_type'], $listFields);
     if ($firstValue) {
-        $projectFields[$mapping['request_type']] = $firstValue['id'];
+        $formFields['request_type'] = $firstValue['id'];
         echo "  Поле 'request_type': используется первое значение списка (ID: {$firstValue['id']}, название: {$firstValue['name']})\n";
     } else {
-        // Если не удалось получить из списка, используем старое значение
-        $projectFields[$mapping['request_type']] = 'test_request';
+        $formFields['request_type'] = 'test_request';
         echo "  Поле 'request_type': используется тестовое значение (список не найден)\n";
     }
 }
-if (!empty($mapping['equipment_list'])) {
-    // Для передачи файла в Bitrix24 нужен массив ID файлов
-    $finalFileId = null;
-    $testFilePath = __DIR__ . '/test_equipment_list.txt';
-    
-    if (!empty($fileId)) {
-        // Используем указанный ID файла
-        $finalFileId = (int)$fileId;
-        echo "Использование указанного файла ID: {$finalFileId}\n";
-    } else {
-        // Всегда используем тестовый файл
-        if (!file_exists($testFilePath)) {
-            echo "✗ ОШИБКА: Тестовый файл не найден: {$testFilePath}\n";
-            echo "  Создайте файл вручную или проверьте путь\n\n";
-        } else {
-            $fileSize = filesize($testFilePath);
-            echo "Найден тестовый файл: {$testFilePath} (размер: {$fileSize} байт)\n";
-            echo "Загрузка файла в Bitrix24...\n";
-            
-            $uploadResult = $bitrixAPI->uploadFile($testFilePath);
-            
-            // Детальная диагностика результата загрузки
-            if ($uploadResult === false) {
-                echo "✗ ОШИБКА: Метод uploadFile вернул false\n";
-                echo "  Проверьте логи для детальной информации\n";
-            } elseif (is_array($uploadResult)) {
-                echo "  Результат загрузки: " . json_encode($uploadResult, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) . "\n";
-                
-                if (isset($uploadResult['id'])) {
-                    $finalFileId = $uploadResult['id'];
-                    echo "✓ Файл загружен успешно, ID: {$finalFileId}\n";
-                    echo "  Имя файла: " . ($uploadResult['name'] ?? basename($testFilePath)) . "\n";
-                    if (isset($uploadResult['size'])) {
-                        echo "  Размер: {$uploadResult['size']} байт\n";
-                    }
-                } else {
-                    echo "✗ ОШИБКА: В результате загрузки отсутствует ID файла\n";
-                    echo "  Структура ответа: " . json_encode($uploadResult, JSON_UNESCAPED_UNICODE) . "\n";
-                }
-            } else {
-                echo "✗ ОШИБКА: Неожиданный тип результата: " . gettype($uploadResult) . "\n";
-                echo "  Значение: " . var_export($uploadResult, true) . "\n";
-            }
-            
-            if (!$finalFileId) {
-                echo "\n  ДИАГНОСТИКА:\n";
-                echo "  1. Проверьте настройки webhook URL в конфигурации\n";
-                echo "  2. Убедитесь, что у webhook есть права на загрузку файлов (disk)\n";
-                echo "  3. Проверьте логи в файле: " . $config['logging']['file'] . "\n";
-                echo "  4. Убедитесь, что файл существует и доступен для чтения\n";
-                echo "\n  АЛЬТЕРНАТИВА: Укажите ID уже загруженного файла через параметр:\n";
-                echo "  php test_project_creation.php {$contactId} <file_id>\n\n";
-            }
-        }
-    }
-    
-    if ($finalFileId) {
-        // Поле equipment_list типа "Ссылка" - используем полную внутреннюю ссылку на файл
-        // Получаем внутреннюю ссылку из результата загрузки
-        $internalLink = null;
-        if (is_array($uploadResult) && isset($uploadResult['internal_link'])) {
-            $internalLink = $uploadResult['internal_link'];
-        }
-        
-        if ($internalLink) {
-            $projectFields[$mapping['equipment_list']] = $internalLink;
-            echo "  ✓ Файл (ID: {$finalFileId}) будет прикреплен к проекту как внутренняя ссылка\n";
-            echo "  Ссылка: {$internalLink}\n\n";
-        } else {
-            // Если внутренняя ссылка не получена, используем формат disk_file_<ID> как запасной вариант
-            $projectFields[$mapping['equipment_list']] = 'disk_file_' . $finalFileId;
-            echo "  ✓ Файл (ID: {$finalFileId}) будет прикреплен к проекту (используется формат disk_file_{$finalFileId})\n\n";
-        }
-    } else {
-        echo "  ⚠ ВНИМАНИЕ: Поле equipment_list не будет заполнено (файл не загружен)\n";
-        echo "  Проект будет создан без файла в поле 'Перечень оборудования'\n\n";
-    }
-}
 if (!empty($mapping['competitors'])) {
-    $projectFields[$mapping['competitors']] = 'Конкурент А; Конкурент Б';
+    $formFields['competitors'] = 'Конкурент А; Конкурент Б';
 }
 if (!empty($mapping['marketing_discount'])) {
-    $projectFields[$mapping['marketing_discount']] = true;
+    $formFields['marketing_discount'] = true;
 }
 if (!empty($mapping['status'])) {
-    // Используем первое значение из списка, если поле является списком
     $firstValue = $getFirstListValue($mapping['status'], $listFields);
     if ($firstValue) {
-        $projectFields[$mapping['status']] = $firstValue['id'];
+        $formFields['status'] = $firstValue['id'];
         echo "  Поле 'status': используется первое значение списка (ID: {$firstValue['id']}, название: {$firstValue['name']})\n";
     } else {
-        // Если не удалось получить из списка, используем старое значение
-        $projectFields[$mapping['status']] = 'DT123_1:NEW';
+        $formFields['status'] = 'DT123_1:NEW';
         echo "  Поле 'status': используется тестовое значение (список не найден)\n";
     }
 }
 
-echo "Данные для создания карточки проекта:\n";
-echo json_encode($projectFields, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) . "\n\n";
+// Обработка файлов для equipment_list
+// createProjectCard сам обработает файлы, нам нужно только подготовить параметры
+$fileIdParam = null;
+$filePathParam = null;
 
-echo "Отправка запроса...\n";
-$result = $bitrixAPI->addSmartProcessItem($projectProcessId, $projectFields);
+if (!empty($mapping['equipment_list'])) {
+    echo "--- ОБРАБОТКА ФАЙЛОВ ДЛЯ EQUIPMENT_LIST ---\n";
+    
+    // Если указаны ID файлов
+    if (!empty($fileIds)) {
+        echo "Использование указанных файлов по ID: " . implode(', ', $fileIds) . "\n";
+        $fileIdParam = count($fileIds) === 1 ? (int)$fileIds[0] : array_map('intval', $fileIds);
+    }
+    
+    // Если указаны пути к файлам
+    if (!empty($filePaths)) {
+        echo "Загрузка файлов из указанных путей: " . implode(', ', $filePaths) . "\n";
+        $validPaths = [];
+        foreach ($filePaths as $filePath) {
+            // Если путь относительный, пробуем найти файл относительно директории скрипта
+            if (!file_exists($filePath) && !is_absolute_path($filePath)) {
+                $absolutePath = __DIR__ . '/' . $filePath;
+                if (file_exists($absolutePath)) {
+                    $filePath = $absolutePath;
+                }
+            }
+            
+            if (file_exists($filePath)) {
+                $validPaths[] = $filePath;
+                echo "  ✓ Файл найден: {$filePath} (размер: " . filesize($filePath) . " байт)\n";
+            } else {
+                echo "  ✗ Файл не найден: {$filePath}\n";
+            }
+        }
+        if (!empty($validPaths)) {
+            $filePathParam = count($validPaths) === 1 ? $validPaths[0] : $validPaths;
+        }
+    }
+    
+    // Если не указаны ни ID, ни пути - используем тестовый файл
+    if (empty($fileIdParam) && empty($filePathParam)) {
+        $testFilePath = __DIR__ . '/test_equipment_list.txt';
+        if (file_exists($testFilePath)) {
+            echo "Использование тестового файла: {$testFilePath}\n";
+            $filePathParam = $testFilePath;
+        } else {
+            echo "⚠ Тестовый файл не найден: {$testFilePath}\n";
+            echo "  Создайте файл вручную или укажите файлы через параметры\n";
+        }
+    }
+    
+    if (empty($fileIdParam) && empty($filePathParam)) {
+        echo "\n  ⚠ ВНИМАНИЕ: Поле equipment_list не будет заполнено (файлы не загружены)\n";
+        echo "  Проект будет создан без файлов в поле 'Перечень оборудования'\n\n";
+    } else {
+        echo "\n  ✓ Параметры файлов подготовлены для createProjectCard\n";
+        if ($fileIdParam) {
+            echo "  File IDs: " . (is_array($fileIdParam) ? implode(', ', $fileIdParam) : $fileIdParam) . "\n";
+        }
+        if ($filePathParam) {
+            echo "  File Paths: " . (is_array($filePathParam) ? implode(', ', $filePathParam) : $filePathParam) . "\n";
+        }
+        echo "\n";
+    }
+}
+
+echo "Form fields для createProjectCard:\n";
+echo json_encode($formFields, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) . "\n";
+echo "\n";
+
+echo "Отправка запроса через createProjectCard...\n";
+
+$result = $bitrixAPI->createProjectCard($contactId, $formFields, $fileIdParam, $filePathParam, $localStorage);
 
 if ($result && isset($result['id'])) {
     echo "✓ УСПЕХ: Карточка проекта создана!\n";

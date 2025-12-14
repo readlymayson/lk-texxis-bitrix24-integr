@@ -21,7 +21,7 @@ $config = require_once __DIR__ . '/../config/bitrix24.php';
 
 $logger = new Logger($config);
 $bitrixAPI = new Bitrix24API($config, $logger);
-$localStorage = new LocalStorage($logger);
+$localStorage = new LocalStorage($logger, $config);
 
 /**
  * Извлечение ID контакта из значения (может быть строкой или массивом)
@@ -53,22 +53,26 @@ function mapProjectData($projectData, $mapping, $logger)
         }
     }
     
-    // Обработка поля файла "Перечень оборудования"
+    // Обработка поля файла "Перечень оборудования" (множественное поле)
     $equipmentListRaw = $projectData[$mapping['equipment_list']] ?? null;
-    $equipmentList = null;
+    $equipmentList = [];
     if (!empty($equipmentListRaw)) {
         if (is_array($equipmentListRaw)) {
-            $equipmentList = [];
             foreach ($equipmentListRaw as $file) {
                 if (is_array($file)) {
-                    $equipmentList[] = [
+                    $fileInfo = [
                         'id' => $file['id'] ?? $file['ID'] ?? null,
                         'name' => $file['name'] ?? $file['NAME'] ?? null,
                         'url' => $file['downloadUrl'] ?? $file['DOWNLOAD_URL'] ?? null,
                         'size' => $file['size'] ?? $file['SIZE'] ?? null
                     ];
+                    if (!empty($fileInfo['id'])) {
+                        $equipmentList[] = $fileInfo;
+                    }
                 } else {
-                    $equipmentList[] = ['id' => $file];
+                    if (!empty($file)) {
+                        $equipmentList[] = ['id' => $file];
+                    }
                 }
             }
         } else {
@@ -92,14 +96,51 @@ function mapProjectData($projectData, $mapping, $logger)
     // Техническое описание проекта (многострочный текст)
     $technicalDescription = $projectData[$mapping['technical_description']] ?? '';
     
+    // Обработка поля "Местоположение" (тип: address)
+    // Bitrix24 возвращает адрес в формате "адрес|;|ID_смартпроцесса"
+    // Нужно извлечь только адресную часть
+    $locationRaw = $projectData[$mapping['location']] ?? '';
+    $location = '';
+    if (!empty($locationRaw)) {
+        // Если адрес содержит разделитель "|;|", берем только часть до разделителя
+        if (str_contains($locationRaw, '|;|')) {
+            $locationParts = explode('|;|', $locationRaw);
+            $location = trim($locationParts[0]);
+        } else {
+            $location = trim($locationRaw);
+        }
+    }
+    
+    // Обработка множественного поля "Типы системы" (system_types)
+    $systemTypesRaw = $projectData[$mapping['system_types']] ?? null;
+    $systemTypes = [];
+    if (!empty($systemTypesRaw)) {
+        if (is_array($systemTypesRaw)) {
+            // Если массив, обрабатываем каждый элемент
+            foreach ($systemTypesRaw as $item) {
+                if (is_array($item)) {
+                    // Если элемент - объект, извлекаем ID
+                    $itemId = $item['ID'] ?? $item['id'] ?? $item['VALUE'] ?? $item['value'] ?? null;
+                    if ($itemId !== null) {
+                        $systemTypes[] = (string)$itemId;
+                    }
+                } else {
+                    // Если элемент - простое значение (ID)
+                    $systemTypes[] = (string)$item;
+                }
+            }
+        } else {
+            // Если одиночное значение, преобразуем в массив
+            $systemTypes = [(string)$systemTypesRaw];
+        }
+    }
+    
     return [
         'bitrix_id' => $projectId,
         'organization_name' => $projectData[$mapping['organization_name']] ?? '',
         'object_name' => $projectData[$mapping['object_name']] ?? '',
-        'system_types' => is_array($projectData[$mapping['system_types']] ?? null) 
-            ? $projectData[$mapping['system_types']] 
-            : (!empty($projectData[$mapping['system_types']]) ? [$projectData[$mapping['system_types']]] : []),
-        'location' => $projectData[$mapping['location']] ?? '',
+        'system_types' => $systemTypes,
+        'location' => $location,
         'implementation_date' => $projectData[$mapping['implementation_date']] ?? null,
         'request_type' => $requestType,
         'equipment_list' => $equipmentList,
@@ -115,7 +156,7 @@ function mapProjectData($projectData, $mapping, $logger)
 /**
  * Синхронизация связанных компаний, проектов и сделок для контакта
  */
-function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage, $config, $logger)
+function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage, $config, $logger, $contactCompanyIdFromAPI = null)
 {
     $results = [
         'companies' => ['count' => 0, 'success' => 0, 'failed' => 0],
@@ -123,7 +164,16 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
     ];
 
     $logger->info('Checking for related companies for contact', ['contact_id' => $contactId]);
+    
     try {
+        // Получаем COMPANY_ID из локального хранилища и из API
+        $contactFromStorage = $localStorage->getContact($contactId);
+        $companyIdFromStorage = $contactFromStorage['company'] ?? null;
+        
+        // Используем COMPANY_ID из API, если он есть, иначе из локального хранилища
+        $companyIdToCheck = $contactCompanyIdFromAPI ?? $companyIdFromStorage;
+        
+        // Ищем компании через фильтр CONTACT_ID
         $companies = $bitrixAPI->getEntityList('company', ['CONTACT_ID' => $contactId]);
 
         if ($companies && isset($companies['result'])) {
@@ -141,23 +191,53 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
                     $companyData = $fullCompanyData['result'];
 
                     // Проверяем фактическую привязку к контакту
+                    // Связь может быть двунаправленной:
+                    // 1. Через CONTACT_ID в компании (компания связана с контактом)
+                    // 2. Через COMPANY_ID в контакте (контакт связан с компанией)
                     $companyContactId = extractContactId($companyData['CONTACT_ID'] ?? null);
-                    if (empty($companyContactId) || (string)$companyContactId !== (string)$contactId) {
+                    $isLinkedViaContactId = !empty($companyContactId) && (string)$companyContactId === (string)$contactId;
+                    $isLinkedViaCompanyId = !empty($companyIdToCheck) && (string)$companyIdToCheck === (string)$companyId;
+                    
+                    // Пропускаем компанию только если она не связана ни одним из способов
+                    if (!$isLinkedViaContactId && !$isLinkedViaCompanyId) {
                         $logger->info('Skipping company - contact mismatch or empty', [
                             'company_id' => $companyId,
                             'expected_contact_id' => $contactId,
-                            'actual_contact_id' => $companyContactId
+                            'actual_contact_id' => $companyContactId,
+                            'link_via_contact_id' => $isLinkedViaContactId,
+                            'link_via_company_id' => $isLinkedViaCompanyId
                         ]);
                         continue;
                     }
 
                     $results['companies']['count']++;
                     $syncResult = $localStorage->syncCompanyByBitrixId($companyId, $companyData);
+                    
                     if ($syncResult) {
                         $results['companies']['success']++;
                     } else {
                         $results['companies']['failed']++;
                     }
+                }
+            }
+        }
+        
+        // Если COMPANY_ID есть в контакте, но не найдена через CONTACT_ID фильтр,
+        // попробуем получить компанию напрямую по ID
+        if (!empty($companyIdToCheck) && $results['companies']['count'] === 0) {
+            $fullCompanyData = $bitrixAPI->getEntityData('company', $companyIdToCheck);
+            if ($fullCompanyData && isset($fullCompanyData['result'])) {
+                $companyData = $fullCompanyData['result'];
+                
+                // Синхронизируем компанию, даже если связь через CONTACT_ID не найдена
+                // (связь может быть через COMPANY_ID в контакте)
+                $syncResult = $localStorage->syncCompanyByBitrixId($companyIdToCheck, $companyData);
+                
+                if ($syncResult) {
+                    $results['companies']['count']++;
+                    $results['companies']['success']++;
+                } else {
+                    $results['companies']['failed']++;
                 }
             }
         }
@@ -289,13 +369,28 @@ try {
     
     if (!empty($lkClientField)) {
         $lkClientValue = $contactDataFromAPI[$lkClientField] ?? null;
-        if (empty($lkClientValue) || !in_array($lkClientValue, $lkClientValues, true)) {
+        
+        // Нормализуем значения для сравнения (приводим к строкам)
+        // Bitrix24 может возвращать значения как строки или числа
+        if (!empty($lkClientValue) || $lkClientValue === '0' || $lkClientValue === 0) {
+            $lkClientValueNormalized = (string)$lkClientValue;
+            $lkClientValuesNormalized = array_map('strval', $lkClientValues);
+            $isValid = in_array($lkClientValueNormalized, $lkClientValuesNormalized, true);
+        } else {
+            $isValid = false;
+        }
+        
+        if (!$isValid) {
             echo "  ⊘ ПРОПУЩЕН: Поле ЛК клиента невалидно или пустое\n";
-            echo "  Значение поля: " . ($lkClientValue ?? 'не указано') . "\n";
+            echo "  Значение поля: " . ($lkClientValue ?? 'не указано') . " (тип: " . gettype($lkClientValue) . ")\n";
+            echo "  Нормализованное значение: " . (isset($lkClientValueNormalized) ? $lkClientValueNormalized : 'не определено') . "\n";
             echo "  Допустимые значения: " . implode(', ', $lkClientValues) . "\n";
             exit(1);
         }
     }
+    
+    // Сохраняем COMPANY_ID из API для использования в синхронизации компаний
+    $contactCompanyIdFromAPI = extractContactId($contactDataFromAPI['COMPANY_ID'] ?? null);
     
     $syncResult = $localStorage->syncContactByBitrixId($selectedContactId, $contactDataFromAPI);
     
@@ -352,7 +447,7 @@ echo "\n";
 echo "--- СИНХРОНИЗАЦИЯ СВЯЗАННЫХ СУЩНОСТЕЙ ---\n\n";
 
 try {
-    $relatedResults = syncAllRelatedEntitiesForContact($selectedContactId, $bitrixAPI, $localStorage, $config, $logger);
+    $relatedResults = syncAllRelatedEntitiesForContact($selectedContactId, $bitrixAPI, $localStorage, $config, $logger, $contactCompanyIdFromAPI ?? null);
     $results['related'] = $relatedResults;
     
     echo "  Компании: найдено {$relatedResults['companies']['count']}, успешно {$relatedResults['companies']['success']}, ошибок {$relatedResults['companies']['failed']}\n";
