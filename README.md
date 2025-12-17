@@ -197,8 +197,8 @@ $bitrixAPI->addSmartProcessItem($entityTypeId, $fields);
 // Создание карточки проекта с поддержкой множественных файлов
 $bitrixAPI->createProjectCard($contactId, $formFields, $fileId, $filePath, $localStorage);
 
-// Отправка email контакту
-$bitrixAPI->sendEmailToContact($contactId, $subject, $message, $localStorage);
+// Запуск бизнес-процесса отправки email контакту
+$bitrixAPI->startEmailBusinessProcess($contactId, $url);
 ```
 
 ### Класс LocalStorage

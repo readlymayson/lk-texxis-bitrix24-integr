@@ -496,122 +496,66 @@ class Bitrix24API
     }
 
     /**
-     * Отправка письма на e-mail контакта через Битрикс24
+     * Запуск бизнес-процесса для отправки email контакту через Битрикс24
      *
      * @param int|string $contactId ID контакта в Bitrix24
-     * @param string $subject Тема письма
-     * @param string $message Тело письма (HTML)
-     * @param object|null $localStorage Экземпляр LocalStorage для чтения e-mail из ЛК
-     * @return array|false Результат crm.activity.add или false при ошибке
+     * @param string $url Строка URL для передачи в бизнес-процесс
+     * @return array|false Результат bizproc.workflow.start или false при ошибке
      */
-    public function sendEmailToContact($contactId, $subject, $message, $localStorage = null)
+    public function startEmailBusinessProcess($contactId, $url)
     {
         if (empty($contactId)) {
-            $this->logger->error('Contact ID is required to send email');
+            $this->logger->error('Contact ID is required to start email business process');
             return false;
         }
 
-        if (trim((string)$subject) === '' || trim((string)$message) === '') {
-            $this->logger->error('Subject and message are required to send email', [
+        if (empty($url) || trim((string)$url) === '') {
+            $this->logger->error('URL is required to start email business process', [
                 'contact_id' => $contactId
             ]);
             return false;
         }
 
-        // 1. Пытаемся взять e-mail из локального хранилища
-        $email = '';
-        $contactData = null;
-
-        if ($localStorage !== null) {
-            $contactData = $localStorage->getContact($contactId);
-            if ($contactData && !empty($contactData['email'])) {
-                $email = $this->extractEmailValue($contactData['email']);
-            }
-        }
-
-        // 2. Если e-mail не найден в ЛК, берем из Bitrix24
-        if (empty($email)) {
-            $bitrixContact = $this->getEntityData('contact', $contactId);
-            if ($bitrixContact && isset($bitrixContact['result'])) {
-                $contactData = $bitrixContact['result'];
-                $email = $this->extractEmailValue($contactData['EMAIL'] ?? '');
-            }
-        }
-
-        if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
-            $this->logger->error('Valid email not found for contact', [
-                'contact_id' => $contactId,
-                'email' => $email
+        $businessProcessId = $this->config['bitrix24']['email_business_process_id'] ?? 0;
+        
+        if (empty($businessProcessId)) {
+            $this->logger->error('Email business process ID is not configured', [
+                'contact_id' => $contactId
             ]);
             return false;
         }
 
-        $emailFrom = $this->config['bitrix24']['email_from'] ?? '';
-
-        $fields = [
-            'OWNER_ID' => $contactId,
-            'OWNER_TYPE_ID' => 3, // 3 - контакт
-            'TYPE_ID' => 4,       // 4 - письмо
-            'PROVIDER_ID' => 'crm_email',
-            'PROVIDER_TYPE_ID' => 'EMAIL',
-            'SUBJECT' => $subject,
-            'DESCRIPTION' => $message,
-            'DESCRIPTION_TYPE' => 2, // 2 - HTML
-            'COMMUNICATIONS' => [
-                [
-                    'TYPE' => 'EMAIL',
-                    'VALUE' => $email,
-                    'ENTITY_ID' => $contactId,
-                    'ENTITY_TYPE_ID' => 3
-                ]
-            ],
-            'SETTINGS' => [
-                'MESSAGE_TO' => $email
-            ],
-            'DIRECTION' => 2, // 2 - исходящее
-            'COMPLETED' => 'N'
+        $params = [
+            'TEMPLATE_ID' => (int)$businessProcessId,
+            'DOCUMENT_TYPE' => ['crm', 'CCrmDocumentContact', 'CONTACT'],
+            'DOCUMENT_ID' => ['crm', 'CCrmDocumentContact', 'CONTACT_' . (int)$contactId],
+            'PARAMETERS' => [
+                'URL' => $url
+            ]
         ];
 
-        if (!empty($emailFrom)) {
-            $fields['SETTINGS']['MESSAGE_FROM'] = $emailFrom;
-        }
-
-        // Ответственный приоритетно берем из контакта, если есть
-        if ($contactData && isset($contactData['ASSIGNED_BY_ID'])) {
-            $fields['RESPONSIBLE_ID'] = $contactData['ASSIGNED_BY_ID'];
-        }
-
-        $this->logger->info('Sending email via Bitrix24', [
+        $this->logger->info('Starting email business process via Bitrix24', [
             'contact_id' => $contactId,
-            'email' => $email,
-            'subject' => $subject
+            'business_process_id' => $businessProcessId,
+            'url' => $url
         ]);
 
-        return $this->makeApiCall('crm.activity.add', ['fields' => $fields]);
-    }
+        $result = $this->makeApiCall('bizproc.workflow.start', $params);
 
-    /**
-     * Извлекает первый валидный e-mail из строки или массива Bitrix24
-     */
-    private function extractEmailValue($emailData)
-    {
-        if (is_string($emailData)) {
-            return trim($emailData);
+        if ($result && isset($result['result'])) {
+            $this->logger->debug('Email business process started successfully', [
+            'contact_id' => $contactId,
+                'workflow_id' => $result['result'] ?? 'unknown'
+            ]);
+        } else {
+            $this->logger->warning('Failed to start email business process', [
+                'contact_id' => $contactId,
+                'business_process_id' => $businessProcessId,
+                'result' => $result
+            ]);
         }
 
-        if (is_array($emailData)) {
-            // Структура Bitrix24: [['VALUE' => 'mail@example.com', ...], ...]
-            foreach ($emailData as $item) {
-                if (is_array($item) && !empty($item['VALUE'])) {
-                    return trim($item['VALUE']);
-                }
-                if (is_string($item) && !empty($item)) {
-                    return trim($item);
-                }
-            }
-        }
-
-        return '';
+        return $result;
     }
 
     /**
