@@ -167,14 +167,16 @@ class LocalStorage
 
         $companies = $this->readData($this->companiesFile, 'companies');
 
-        // Получаем значение поля партнерского договора
+        // Получаем значения полей из маппинга
         $partnerContractValue = $this->getFieldValue($companyData, 'company', 'partner_contract_status');
+        $innValue = $this->getFieldValue($companyData, 'company', 'inn');
 
         $companies[$companyId] = [
             'id' => $companyId,
             'title' => $companyData['TITLE'] ?? $companyData['title'] ?? '',
             'email' => $companyData['EMAIL'] ?? $companyData['email'] ?? '',
             'phone' => $companyData['PHONE'] ?? $companyData['phone'] ?? '',
+            'inn' => $innValue,
             'type' => $companyData['COMPANY_TYPE'] ?? $companyData['company_type'] ?? '',
             'industry' => $companyData['INDUSTRY'] ?? $companyData['industry'] ?? '',
             'employees' => $companyData['EMPLOYEES'] ?? $companyData['employees'] ?? '',
@@ -283,14 +285,16 @@ class LocalStorage
 
         $companies = $this->readData($this->companiesFile, 'companies');
 
-        // Получаем значение поля партнерского договора
+        // Получаем значения полей из маппинга
         $partnerContractValue = $this->getFieldValue($companyData, 'company', 'partner_contract_status');
+        $innValue = $this->getFieldValue($companyData, 'company', 'inn');
 
         $companies[$companyData['ID']] = [
             'id' => $companyData['ID'],
             'title' => $companyData['TITLE'] ?? '',
             'email' => $companyData['EMAIL'] ?? '',
             'phone' => $companyData['PHONE'] ?? '',
+            'inn' => $innValue,
             'industry' => $companyData['INDUSTRY'] ?? '',
             'employees' => $companyData['EMPLOYEES'] ?? '',
             'revenue' => $companyData['REVENUE'] ?? '',

@@ -630,8 +630,6 @@ class Bitrix24API
         // Список служебных ключей, которые не являются именами полей в Bitrix24
         $skipKeys = [
             'lk_client_values',      // Массив допустимых значений
-            'agent_contract_values', // Массив значений статуса агентского договора
-            'partner_contract_values', // Массив значений статуса партнерского договора
             'lk_delete_value'        // Числовое значение для проверки удаления
         ];
         
@@ -906,21 +904,75 @@ class Bitrix24API
 
     /**
      * Загрузка файла в Bitrix24
-     * 
+     *
      * @param string $filePath Путь к локальному файлу
      * @param int $folderId ID папки на Диске Bitrix24 (опционально, будет получен автоматически)
      * @return array|false Результат загрузки с ID файла или false при ошибке
      */
     public function uploadFile($filePath, $folderId = null)
     {
+        // Проверяем существование файла
         if (!file_exists($filePath)) {
             $this->logger->error('File not found for upload', ['file_path' => $filePath]);
             return false;
         }
 
+        // Проверяем, что это файл, а не директория
+        if (!is_file($filePath)) {
+            $this->logger->error('Path is not a file', ['file_path' => $filePath]);
+            return false;
+        }
+
+        // Проверяем права доступа на чтение
+        if (!is_readable($filePath)) {
+            $this->logger->error('File is not readable', ['file_path' => $filePath]);
+            return false;
+        }
+
+        $fileSize = filesize($filePath);
+
+        // Проверяем размер файла (максимум 100MB для безопасности)
+        $maxFileSize = 100 * 1024 * 1024; // 100MB
+        if ($fileSize > $maxFileSize) {
+            $this->logger->error('File too large for upload', [
+                'file_path' => $filePath,
+                'file_size' => $fileSize,
+                'max_size' => $maxFileSize
+            ]);
+            return false;
+        }
+
+        // Проверяем, что файл не пустой
+        if ($fileSize === 0) {
+            $this->logger->error('File is empty', ['file_path' => $filePath]);
+            return false;
+        }
+
+        // Определяем MIME тип для логирования
+        $mimeType = 'unknown';
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        if ($finfo) {
+            $mimeType = finfo_file($finfo, $filePath);
+            finfo_close($finfo);
+        }
+
+        // Читаем содержимое файла с проверкой ошибок
+        $fileContent = file_get_contents($filePath);
+        if ($fileContent === false) {
+            $this->logger->error('Failed to read file content', [
+                'file_path' => $filePath,
+                'file_size' => $fileSize
+            ]);
+            return false;
+        }
+
+        $originalFileName = basename($filePath);
+
         $this->logger->debug('Uploading file to Bitrix24', [
             'file_path' => $filePath,
-            'file_size' => filesize($filePath),
+            'file_size' => $fileSize,
+            'mime_type' => $mimeType,
+            'original_name' => $originalFileName,
             'folder_id' => $folderId
         ]);
 
@@ -934,13 +986,49 @@ class Bitrix24API
             }
         }
 
-        $fileContent = file_get_contents($filePath);
-        $originalFileName = basename($filePath);
-        $fileSize = filesize($filePath);
-        
         // Добавляем timestamp к имени файла, чтобы избежать конфликтов при повторной загрузке
         $pathInfo = pathinfo($originalFileName);
-        $fileName = $pathInfo['filename'] . '_' . time() . '.' . ($pathInfo['extension'] ?? 'txt');
+
+        // Определяем расширение файла более надежно
+        $extension = '';
+        if (!empty($pathInfo['extension'])) {
+            $extension = $pathInfo['extension'];
+        } else {
+            // Для файлов без расширения пытаемся определить тип по MIME
+            $finfo = finfo_open(FILEINFO_MIME_TYPE);
+            if ($finfo) {
+                $mimeType = finfo_file($finfo, $filePath);
+                finfo_close($finfo);
+
+                // Простое маппинг MIME типов на расширения
+                $mimeToExt = [
+                    'application/pdf' => 'pdf',
+                    'application/msword' => 'doc',
+                    'application/vnd.openxmlformats-officedocument.wordprocessingml.document' => 'docx',
+                    'application/vnd.ms-excel' => 'xls',
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' => 'xlsx',
+                    'application/vnd.ms-powerpoint' => 'ppt',
+                    'application/vnd.openxmlformats-officedocument.presentationml.presentation' => 'pptx',
+                    'text/plain' => 'txt',
+                    'text/csv' => 'csv',
+                    'image/jpeg' => 'jpg',
+                    'image/png' => 'png',
+                    'image/gif' => 'gif',
+                    'image/webp' => 'webp',
+                    'application/zip' => 'zip',
+                    'application/x-rar-compressed' => 'rar',
+                    'application/x-7z-compressed' => '7z'
+                ];
+
+                if (isset($mimeToExt[$mimeType])) {
+                    $extension = $mimeToExt[$mimeType];
+                }
+            }
+        }
+
+        // Формируем безопасное имя файла
+        $safeFileName = preg_replace('/[^a-zA-Z0-9а-яА-ЯёЁ_\-\.]/u', '_', $pathInfo['filename']);
+        $fileName = $safeFileName . '_' . time() . ($extension ? '.' . $extension : '');
         
         // Если folderId не получен, пробуем использовать ROOT_OBJECT_ID из storage
         if ($folderId === null || $folderId === false) {
@@ -969,7 +1057,7 @@ class Bitrix24API
             
             $this->logger->debug('Attempting file upload (method 1: disk.file.upload)', [
                 'method' => $method,
-                'file_name' => $fileName,
+                'file_name' => isset($fileName) ? $fileName : $originalFileName,
                 'file_size' => $fileSize
             ]);
             

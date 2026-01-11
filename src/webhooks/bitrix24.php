@@ -10,7 +10,9 @@
  * - ONCRMCOMPANYUPDATE - изменение компании
  * - ONCRMCOMPANYADD - создание компании
  * - ONCRMCOMPANYDELETE - удаление компании
- * - ONCRM_DYNAMIC_ITEM_UPDATE - изменение смарт-процесса
+ * - ONCRMDYNAMICITEMUPDATE - изменение смарт-процесса
+ * - ONCRMDYNAMICITEMADD - создание смарт-процесса
+ * - ONCRMDYNAMICITEMDELETE - удаление смарт-процесса
  */
 
 require_once __DIR__ . '/../classes/EnvLoader.php';
@@ -282,10 +284,23 @@ function extractContactId($rawValue)
 /**
  * Маппинг данных проекта из Bitrix24 в локальный формат
  */
-function mapProjectData($projectData, $mapping, $logger)
+function mapProjectData($projectData, $mapping, $logger, $localStorage = null)
 {
     $projectId = $projectData['id'] ?? $projectData['ID'] ?? null;
     $clientId = extractContactId($projectData[$mapping['client_id']] ?? null);
+
+    // Извлекаем company_id из данных контакта в локальном хранилище
+    $companyId = null;
+    if (!empty($clientId) && $localStorage) {
+        $contactData = $localStorage->getContact($clientId);
+        if ($contactData && isset($contactData['company'])) {
+            $companyId = $contactData['company'];
+            $logger->debug('Extracted company ID from contact data', [
+                'contact_id' => $clientId,
+                'company_id' => $companyId
+            ]);
+        }
+    }
     
     // Обработка списочного поля "Тип запросов"
     $requestTypeRaw = $projectData[$mapping['request_type']] ?? null;
@@ -401,6 +416,7 @@ function mapProjectData($projectData, $mapping, $logger)
         'technical_description' => $technicalDescription,
         'status' => $projectData[$mapping['status']] ?? 'NEW',
         'client_id' => $clientId,
+        'company_id' => $companyId,
         'manager_id' => $projectData['assignedById'] ?? $projectData['ASSIGNED_BY_ID'] ?? null
     ];
 }
@@ -747,7 +763,7 @@ function handleCreate($entityType, $entityData, $localStorage, $bitrixAPI, $logg
             $logger->info('New smart process created', ['process_id' => $projectId]);
             
             $mapping = $config['field_mapping']['smart_process'];
-            $mappedProjectData = mapProjectData($entityData, $mapping, $logger);
+            $mappedProjectData = mapProjectData($entityData, $mapping, $logger, $localStorage);
             $clientId = $mappedProjectData['client_id'];
             
             if (empty($clientId) || !hasContactInLocalStorage($clientId, $localStorage, $logger)) {
@@ -1011,7 +1027,7 @@ function handleCompanyUpdate($companyData, $localStorage, $bitrixAPI, $logger, $
 function handleSmartProcessUpdate($processData, $localStorage, $bitrixAPI, $logger, $config)
 {
     $mapping = $config['field_mapping']['smart_process'];
-    $mappedProjectData = mapProjectData($processData, $mapping, $logger);
+    $mappedProjectData = mapProjectData($processData, $mapping, $logger, $localStorage);
     
     $projectId = $mappedProjectData['bitrix_id'];
     $clientId = $mappedProjectData['client_id'];
@@ -1058,6 +1074,14 @@ function handleDelete($entityType, $entityData, $localStorage, $logger)
 
         case 'company':
             $logger->info('Company deleted', ['company_id' => $entityData['ID'] ?? 'unknown']);
+            break;
+
+        case 'smart_process':
+            $projectId = $entityData['id'] ?? $entityData['ID'] ?? null;
+            $logger->info('Smart process deleted', ['project_id' => $projectId ?? 'unknown']);
+            if ($projectId) {
+                $localStorage->deleteProject($projectId);
+            }
             break;
     }
 
@@ -1300,7 +1324,7 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
 
                         if ($projectContactId === $contactId) {
                             // Маппируем данные проекта используя функцию mapProjectData
-                            $mappedProjectData = mapProjectData($projectData, $mapping, $logger);
+                            $mappedProjectData = mapProjectData($projectData, $mapping, $logger, $localStorage);
                             
                             $logger->info('Syncing related project to contact LK', [
                                 'project_id' => $projectId,

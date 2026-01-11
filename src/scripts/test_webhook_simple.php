@@ -96,6 +96,7 @@ $postData = http_build_query($testData);
                         <option value="ONCRMCOMPANYADD" <?= $eventType === 'ONCRMCOMPANYADD' ? 'selected' : '' ?>>ONCRMCOMPANYADD</option>
                         <option value="ONCRMDYNAMICITEMUPDATE" <?= $eventType === 'ONCRMDYNAMICITEMUPDATE' ? 'selected' : '' ?>>ONCRMDYNAMICITEMUPDATE</option>
                         <option value="ONCRMDYNAMICITEMADD" <?= $eventType === 'ONCRMDYNAMICITEMADD' ? 'selected' : '' ?>>ONCRMDYNAMICITEMADD</option>
+                        <option value="ONCRMDYNAMICITEMDELETE" <?= $eventType === 'ONCRMDYNAMICITEMDELETE' ? 'selected' : '' ?>>ONCRMDYNAMICITEMDELETE</option>
                     </select>
                 </div>
                 

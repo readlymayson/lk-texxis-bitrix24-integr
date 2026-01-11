@@ -8,16 +8,16 @@
  * php test_project_creation.php [contact_id] --files [file_path1] [file_path2] ... [file_pathN]
  * 
  * Примеры:
- * php test_project_creation.php 3                    # Создание проекта для контакта ID=3 (файл будет загружен автоматически)
+ * php test_project_creation.php 3                    # Создание проекта для контакта ID=3 (ТЗ будет загружено автоматически)
  * php test_project_creation.php 3 123                 # Использовать существующий файл с ID=123
  * php test_project_creation.php 3 123 456 789         # Использовать несколько существующих файлов с ID=123, 456, 789
  * php test_project_creation.php 3 --files file1.txt file2.txt file3.txt  # Загрузить несколько файлов
  * 
- * Примечание: 
+ * Примечание:
  * - company_id и manager_id автоматически берутся из базы данных ЛК по contact_id
  * - file_id (опционально) - ID уже загруженного файла в Bitrix24. Можно указать несколько через пробел
  * - --files - флаг для указания путей к файлам для загрузки (можно указать несколько)
- * - Если не указаны file_id и --files, будет создан и загружен один тестовый файл
+ * - Если не указаны file_id и --files, будет загружен файл ТЗ-Личный-кабинет-TEXXIS.pdf
  */
 
 require_once __DIR__ . '/../classes/EnvLoader.php';
@@ -271,7 +271,7 @@ if (!empty($mapping['equipment_list'])) {
     
     // Если не указаны ни ID, ни пути - используем тестовый файл
     if (empty($fileIdParam) && empty($filePathParam)) {
-        $testFilePath = __DIR__ . '/test_equipment_list.txt';
+        $testFilePath = __DIR__ . '/../../docs/ТЗ-Личный-кабинет-TEXXIS.pdf';
         if (file_exists($testFilePath)) {
             echo "Использование тестового файла: {$testFilePath}\n";
             $filePathParam = $testFilePath;
