@@ -196,8 +196,8 @@ echo "\n\n=== ТЕСТ ФУНКЦИИ mapProjectData ===\n";
 $testProjectData = [
     'id' => '999999',
     'contactId' => '3', // Контакт с company=9 согласно contacts.json
-    'ufCrm8_1766559654950' => 'Тестовая организация',
-    'ufCrm8_1766559654952' => 'Тестовый объект'
+    'ufCrm7_1768130049371' => 'Тестовая организация',
+    'ufCrm7_1768130056401' => 'Тестовый объект'
 ];
 
 $mapping = $config['field_mapping']['smart_process'];
