@@ -1334,16 +1334,30 @@ class Bitrix24API
             return false;
         }
 
-        // Получаем managerId только из локального хранилища
+        // Получаем данные из локального хранилища
         $managerId = null;
+        $companyId = null;
         if ($localStorage !== null) {
             $contact = $localStorage->getContact($contactId);
-            if ($contact && !empty($contact['manager_id'])) {
-                $managerId = $contact['manager_id'];
-                $this->logger->debug('Manager ID found in local storage', [
-                    'contact_id' => $contactId,
-                    'manager_id' => $managerId
-                ]);
+
+            if ($contact) {
+                // Получаем manager_id из контакта
+                if (!empty($contact['manager_id'])) {
+                    $managerId = $contact['manager_id'];
+                    $this->logger->debug('Manager ID found in local storage', [
+                        'contact_id' => $contactId,
+                        'manager_id' => $managerId
+                    ]);
+                }
+
+                // Получаем company_id из контакта
+                if (!empty($contact['company'])) {
+                    $companyId = $contact['company'];
+                    $this->logger->debug('Company ID found in local storage', [
+                        'contact_id' => $contactId,
+                        'company_id' => $companyId
+                    ]);
+                }
             }
         }
 
@@ -1354,9 +1368,18 @@ class Bitrix24API
             $projectFields[$mapping['client_id']] = $contactId;
         }
 
+        // Компания: если не передана, пробуем подтянуть
+        if (!isset($projectFields[$mapping['company_id'] ?? '']) && !empty($companyId) && !empty($mapping['company_id'])) {
+            $projectFields[$mapping['company_id']] = $companyId;
+        }
+
         // Значения из формы (кроме contact_id): ожидаем ключи по маппингу (organization_name, object_name, system_types, location и т.д.)
         foreach ($mapping as $fieldKey => $bitrixField) {
             if ($fieldKey === 'client_id') {
+                continue;
+            }
+            // company_id заполнится ниже, если не пришёл из формы
+            if ($fieldKey === 'company_id' && empty($formFields[$fieldKey])) {
                 continue;
             }
             // manager_id заполнится ниже, если не пришёл из формы
@@ -1451,6 +1474,7 @@ class Bitrix24API
             'contact_id' => $contactId,
             'smart_process_id' => $smartProcessId,
             'has_manager' => !empty($managerId),
+            'has_company' => !empty($companyId),
             'fields_keys' => array_keys($projectFields)
         ]);
 
