@@ -229,6 +229,9 @@ if (!empty($mapping['status'])) {
         echo "  Поле 'status': используется тестовое значение (список не найден)\n";
     }
 }
+if (!empty($mapping['equipment_list_text'])) {
+    $formFields['equipment_list_text'] = 'Оборудования 1, 2 и 3';
+}
 
 // Обработка файлов для equipment_list
 // createProjectCard сам обработает файлы, нам нужно только подготовить параметры

@@ -1531,17 +1531,13 @@ class Bitrix24API
                     ]);
                 }
                 
-                // Получаем manager_id из Bitrix24 API (ASSIGNED_BY_ID)
-                $contactData = $this->getEntityData('contact', $contactId);
-                if ($contactData && isset($contactData['result']['ASSIGNED_BY_ID'])) {
-                    $managerId = $contactData['result']['ASSIGNED_BY_ID'];
-                    if (!empty($managerId) && !empty($mapping['manager_id'])) {
-                        $fields[$mapping['manager_id']] = $managerId;
-                        $this->logger->debug('Retrieved manager_id from Bitrix24 API', [
-                            'contact_id' => $contactId,
-                            'manager_id' => $managerId
-                        ]);
-                    }
+                // Получаем manager_id из контакта (локальное хранилище)
+                if (!empty($contact['manager_id']) && !empty($mapping['manager_id'])) {
+                    $fields[$mapping['manager_id']] = $contact['manager_id'];
+                    $this->logger->debug('Retrieved manager_id from local storage', [
+                        'contact_id' => $contactId,
+                        'manager_id' => $contact['manager_id']
+                    ]);
                 }
             } else {
                 $this->logger->warning('Contact not found in local storage', [
@@ -1641,17 +1637,13 @@ class Bitrix24API
                     ]);
                 }
                 
-                // Получаем manager_id из Bitrix24 API (ASSIGNED_BY_ID)
-                $contactData = $this->getEntityData('contact', $contactId);
-                if ($contactData && isset($contactData['result']['ASSIGNED_BY_ID'])) {
-                    $managerId = $contactData['result']['ASSIGNED_BY_ID'];
-                    if (!empty($managerId) && !empty($mapping['manager_id'])) {
-                        $fields[$mapping['manager_id']] = $managerId;
-                        $this->logger->debug('Retrieved manager_id from Bitrix24 API', [
-                            'contact_id' => $contactId,
-                            'manager_id' => $managerId
-                        ]);
-                    }
+                // Получаем manager_id из контакта (локальное хранилище)
+                if (!empty($contact['manager_id']) && !empty($mapping['manager_id'])) {
+                    $fields[$mapping['manager_id']] = $contact['manager_id'];
+                    $this->logger->debug('Retrieved manager_id from local storage', [
+                        'contact_id' => $contactId,
+                        'manager_id' => $contact['manager_id']
+                    ]);
                 }
             } else {
                 $this->logger->warning('Contact not found in local storage', [

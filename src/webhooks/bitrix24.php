@@ -411,6 +411,7 @@ function mapProjectData($projectData, $mapping, $logger, $localStorage = null)
         'implementation_date' => $projectData[$mapping['implementation_date']] ?? null,
         'request_type' => $requestType,
         'equipment_list' => $equipmentList,
+        'equipment_list_text' => $projectData[$mapping['equipment_list_text']] ?? '',
         'competitors' => $projectData[$mapping['competitors']] ?? '',
         'marketing_discount' => $marketingDiscount,
         'technical_description' => $technicalDescription,
@@ -845,7 +846,19 @@ function handleContactUpdate($contactData, $localStorage, $bitrixAPI, $logger, $
                 'lk_id' => $existingContact['id']
             ]);
             $result = $localStorage->syncContactByBitrixId($contactId, $contactData);
-            
+            if ($result) {
+                // Синхронизируем менеджера при обновлении существующего контакта
+                $managerField = $config['field_mapping']['contact']['manager_id'] ?? 'ASSIGNED_BY_ID';
+                $assignedById = $contactData[$managerField] ?? null;
+                $logger->debug('Extracting manager ID for existing contact update', [
+                    'contact_id' => $contactId,
+                    'manager_field' => $managerField,
+                    'assigned_by_id' => $assignedById,
+                    'has_field' => isset($contactData[$managerField])
+                ]);
+                syncManagerForContact($contactId, $assignedById, $bitrixAPI, $localStorage, $logger);
+            }
+
             return $result;
         } else {
             $logger->info('Skipping contact update - invalid LK client field value', [

@@ -131,6 +131,7 @@ class LocalStorage
             'phone' => $contactData['PHONE'] ?? '',
             'type_id' => $contactData['TYPE_ID'] ?? '',
             'company' => $contactData['COMPANY_ID'] ?? null,
+            'manager_id' => $contactData['ASSIGNED_BY_ID'] ?? null,
             'agent_contract_status' => $agentContractValue,
             'lk_client_field' => $lkClientValue,
             'status' => 'active',
@@ -245,6 +246,7 @@ class LocalStorage
         $contacts[$contactData['ID']]['phone'] = $contactData['PHONE'] ?? $contacts[$contactData['ID']]['phone'];
         $contacts[$contactData['ID']]['type_id'] = $contactData['TYPE_ID'] ?? $contacts[$contactData['ID']]['type_id'];
         $contacts[$contactData['ID']]['company'] = $contactData['COMPANY_ID'] ?? $contacts[$contactData['ID']]['company'];
+        $contacts[$contactData['ID']]['manager_id'] = $contactData['ASSIGNED_BY_ID'] ?? $contacts[$contactData['ID']]['manager_id'];
         
         // Обновляем поле агентского договора
         $agentContractValue = $this->getFieldValue($contactData, 'contact', 'agent_contract_status');
@@ -454,6 +456,7 @@ class LocalStorage
             'implementation_date' => $projectData['implementation_date'] ?? null,
             'request_type' => $projectData['request_type'] ?? '',
             'equipment_list' => $equipmentList,
+            'equipment_list_text' => $projectData['equipment_list_text'] ?? '',
             'competitors' => $projectData['competitors'] ?? '',
             'marketing_discount' => $projectData['marketing_discount'] ?? false,
             'technical_description' => $projectData['technical_description'] ?? '',
@@ -563,6 +566,7 @@ class LocalStorage
         $projects[$projectId]['location'] = $projectData['location'] ?? $projects[$projectId]['location'] ?? '';
         $projects[$projectId]['implementation_date'] = $projectData['implementation_date'] ?? $projects[$projectId]['implementation_date'] ?? null;
         $projects[$projectId]['request_type'] = $projectData['request_type'] ?? $projects[$projectId]['request_type'] ?? '';
+        $projects[$projectId]['equipment_list_text'] = $projectData['equipment_list_text'] ?? $projects[$projectId]['equipment_list_text'] ?? '';
         
         // Обработка equipment_list - всегда массив файлов
         $equipmentList = $projectData['equipment_list'] ?? $projects[$projectId]['equipment_list'] ?? [];
