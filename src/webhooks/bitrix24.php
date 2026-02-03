@@ -535,9 +535,9 @@ function shouldDeleteContactData($entityType, $entityData, $config, $logger)
     }
 
     $fieldName = $config['field_mapping'][$entityType]['lk_client_field'];
-    $deleteValue = $config['field_mapping'][$entityType]['lk_delete_value'] ?? '';
+    $deleteValues = $config['field_mapping'][$entityType]['lk_delete_values'] ?? [];
 
-    if (empty($deleteValue) && $deleteValue !== '0' && $deleteValue !== 0) {
+    if (empty($deleteValues) || !is_array($deleteValues)) {
         return false;
     }
 
@@ -550,9 +550,9 @@ function shouldDeleteContactData($entityType, $entityData, $config, $logger)
     // Нормализуем значения для сравнения (приводим к строкам)
     // Bitrix24 может возвращать значения как строки или числа
     $fieldValueNormalized = (string)$fieldValue;
-    $deleteValueNormalized = (string)$deleteValue;
+    $deleteValuesNormalized = array_map('strval', $deleteValues);
 
-    $shouldDelete = ($fieldValueNormalized === $deleteValueNormalized);
+    $shouldDelete = in_array($fieldValueNormalized, $deleteValuesNormalized, true);
 
     $logger->debug('Checking if contact data should be deleted', [
         'entity_type' => $entityType,
@@ -560,9 +560,9 @@ function shouldDeleteContactData($entityType, $entityData, $config, $logger)
         'field_value' => $fieldValue,
         'field_value_type' => gettype($fieldValue),
         'field_value_normalized' => $fieldValueNormalized,
-        'delete_value' => $deleteValue,
-        'delete_value_type' => gettype($deleteValue),
-        'delete_value_normalized' => $deleteValueNormalized,
+        'delete_values' => $deleteValues,
+        'delete_values_type' => gettype($deleteValues),
+        'delete_values_normalized' => $deleteValuesNormalized,
         'should_delete' => $shouldDelete
     ]);
 

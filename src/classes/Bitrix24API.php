@@ -630,7 +630,7 @@ class Bitrix24API
         // Список служебных ключей, которые не являются именами полей в Bitrix24
         $skipKeys = [
             'lk_client_values',      // Массив допустимых значений
-            'lk_delete_value'        // Числовое значение для проверки удаления
+            'lk_delete_values'       // Массив значений для проверки удаления
         ];
         
         foreach ($mapping as $key => $value) {
