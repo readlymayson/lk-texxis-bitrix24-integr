@@ -430,14 +430,20 @@ class LocalStorage
      */
     public function addProject($projectData)
     {
-        $this->logger->debug('Adding project locally', ['project_id' => $projectData['id'] ?? $projectData['ID'] ?? 'unknown']);
-
-        $projects = $this->readData($this->projectsFile, 'projects');
-
         $projectId = $projectData['id'] ?? $projectData['ID'] ?? $projectData['bitrix_id'] ?? null;
         if (!$projectId) {
             $this->logger->error('Project ID not found in data', ['project_data_keys' => array_keys($projectData)]);
             return false;
+        }
+
+        $this->logger->debug('Adding project locally', ['project_id' => $projectId]);
+
+        $projects = $this->readData($this->projectsFile, 'projects');
+
+        // Если проект уже существует, переключаемся на синхронизацию
+        if (isset($projects[$projectId])) {
+            $this->logger->info('Project already exists, switching to sync mode', ['project_id' => $projectId]);
+            return $this->syncProjectByBitrixId($projectId, $projectData);
         }
 
         // Обработка equipment_list - всегда массив файлов
@@ -553,7 +559,7 @@ class LocalStorage
         $projects = $this->readData($this->projectsFile, 'projects');
 
         if (!isset($projects[$projectId])) {
-            $this->logger->warning('Project not found for sync by Bitrix ID, creating new', [
+            $this->logger->debug('Project not found for sync by Bitrix ID, creating new', [
                 'project_id' => $projectId
             ]);
             return $this->addProject($projectData);
