@@ -55,3 +55,6 @@ docs/generated/
 # Тестовые файлы
 test-*.php
 test-webhook.json
+
+# Скрипты
+src/scripts/
