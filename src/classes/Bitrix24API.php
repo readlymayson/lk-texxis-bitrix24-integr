@@ -2035,10 +2035,57 @@ class Bitrix24API
     }
 
     /**
+     * Получение ИНН компании из её реквизитов
+     *
+     * @param int $companyId ID компании в Bitrix24
+     * @return string|null ИНН компании или null при отсутствии
+     */
+    public function getCompanyINN($companyId)
+    {
+        $this->logger->debug('Getting company INN from Bitrix24 requisites', [
+            'company_id' => $companyId
+        ]);
+
+        $result = $this->makeApiCall('crm.requisite.list', [
+            'filter' => [
+                'ENTITY_ID' => $companyId,
+                'ENTITY_TYPE_ID' => 4 // CRM_COMPANY
+            ],
+            'select' => ['RQ_INN']
+        ]);
+
+        if ($result && isset($result['result']) && is_array($result['result']) && !empty($result['result'])) {
+            // Берем ИНН из первого найденного реквизита
+            $inn = $result['result'][0]['RQ_INN'] ?? null;
+
+            if ($inn !== null) {
+                $this->logger->debug('Company INN found in requisites', [
+                    'company_id' => $companyId,
+                    'inn' => $inn
+                ]);
+                return $inn;
+            } else {
+                $this->logger->debug('Company requisites found but no INN', [
+                    'company_id' => $companyId,
+                    'requisites_count' => count($result['result'])
+                ]);
+            }
+        } else {
+            $this->logger->debug('No requisites found for company', [
+                'company_id' => $companyId,
+                'result_type' => gettype($result),
+                'has_result' => isset($result['result']) ? 'yes' : 'no'
+            ]);
+        }
+
+        return null;
+    }
+
+    /**
      * Получение полей типа списка компании
-     * 
+     *
      * @return array|false Массив с полями типа списка и их значениями или false при ошибке
-     * 
+     *
      * Формат возвращаемых данных:
      * [
      *   'field_id' => [

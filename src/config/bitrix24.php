@@ -14,7 +14,6 @@ return [
         'webhook_url' => EnvLoader::get('BITRIX24_WEBHOOK_URL', ''),
         'application_token' => EnvLoader::get('BITRIX24_APPLICATION_TOKEN', ''), // Токен приложения для валидации webhook
         'timeout' => EnvLoader::getInt('BITRIX24_TIMEOUT', 30), // Timeout для API запросов (секунды)
-        'email_from' => '', // Email адрес отправителя для писем (опционально)
         'smart_process_id' => 1142, // ID смарт-процесса для проектов
         'smart_process_change_data_id' => 1152, // ID смарт-процесса "Изменение данных в ЛК"
         'smart_process_delete_data_id' => 1164, // ID смарт-процесса "Удаление пользовательских данных"
@@ -58,10 +57,9 @@ return [
         ],
         'company' => [
             'title' => 'TITLE',
-            'email' => 'EMAIL', 
+            'email' => 'EMAIL',
             'phone' => 'PHONE',
             'contact_id' => 'CONTACT_ID',
-            'inn' => '', // ИНН компании
             'website' => 'WEB', // Сайт компании
             'partner_contract_status' => 'UF_CRM_65CA23468EF2E', // Статус "Партнерский договор" (п.3.7) - список с заданными значениями
         ],

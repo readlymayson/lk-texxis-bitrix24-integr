@@ -150,11 +150,15 @@ class LocalStorage
 
     /**
      * Создание компании
+     *
+     * @param array $companyData Данные компании из Bitrix24
+     * @param string|null $inn ИНН компании (если не передан, будет получен через API)
+     * @return bool
      */
-    public function createCompany($companyData)
+    public function createCompany($companyData, $inn = null)
     {
         $companyId = $companyData['ID'] ?? $companyData['id'] ?? null;
-        
+
         if (empty($companyId)) {
             $this->logger->error('Company ID is missing in company data', [
                 'data_keys' => array_keys($companyData),
@@ -164,13 +168,15 @@ class LocalStorage
             return false;
         }
 
-        $this->logger->debug('Creating company locally', ['company_id' => $companyId]);
+        $this->logger->debug('Creating company locally', ['company_id' => $companyId, 'inn_provided' => $inn !== null]);
 
         $companies = $this->readData($this->companiesFile, 'companies');
 
         // Получаем значения полей из маппинга
         $partnerContractValue = $this->getFieldValue($companyData, 'company', 'partner_contract_status');
-        $innValue = $this->getFieldValue($companyData, 'company', 'inn');
+
+        // ИНН передается как параметр или берется из данных (для обратной совместимости)
+        $innValue = $inn ?? $companyData['INN'] ?? $companyData['inn'] ?? null;
 
         $companies[$companyId] = [
             'id' => $companyId,
@@ -192,7 +198,7 @@ class LocalStorage
 
         $this->writeData($this->companiesFile, $companies, 'companies');
 
-        $this->logger->info('Company created successfully', ['company_id' => $companyId]);
+        $this->logger->info('Company created successfully', ['company_id' => $companyId, 'inn' => $innValue]);
 
         return true;
     }
@@ -280,16 +286,27 @@ class LocalStorage
 
     /**
      * Синхронизация данных компании
+     *
+     * @param string $lkId ID в локальном хранилище (не используется, оставлено для совместимости)
+     * @param array $companyData Данные компании из Bitrix24
+     * @param string|null $inn ИНН компании (если не передан, будет получен через API)
+     * @return bool
      */
-    public function syncCompany($lkId, $companyData)
+    public function syncCompany($lkId, $companyData, $inn = null)
     {
-        $this->logger->debug('Syncing company data locally', ['lk_id' => $lkId, 'company_id' => $companyData['ID']]);
+        $this->logger->debug('Syncing company data locally', [
+            'lk_id' => $lkId,
+            'company_id' => $companyData['ID'],
+            'inn_provided' => $inn !== null
+        ]);
 
         $companies = $this->readData($this->companiesFile, 'companies');
 
         // Получаем значения полей из маппинга
         $partnerContractValue = $this->getFieldValue($companyData, 'company', 'partner_contract_status');
-        $innValue = $this->getFieldValue($companyData, 'company', 'inn');
+
+        // ИНН передается как параметр или берется из данных (для обратной совместимости)
+        $innValue = $inn ?? $companyData['INN'] ?? $companyData['inn'] ?? null;
 
         $companies[$companyData['ID']] = [
             'id' => $companyData['ID'],
@@ -313,7 +330,7 @@ class LocalStorage
         if ($writeResult === false) {
             $this->logger->error('Failed to write company data', ['company_id' => $companyData['ID']]);
         } else {
-            $this->logger->info('Company synced successfully', ['company_id' => $companyData['ID']]);
+            $this->logger->info('Company synced successfully', ['company_id' => $companyData['ID'], 'inn' => $innValue]);
         }
 
         return true;
@@ -534,19 +551,25 @@ class LocalStorage
 
     /**
      * Синхронизация данных компании по Bitrix ID
+     *
+     * @param int $companyId ID компании в Bitrix24
+     * @param array $companyData Данные компании из Bitrix24
+     * @param string|null $inn ИНН компании (если не передан, будет получен через API)
+     * @return bool
      */
-    public function syncCompanyByBitrixId($companyId, $companyData)
+    public function syncCompanyByBitrixId($companyId, $companyData, $inn = null)
     {
         $existingCompany = $this->getCompany($companyId);
 
         if (!$existingCompany) {
             $this->logger->warning('Company not found for sync by Bitrix ID, creating new', [
-                'company_id' => $companyId
+                'company_id' => $companyId,
+                'inn_provided' => $inn !== null
             ]);
-            return $this->createCompany($companyData);
+            return $this->createCompany($companyData, $inn);
         }
 
-        return $this->syncCompany($companyId, $companyData);
+        return $this->syncCompany($companyId, $companyData, $inn);
     }
 
     /**

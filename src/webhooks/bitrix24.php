@@ -756,7 +756,17 @@ function handleCreate($entityType, $entityData, $localStorage, $bitrixAPI, $logg
                 'company_id' => $entityData['ID'],
                 'contact_id' => $contactId
             ]);
-            $localStorage->createCompany($entityData);
+
+            // Получаем ИНН компании из реквизитов для новой компании
+            $companyInn = $bitrixAPI->getCompanyINN($entityData['ID']);
+            if ($companyInn !== null) {
+                $logger->debug('Company INN obtained from requisites for new company', [
+                    'company_id' => $entityData['ID'],
+                    'inn' => $companyInn
+                ]);
+            }
+
+            $localStorage->createCompany($entityData, $companyInn);
             break;
 
         case 'smart_process':
@@ -1014,8 +1024,21 @@ function handleCompanyUpdate($companyData, $localStorage, $bitrixAPI, $logger, $
 
         $companyData['CONTACT_ID'] = $contactId;
 
+        // Получаем ИНН компании из реквизитов
+        $companyInn = $bitrixAPI->getCompanyINN($companyId);
+        if ($companyInn !== null) {
+            $logger->debug('Company INN obtained from requisites', [
+                'company_id' => $companyId,
+                'inn' => $companyInn
+            ]);
+        } else {
+            $logger->debug('No INN found in company requisites', [
+                'company_id' => $companyId
+            ]);
+        }
+
         // Синхронизируем компанию через LocalStorage
-        $result = $localStorage->syncCompanyByBitrixId($companyId, $companyData);
+        $result = $localStorage->syncCompanyByBitrixId($companyId, $companyData, $companyInn);
         if (!$result) {
             $logger->error('Failed to sync company', [
                 'company_id' => $companyId
@@ -1231,7 +1254,16 @@ function syncAllRelatedEntitiesForContact($contactId, $bitrixAPI, $localStorage,
 
                     $companyData['CONTACT_ID'] = $contactId;
 
-                    $syncResult = $localStorage->syncCompanyByBitrixId($companyId, $companyData);
+                    // Получаем ИНН компании из реквизитов для связанной компании
+                    $companyInn = $bitrixAPI->getCompanyINN($companyId);
+                    if ($companyInn !== null) {
+                        $logger->debug('Company INN obtained from requisites for related company', [
+                            'company_id' => $companyId,
+                            'inn' => $companyInn
+                        ]);
+                    }
+
+                    $syncResult = $localStorage->syncCompanyByBitrixId($companyId, $companyData, $companyInn);
                         if (!$syncResult) {
                             $logger->error('Failed to sync related company', [
                                 'company_id' => $companyId,
