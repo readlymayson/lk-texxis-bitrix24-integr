@@ -7,11 +7,18 @@ class Bitrix24API
 {
     private $config;
     private $logger;
+    private $lastApiCallTime = 0;
+    private $minApiCallInterval = 0.5; // Минимальный интервал между запросами в секундах
 
     public function __construct($config, $logger)
     {
         $this->config = $config;
         $this->logger = $logger;
+        
+        // Настройка интервала из конфига, если есть
+        if (isset($this->config['bitrix24']['min_api_interval'])) {
+            $this->minApiCallInterval = (float)$this->config['bitrix24']['min_api_interval'];
+        }
     }
 
     /**
@@ -340,159 +347,203 @@ class Bitrix24API
      */
     private function makeApiCall($method, $params = [])
     {
-        $webhookUrl = $this->config['bitrix24']['webhook_url'] ?? '';
-        
-        // Валидация URL
-        if (empty($webhookUrl)) {
-            $this->logger->error('Webhook URL is not configured');
-            return false;
-        }
-        
-        // Проверка формата URL
-        if (!filter_var($webhookUrl, FILTER_VALIDATE_URL)) {
-            $this->logger->error('Invalid webhook URL format', [
-                'webhook_url' => substr($webhookUrl, 0, 50) . '...'
-            ]);
-            return false;
-        }
-        
-        // Проверка протокола (должен быть HTTPS)
-        if (!str_starts_with(strtolower($webhookUrl), 'https://')) {
-            $this->logger->warning('Webhook URL is not using HTTPS', [
-                'webhook_url' => substr($webhookUrl, 0, 50) . '...'
-            ]);
-        }
-        
-        $url = rtrim($webhookUrl, '/') . '/' . $method . '.json';
-        
-        // Дополнительная валидация полного URL
-        if (!filter_var($url, FILTER_VALIDATE_URL)) {
-            $this->logger->error('Invalid constructed URL', [
+        $maxRetries = 3;
+        $retryDelay = 2; // Задержка в секундах при ошибке лимитов
+        $attempt = 0;
+
+        while ($attempt < $maxRetries) {
+            $attempt++;
+
+            // Добавляем задержку между API вызовами для предотвращения превышения лимитов
+            $currentTime = microtime(true);
+            $timeSinceLastCall = $currentTime - $this->lastApiCallTime;
+            if ($timeSinceLastCall < $this->minApiCallInterval) {
+                $sleepTime = $this->minApiCallInterval - $timeSinceLastCall;
+                usleep((int)($sleepTime * 1000000));
+            }
+            $this->lastApiCallTime = microtime(true);
+
+            $webhookUrl = $this->config['bitrix24']['webhook_url'] ?? '';
+            
+            // Валидация URL
+            if (empty($webhookUrl)) {
+                $this->logger->error('Webhook URL is not configured');
+                return false;
+            }
+            
+            // Проверка формата URL
+            if (!filter_var($webhookUrl, FILTER_VALIDATE_URL)) {
+                $this->logger->error('Invalid webhook URL format', [
+                    'webhook_url' => substr($webhookUrl, 0, 50) . '...'
+                ]);
+                return false;
+            }
+            
+            // Проверка протокола (должен быть HTTPS)
+            if (!str_starts_with(strtolower($webhookUrl), 'https://')) {
+                $this->logger->warning('Webhook URL is not using HTTPS', [
+                    'webhook_url' => substr($webhookUrl, 0, 50) . '...'
+                ]);
+            }
+            
+            $url = rtrim($webhookUrl, '/') . '/' . $method . '.json';
+            
+            // Дополнительная валидация полного URL
+            if (!filter_var($url, FILTER_VALIDATE_URL)) {
+                $this->logger->error('Invalid constructed URL', [
+                    'method' => $method,
+                    'url' => substr($url, 0, 100) . '...'
+                ]);
+                return false;
+            }
+
+            $postData = json_encode($params, JSON_UNESCAPED_UNICODE);
+            
+            // Проверка результата json_encode
+            if ($postData === false) {
+                $this->logger->error('JSON encoding failed in API call', [
+                    'method' => $method,
+                    'json_error' => json_last_error_msg(),
+                    'params_keys' => array_keys($params)
+                ]);
+                return false;
+            }
+
+            $this->logger->debug('Making API call', [
                 'method' => $method,
-                'url' => substr($url, 0, 100) . '...'
+                'url' => preg_replace('/\/[^\/]+\/[^\/]+\//', '/***/', $url), // Скрываем токен в логах
+                'params' => $params,
+                'attempt' => $attempt
             ]);
-            return false;
-        }
 
-        $postData = json_encode($params, JSON_UNESCAPED_UNICODE);
-        
-        // Проверка результата json_encode
-        if ($postData === false) {
-            $this->logger->error('JSON encoding failed in API call', [
-                'method' => $method,
-                'json_error' => json_last_error_msg(),
-                'params_keys' => array_keys($params)
+            $ch = curl_init();
+
+            curl_setopt_array($ch, [
+                CURLOPT_URL => $url,
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => $postData,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_HTTPHEADER => [
+                    'Content-Type: application/json; charset=utf-8',
+                    'Accept: application/json'
+                ],
+                CURLOPT_TIMEOUT => $this->config['bitrix24']['timeout'],
+                CURLOPT_SSL_VERIFYPEER => true,
+                CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_ENCODING => '', // Автоматическая декомпрессия
             ]);
-            return false;
-        }
 
-        $this->logger->debug('Making API call', [
-            'method' => $method,
-            'url' => preg_replace('/\/[^\/]+\/[^\/]+\//', '/***/', $url), // Скрываем токен в логах
-            'params' => $params
-        ]);
+            $response = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $error = curl_error($ch);
 
-        $ch = curl_init();
+            curl_close($ch);
 
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $url,
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => $postData,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/json; charset=utf-8',
-                'Accept: application/json'
-            ],
-            CURLOPT_TIMEOUT => $this->config['bitrix24']['timeout'],
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_SSL_VERIFYHOST => 2,
-            CURLOPT_ENCODING => '', // Автоматическая декомпрессия
-        ]);
+            if ($error) {
+                $this->logger->error('CURL error in API call', [
+                    'method' => $method,
+                    'error' => $error,
+                    'url' => preg_replace('/\/[^\/]+\/[^\/]+\//', '/***/', $url) // Скрываем токен в логах
+                ]);
+                return false;
+            }
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error = curl_error($ch);
+            $result = json_decode($response, true);
 
-        curl_close($ch);
+            // Обработка ошибок лимитов (503 или QUERY_LIMIT_EXCEEDED)
+            if ($httpCode === 503 || (isset($result['error']) && $result['error'] === 'QUERY_LIMIT_EXCEEDED')) {
+                if ($attempt < $maxRetries) {
+                    $this->logger->warning('API limit exceeded, retrying...', [
+                        'method' => $method,
+                        'attempt' => $attempt,
+                        'next_retry_delay' => $retryDelay,
+                        'response' => $response
+                    ]);
+                    sleep($retryDelay);
+                    $retryDelay *= 2; // Экспоненциальная задержка
+                    continue;
+                } else {
+                    $this->logger->error('API limit exceeded, max retries reached', [
+                        'method' => $method,
+                        'attempts' => $attempt,
+                        'response' => $response
+                    ]);
+                    return false;
+                }
+            }
 
-        if ($error) {
-            $this->logger->error('CURL error in API call', [
-                'method' => $method,
-                'error' => $error,
-                'url' => preg_replace('/\/[^\/]+\/[^\/]+\//', '/***/', $url) // Скрываем токен в логах
-            ]);
-            return false;
-        }
+            if ($httpCode !== 200) {
+                // Проверяем, является ли это ошибкой "Not found"
+                $isNotFound = false;
+                if ($result && isset($result['error_description'])) {
+                    $errorDesc = strtolower($result['error_description']);
+                    $isNotFound = (
+                        str_contains($errorDesc, 'not found') ||
+                        str_contains($errorDesc, 'не найден') ||
+                        ($result['error'] === '' && str_contains($errorDesc, 'not found'))
+                    );
+                }
+                
+                $this->logger->error('API call returned non-200 status code', [
+                    'method' => $method,
+                    'http_code' => $httpCode,
+                    'url' => preg_replace('/\/[^\/]+\/[^\/]+\//', '/***/', $url), // Скрываем токен в логах
+                    'response' => $response,
+                    'is_not_found' => $isNotFound
+                ]);
+                
+                // Возвращаем специальное значение для "Not found"
+                if ($isNotFound) {
+                    return ['error' => 'NOT_FOUND', 'http_code' => $httpCode];
+                }
+                
+                return false;
+            }
 
-        $result = json_decode($response, true);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                $this->logger->error('Invalid JSON response from API', [
+                    'method' => $method,
+                    'response' => $response,
+                    'json_error' => json_last_error_msg()
+                ]);
+                return false;
+            }
 
-        if ($httpCode !== 200) {
-            // Проверяем, является ли это ошибкой "Not found"
-            $isNotFound = false;
-            if ($result && isset($result['error_description'])) {
-                $errorDesc = strtolower($result['error_description']);
+            if (isset($result['error'])) {
+                // Проверяем, является ли это ошибкой "Not found"
+                $errorDesc = strtolower($result['error_description'] ?? '');
                 $isNotFound = (
                     str_contains($errorDesc, 'not found') ||
                     str_contains($errorDesc, 'не найден') ||
-                    ($result['error'] === '' && str_contains($errorDesc, 'not found'))
+                    ($result['error'] === 'NOT_FOUND')
                 );
+
+                if ($isNotFound) {
+                    $this->logger->debug('Entity not found (returned as error)', [
+                        'method' => $method,
+                        'error' => $result['error'],
+                        'description' => $result['error_description'] ?? ''
+                    ]);
+                    return ['error' => 'NOT_FOUND', 'http_code' => $httpCode];
+                }
+
+                $this->logger->error('API returned error', [
+                    'method' => $method,
+                    'error' => $result['error'],
+                    'description' => $result['error_description'] ?? ''
+                ]);
+                return false;
             }
-            
-            $this->logger->error('API call returned non-200 status code', [
+
+            $this->logger->debug('API call successful', [
                 'method' => $method,
-                'http_code' => $httpCode,
-                'url' => preg_replace('/\/[^\/]+\/[^\/]+\//', '/***/', $url), // Скрываем токен в логах
-                'response' => $response,
-                'is_not_found' => $isNotFound
+                'result_count' => isset($result['result']) && is_array($result['result']) ? count($result['result']) : (isset($result['result']) ? 1 : 0)
             ]);
-            
-            // Возвращаем специальное значение для "Not found"
-            if ($isNotFound) {
-                return ['error' => 'NOT_FOUND', 'http_code' => $httpCode];
-            }
-            
-            return false;
+
+            return $result;
         }
 
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            $this->logger->error('Invalid JSON response from API', [
-                'method' => $method,
-                'response' => $response,
-                'json_error' => json_last_error_msg()
-            ]);
-            return false;
-        }
-
-        if (isset($result['error'])) {
-            // Проверяем, является ли это ошибкой "Not found"
-            $errorDesc = strtolower($result['error_description'] ?? '');
-            $isNotFound = (
-                str_contains($errorDesc, 'not found') ||
-                str_contains($errorDesc, 'не найден') ||
-                ($result['error'] === '' && str_contains($errorDesc, 'not found'))
-            );
-            
-            $this->logger->error('API returned error', [
-                'method' => $method,
-                'error' => $result['error'],
-                'error_description' => $result['error_description'] ?? '',
-                'is_not_found' => $isNotFound
-            ]);
-            
-            // Возвращаем специальное значение для "Not found"
-            if ($isNotFound) {
-                return ['error' => 'NOT_FOUND', 'http_code' => $httpCode];
-            }
-            
-            return false;
-        }
-
-        $this->logger->debug('API call successful', [
-            'method' => $method,
-            'result_count' => isset($result['result']) && is_array($result['result']) ? count($result['result']) : (isset($result['result']) ? 1 : 0)
-        ]);
-
-        return $result;
+        return false;
     }
 
     /**
