@@ -1441,7 +1441,7 @@ function createChangeDataCard($contactId, $additionalData, $bitrixAPI, $localSto
         'contact_id' => $contactId,
         'has_personal_changes' => !empty($additionalData['new_email']) || !empty($additionalData['new_phone']),
         'has_company_changes' => !empty($additionalData['new_company_name']) || !empty($additionalData['new_company_inn']),
-        'note' => 'company_id and manager_id will be retrieved from LK database'
+        'note' => 'company_id will be retrieved from LK database, manager_id from additionalData or LK database'
     ]);
 
     $result = $bitrixAPI->createChangeDataCard($contactId, $additionalData, $localStorage);

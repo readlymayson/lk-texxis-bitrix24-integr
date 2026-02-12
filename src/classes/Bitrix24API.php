@@ -451,7 +451,7 @@ class Bitrix24API
             $result = json_decode($response, true);
 
             // Обработка ошибок лимитов (503 или QUERY_LIMIT_EXCEEDED)
-            if ($httpCode === 503 || (isset($result['error']) && $result['error'] === 'QUERY_LIMIT_EXCEEDED')) {
+            if ($httpCode === 503 || (is_array($result) && isset($result['error']) && $result['error'] === 'QUERY_LIMIT_EXCEEDED')) {
                 if ($attempt < $maxRetries) {
                     $this->logger->warning('API limit exceeded, retrying...', [
                         'method' => $method,
@@ -472,15 +472,37 @@ class Bitrix24API
                 }
             }
 
+            // Проверка ошибок парсинга JSON должна быть до использования $result
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                $this->logger->error('Invalid JSON response from API', [
+                    'method' => $method,
+                    'http_code' => $httpCode,
+                    'response' => $response,
+                    'json_error' => json_last_error_msg()
+                ]);
+                // Если это была ошибка лимитов, но JSON не распарсился, все равно пробуем retry
+                if ($httpCode === 503 && $attempt < $maxRetries) {
+                    $this->logger->warning('API limit exceeded (invalid JSON), retrying...', [
+                        'method' => $method,
+                        'attempt' => $attempt,
+                        'next_retry_delay' => $retryDelay
+                    ]);
+                    sleep($retryDelay);
+                    $retryDelay *= 2;
+                    continue;
+                }
+                return false;
+            }
+
             if ($httpCode !== 200) {
                 // Проверяем, является ли это ошибкой "Not found"
                 $isNotFound = false;
-                if ($result && isset($result['error_description'])) {
+                if (is_array($result) && isset($result['error_description'])) {
                     $errorDesc = strtolower($result['error_description']);
                     $isNotFound = (
                         str_contains($errorDesc, 'not found') ||
                         str_contains($errorDesc, 'не найден') ||
-                        ($result['error'] === '' && str_contains($errorDesc, 'not found'))
+                        (isset($result['error']) && $result['error'] === '' && str_contains($errorDesc, 'not found'))
                     );
                 }
                 
@@ -500,16 +522,7 @@ class Bitrix24API
                 return false;
             }
 
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                $this->logger->error('Invalid JSON response from API', [
-                    'method' => $method,
-                    'response' => $response,
-                    'json_error' => json_last_error_msg()
-                ]);
-                return false;
-            }
-
-            if (isset($result['error'])) {
+            if (is_array($result) && isset($result['error'])) {
                 // Проверяем, является ли это ошибкой "Not found"
                 $errorDesc = strtolower($result['error_description'] ?? '');
                 $isNotFound = (
@@ -1543,35 +1556,35 @@ class Bitrix24API
     public function createChangeDataCard($contactId, $additionalData = [], $localStorage = null)
     {
         $smartProcessId = $this->config['bitrix24']['smart_process_change_data_id'] ?? '';
-        
+
         if (empty($smartProcessId)) {
             $this->logger->warning('Smart process ID for change data not configured');
             return false;
         }
 
         $mapping = $this->config['field_mapping']['smart_process_change_data'] ?? [];
-        
+
         if (empty($mapping)) {
             $this->logger->warning('Field mapping for change data smart process not configured');
             return false;
         }
 
         $fields = [];
-        
+
         // Обязательное поле - contact_id
         if (empty($contactId)) {
             $this->logger->error('Contact ID is required for creating change data card');
             return false;
         }
-        
+
         if (!empty($mapping['contact_id'])) {
             $fields[$mapping['contact_id']] = $contactId;
         }
-        
+
         // Получаем данные из локального хранилища, если передан LocalStorage
         if ($localStorage !== null) {
             $contact = $localStorage->getContact($contactId);
-            
+
             if ($contact) {
                 // Получаем company_id из контакта
                 if (!empty($contact['company']) && !empty($mapping['company_id'])) {
@@ -1581,9 +1594,9 @@ class Bitrix24API
                         'company_id' => $contact['company']
                     ]);
                 }
-                
-                // Получаем manager_id из контакта (локальное хранилище)
-                if (!empty($contact['manager_id']) && !empty($mapping['manager_id'])) {
+
+                // Получаем manager_id из контакта (локальное хранилище), только если не передан в additionalData
+                if (!isset($additionalData['manager_id']) && !empty($contact['manager_id']) && !empty($mapping['manager_id'])) {
                     $fields[$mapping['manager_id']] = $contact['manager_id'];
                     $this->logger->debug('Retrieved manager_id from local storage', [
                         'contact_id' => $contactId,
@@ -1628,6 +1641,10 @@ class Bitrix24API
         
         if (isset($additionalData['change_reason_company']) && !empty($mapping['change_reason_company'])) {
             $fields[$mapping['change_reason_company']] = $additionalData['change_reason_company'];
+        }
+
+        if (isset($additionalData['manager_id']) && !empty($mapping['manager_id'])) {
+            $fields[$mapping['manager_id']] = $additionalData['manager_id'];
         }
 
         $this->logger->debug('Prepared fields for change data card', [
