@@ -19,6 +19,7 @@ require_once __DIR__ . '/../classes/EnvLoader.php';
 require_once __DIR__ . '/../classes/Logger.php';
 require_once __DIR__ . '/../classes/Bitrix24API.php';
 require_once __DIR__ . '/../classes/LocalStorage.php';
+require_once __DIR__ . '/../classes/QueueManager.php';
 
 // Проверка доступности необходимых файлов
 $configFile = __DIR__ . '/../config/bitrix24.php';
@@ -51,6 +52,7 @@ try {
     $logger = new Logger($config);
     $bitrixAPI = new Bitrix24API($config, $logger);
     $localStorage = new LocalStorage($logger, $config);
+    $queueManager = new QueueManager($logger, $config);
 } catch (Exception $e) {
     error_log('ERROR: Failed to initialize classes: ' . $e->getMessage());
     http_response_code(500);
@@ -175,38 +177,33 @@ try {
         exit;
     }
 
-    $logger->info('=== STARTING EVENT PROCESSING ===', [
+    $logger->info('=== ADDING EVENT TO QUEUE ===', [
         'event_name' => $eventName,
         'event_type' => getWebhookEventType($eventName),
         'action' => getActionFromEvent($eventName),
         'entity_id' => $entityId,
-        'processing_start_time' => date('Y-m-d H:i:s')
+        'queue_time' => date('Y-m-d H:i:s')
     ]);
 
-    $result = processEventWithRetry($eventName, $webhookData, $config, $logger, $bitrixAPI, $localStorage);
+    // Добавляем событие в очередь вместо немедленной обработки
+    $taskId = $queueManager->push($webhookData);
 
-    $processingEndTime = date('Y-m-d H:i:s');
-    $processingDuration = time() - strtotime($webhookData['ts'] ?? 'now');
-
-    if ($result) {
-        $logger->debug('Event processing completed successfully', [
+    if ($taskId) {
+        $logger->info('Event successfully added to queue', [
             'event_name' => $eventName,
             'entity_id' => $entityId,
-            'processing_end_time' => $processingEndTime,
-            'processing_duration_seconds' => $processingDuration,
-            'result' => 'SUCCESS'
+            'task_id' => $taskId,
+            'result' => 'QUEUED'
         ]);
-        sendResponse(200, ['status' => 'success', 'event' => $eventName]);
+        sendResponse(200, ['status' => 'queued', 'event' => $eventName, 'task_id' => $taskId]);
     } else {
-        $logger->error('=== EVENT PROCESSING FAILED ===', [
+        $logger->error('=== FAILED TO ADD EVENT TO QUEUE ===', [
             'event_name' => $eventName,
             'event_type' => getWebhookEventType($eventName),
             'entity_id' => $entityId,
-            'processing_end_time' => $processingEndTime,
-            'processing_duration_seconds' => $processingDuration,
-            'result' => 'FAILED'
+            'result' => 'QUEUE_FAILED'
         ]);
-        sendResponse(500, ['error' => 'Processing failed', 'event' => $eventName]);
+        sendResponse(500, ['error' => 'Failed to queue event', 'event' => $eventName]);
     }
 
 } catch (Exception $e) {
@@ -220,58 +217,70 @@ try {
     sendResponse(500, ['error' => 'Internal server error']);
 }
 
+
 /**
- * Обработка события с механизмом повторных попыток
+ * Определение типа события webhook
  */
-function processEventWithRetry($eventName, $webhookData, $config, $logger, $bitrixAPI, $localStorage)
+function getWebhookEventType($eventName)
 {
-    $maxRetries = $config['events']['max_retries'];
-    $retryDelays = $config['events']['retry_delays'];
+    $eventTypes = [
+        'CONTACT' => 'contact',
+        'COMPANY' => 'company',
+        'DYNAMIC_ITEM' => 'smart_process'
+    ];
 
-    for ($attempt = 0; $attempt <= $maxRetries; $attempt++) {
-        try {
-            $logger->debug('Processing event attempt', [
-                'event' => $eventName,
-                'attempt' => $attempt + 1,
-                'max_attempts' => $maxRetries + 1
-            ]);
-
-            $result = processEvent($eventName, $webhookData, $bitrixAPI, $localStorage, $logger, $config);
-
-            if ($result) {
-                return true;
-            }
-
-            // Если это не последняя попытка, логируем задержку
-            // Повторные попытки должны обрабатываться внешней системой (очередь, cron)
-            // sleep() не используется, чтобы не блокировать webhook
-            if ($attempt < $maxRetries) {
-                $delay = $retryDelays[$attempt] ?? end($retryDelays);
-                $logger->warning('Event processing failed, retry recommended', [
-                    'attempt' => $attempt + 1,
-                    'max_attempts' => $maxRetries + 1,
-                    'recommended_delay' => $delay,
-                    'event' => $eventName,
-                    'note' => 'Retries should be handled by external queue system'
-                ]);
-            }
-
-        } catch (Exception $e) {
-            $logger->error('Exception during event processing', [
-                'event' => $eventName,
-                'attempt' => $attempt + 1,
-                'error' => $e->getMessage()
-            ]);
-
-            break;
+    foreach ($eventTypes as $type => $entity) {
+        if (str_contains($eventName, $type)) {
+            return $entity;
         }
     }
 
-    return false;
+    return 'unknown';
 }
 
 /**
- * Извлечение ID контакта из значения (может быть строкой или массивом)
+ * Определение действия из названия события
+ */
+function getActionFromEvent($eventName)
+{
+    $actions = [
+        'ADD' => 'create',
+        'UPDATE' => 'update',
+        'DELETE' => 'delete'
+    ];
+
+    foreach ($actions as $suffix => $action) {
+        if (str_ends_with($eventName, $suffix)) {
+            return $action;
+        }
+    }
+
+    return 'unknown';
+}
+
+/**
+ * Получение заголовков запроса
+ */
+function getRequestHeaders()
+{
+    $headers = [];
+
+    foreach ($_SERVER as $key => $value) {
+        if (str_starts_with($key, 'HTTP_')) {
+            $headerName = str_replace('HTTP_', '', $key);
+            $headerName = str_replace('_', '-', $headerName);
+            $headers[strtolower($headerName)] = $value;
+        } elseif (in_array($key, ['CONTENT_TYPE', 'CONTENT_LENGTH', 'USER_AGENT'])) {
+            $headerName = str_replace('_', '-', $key);
+            $headers[strtolower($headerName)] = $value;
+        }
+    }
+
+    return $headers;
+}
+
+/**
+ * Отправка HTTP ответа
  */
 function extractContactId($rawValue)
 {
@@ -1122,67 +1131,6 @@ function handleDelete($entityType, $entityData, $localStorage, $logger)
     }
 
     return true;
-}
-
-/**
- * Определение типа события webhook
- */
-function getWebhookEventType($eventName)
-{
-    $eventTypes = [
-        'CONTACT' => 'contact',
-        'COMPANY' => 'company',
-        'DYNAMIC_ITEM' => 'smart_process'
-    ];
-
-    foreach ($eventTypes as $type => $entity) {
-        if (str_contains($eventName, $type)) {
-            return $entity;
-        }
-    }
-
-    return 'unknown';
-}
-
-/**
- * Определение действия из названия события
- */
-function getActionFromEvent($eventName)
-{
-    $actions = [
-        'ADD' => 'create',
-        'UPDATE' => 'update',
-        'DELETE' => 'delete'
-    ];
-
-    foreach ($actions as $suffix => $action) {
-        if (str_ends_with($eventName, $suffix)) {
-            return $action;
-        }
-    }
-
-    return 'unknown';
-}
-
-/**
- * Получение заголовков запроса
- */
-function getRequestHeaders()
-{
-    $headers = [];
-
-    foreach ($_SERVER as $key => $value) {
-        if (str_starts_with($key, 'HTTP_')) {
-            $headerName = str_replace('HTTP_', '', $key);
-            $headerName = str_replace('_', '-', $headerName);
-            $headers[strtolower($headerName)] = $value;
-        } elseif (in_array($key, ['CONTENT_TYPE', 'CONTENT_LENGTH', 'USER_AGENT'])) {
-            $headerName = str_replace('_', '-', $key);
-            $headers[strtolower($headerName)] = $value;
-        }
-    }
-
-    return $headers;
 }
 
 /**
