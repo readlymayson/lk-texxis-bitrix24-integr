@@ -5,6 +5,10 @@ src/logs/
 
 # Данные приложения
 src/data/
+!src/data/.gitkeep
+
+# Очередь вебхуков (динамические данные)
+src/data/webhook_queue.json
 
 # Файлы окружения
 .env
@@ -41,6 +45,7 @@ Thumbs.db
 *.rar
 *.7z
 *.bak
+backup_*.tar.gz
 
 # Сессии PHP
 session.save_path/
@@ -49,12 +54,13 @@ session.save_path/
 cache/
 tmp/
 
+# PID файлы воркеров
+src/data/worker.pid
+
 # Документация (если генерируется автоматически)
 docs/generated/
 
 # Тестовые файлы
 test-*.php
 test-webhook.json
-
-# Скрипты
-src/scripts/
+src/scripts/tests/
