@@ -28,6 +28,10 @@ return [
         'companies_file' => __DIR__ . '/../data/companies.json',
         'projects_file' => __DIR__ . '/../data/projects.json',
         'managers_file' => __DIR__ . '/../data/managers.json',
+        'b24list_file' => __DIR__ . '/../data/b24list.json',
+        // Настройки Highload-блоков для интеграции
+        'company_hl_entity_id' => 2, // ID HL-блока для компаний
+        'project_hl_entity_id' => 3, // ID HL-блока для проектов
     ],
 
     // Настройки логирования
@@ -41,9 +45,9 @@ return [
     // Маппинг полей Битрикс24 -> ЛК
     'field_mapping' => [
         'contact' => [
-            'lk_client_field' => 'UF_CRM_1770886298278', // Поле "ЛК клиента" в контакте
-            'lk_client_values' => [120], // Допустимые значения поля "ЛК клиента"
-            'lk_delete_values' => [118], // Значения поля ЛК, при которых удаляются данные из БД
+            'lk_client_field' => 'UF_CRM_1763468430', // Поле "ЛК клиента" в контакте
+            'lk_client_values' => [3118,3120,3122], // Допустимые значения поля "ЛК клиента"
+            'lk_delete_values' => [3116,3294], // Значения поля ЛК, при которых удаляются данные из БД
             'email' => 'EMAIL',
             'phone' => 'PHONE',
             'name' => 'NAME',
@@ -53,7 +57,7 @@ return [
             'company_id' => 'COMPANY_ID',
             'manager_id' => 'ASSIGNED_BY_ID',
             'organization' => 'COMPANY_ID', // Организация (п.3.2) - связь с компанией, название берется из связанной компании
-            'agent_contract_status' => '', // Статус "Агентский договор" (п.3.6) - список с заданными значениями
+            'agent_contract_status' => 'UF_CRM_65CA1E9F08E72', // Статус "Агентский договор" (п.3.6) - список с заданными значениями
         ],
         'company' => [
             'title' => 'TITLE',
@@ -61,7 +65,7 @@ return [
             'phone' => 'PHONE',
             'contact_id' => 'CONTACT_ID',
             'website' => 'WEB', // Сайт компании
-            'partner_contract_status' => '', // Статус "Партнерский договор" (п.3.7) - список с заданными значениями
+            'partner_contract_status' => 'UF_CRM_65CA23468EF2E', // Статус "Партнерский договор" (п.3.7) - список с заданными значениями
         ],
         // Маппинг полей проектов (смарт-процессов)
         'smart_process' => [
@@ -118,12 +122,16 @@ return [
     // Настройки обработки событий
     'events' => [
         'enabled_events' => [
+            'ONCRMCONTACTADD',    // Изменение контакта
             'ONCRMCONTACTUPDATE',    // Изменение контакта
             'ONCRMCONTACTDELETE',    // Удаление контакта
+            'ONCRMCOMPANYADD',       // Создание компании
             'ONCRMCOMPANYUPDATE',    // Изменение компании
             'ONCRMCOMPANYDELETE',    // Удаление компании
+            'ONCRM_DYNAMIC_ITEM_ADD', // Изменение смарт-процесса
             'ONCRM_DYNAMIC_ITEM_UPDATE', // Изменение смарт-процесса
             'ONCRM_DYNAMIC_ITEM_DELETE', // Удаление смарт-процесса
+            'ONCRMDYNAMICITEMADD', // Изменение смарт-процесса (альтернатива ONCRM_DYNAMIC_ITEM_UPDATE)
             'ONCRMDYNAMICITEMUPDATE', // Изменение смарт-процесса (альтернатива ONCRM_DYNAMIC_ITEM_UPDATE)
             'ONCRMDYNAMICITEMDELETE', // Удаление смарт-процесса (альтернатива ONCRM_DYNAMIC_ITEM_DELETE)
         ],
@@ -144,3 +152,4 @@ return [
         'pid_file' => __DIR__ . '/../data/worker.pid', // Путь к PID файлу воркера
     ],
 ];
+

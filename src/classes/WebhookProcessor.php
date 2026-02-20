@@ -278,6 +278,74 @@ class WebhookProcessor
     }
 
     /**
+     * Синхронизация компании для контакта
+     */
+    private function syncCompanyForContact($contactId, $companyId)
+    {
+        if (empty($companyId)) {
+            return false;
+        }
+
+        $this->logger->debug('Checking if company exists in local storage', [
+            'contact_id' => $contactId,
+            'company_id' => $companyId
+        ]);
+
+        $existingCompany = $this->localStorage->getCompany($companyId);
+        if ($existingCompany) {
+            $this->logger->debug('Company already exists in local storage, skipping sync', [
+                'contact_id' => $contactId,
+                'company_id' => $companyId
+            ]);
+            return true;
+        }
+
+        $this->logger->debug('Company not found in local storage, fetching from Bitrix24 API', [
+            'contact_id' => $contactId,
+            'company_id' => $companyId
+        ]);
+
+        $companyData = $this->bitrixAPI->getEntityData('company', $companyId);
+        if ($companyData && isset($companyData['result'])) {
+            $companyDataResult = $companyData['result'];
+            if (is_array($companyDataResult) && isset($companyDataResult[0])) {
+                $companyDataResult = $companyDataResult[0];
+            }
+
+            // Получаем ИНН компании из реквизитов
+            $companyInn = $this->bitrixAPI->getCompanyINN($companyId);
+            if ($companyInn !== null) {
+                $this->logger->debug('Company INN obtained from requisites', [
+                    'company_id' => $companyId,
+                    'inn' => $companyInn
+                ]);
+            }
+
+            $syncResult = $this->localStorage->syncCompanyByBitrixId($companyId, $companyDataResult, $companyInn);
+            if ($syncResult) {
+                $this->logger->info('Company synced successfully for contact update', [
+                    'contact_id' => $contactId,
+                    'company_id' => $companyId,
+                    'company_title' => $companyDataResult['TITLE'] ?? 'N/A'
+                ]);
+                return true;
+            } else {
+                $this->logger->error('Failed to sync company for contact', [
+                    'contact_id' => $contactId,
+                    'company_id' => $companyId
+                ]);
+                return false;
+            }
+        } else {
+            $this->logger->warning('Failed to fetch company data from Bitrix24 API', [
+                'contact_id' => $contactId,
+                'company_id' => $companyId
+            ]);
+            return false;
+        }
+    }
+
+    /**
      * Проверка допустимого значения поля ЛК клиента
      */
     private function isValidLKClientValue($entityType, $entityData)
@@ -662,6 +730,17 @@ class WebhookProcessor
                         'has_field' => isset($contactData[$managerField])
                     ]);
                     $this->syncManagerForContact($contactId, $assignedById);
+
+                    // Проверяем изменение компании и синхронизируем новую компанию при необходимости
+                    $companyField = $this->config['field_mapping']['contact']['company_id'] ?? 'COMPANY_ID';
+                    $newCompanyId = $contactData[$companyField] ?? null;
+                    if ($newCompanyId) {
+                        $this->logger->debug('Checking if company needs to be synced for updated contact', [
+                            'contact_id' => $contactId,
+                            'new_company_id' => $newCompanyId
+                        ]);
+                        $this->syncCompanyForContact($contactId, $newCompanyId);
+                    }
                 }
 
                 return $result;
@@ -904,7 +983,11 @@ class WebhookProcessor
                 break;
 
             case 'company':
-                $this->logger->info('Company deleted', ['company_id' => $entityData['ID'] ?? 'unknown']);
+                $companyId = $entityData['ID'] ?? null;
+                $this->logger->info('Company deleted', ['company_id' => $companyId ?? 'unknown']);
+                if ($companyId) {
+                    $this->localStorage->deleteCompany($companyId);
+                }
                 break;
 
             case 'smart_process':
@@ -947,6 +1030,61 @@ class WebhookProcessor
         $this->logger->info('Checking for related companies for contact', ['contact_id' => $contactId]);
 
         try {
+            // Проверяем COMPANY_ID самого контакта и синхронизируем эту компанию
+            $contactData = $this->localStorage->getContact($contactId);
+            if ($contactData && isset($contactData['company']) && !empty($contactData['company'])) {
+                $contactCompanyId = $contactData['company'];
+                $this->logger->info('Contact has COMPANY_ID, syncing primary company', [
+                    'contact_id' => $contactId,
+                    'company_id' => $contactCompanyId
+                ]);
+
+                try {
+                    // Получаем данные компании из Bitrix24
+                    $companyDataFromAPI = $this->bitrixAPI->getEntityData('company', $contactCompanyId);
+
+                    if ($companyDataFromAPI && isset($companyDataFromAPI['result'])) {
+                        $companyDataResult = $companyDataFromAPI['result'];
+
+                        // Получаем ИНН компании из реквизитов
+                        $companyInn = $this->bitrixAPI->getCompanyINN($contactCompanyId);
+                        if ($companyInn !== null) {
+                            $this->logger->debug('Company INN obtained from requisites for contact company', [
+                                'company_id' => $contactCompanyId,
+                                'inn' => $companyInn
+                            ]);
+                        }
+
+                        // Синхронизируем компанию
+                        $syncResult = $this->localStorage->syncCompanyByBitrixId($contactCompanyId, $companyDataResult, $companyInn);
+
+                        if (!$syncResult) {
+                            $this->logger->error('Failed to sync contact primary company', [
+                                'contact_id' => $contactId,
+                                'company_id' => $contactCompanyId
+                            ]);
+                        } else {
+                            $this->logger->info('Successfully synced contact primary company', [
+                                'contact_id' => $contactId,
+                                'company_id' => $contactCompanyId,
+                                'company_title' => $companyDataResult['TITLE'] ?? 'N/A'
+                            ]);
+                        }
+                    } else {
+                        $this->logger->error('Failed to get contact primary company data from Bitrix24 API', [
+                            'contact_id' => $contactId,
+                            'company_id' => $contactCompanyId
+                        ]);
+                    }
+                } catch (Exception $e) {
+                    $this->logger->error('Exception during contact primary company sync', [
+                        'contact_id' => $contactId,
+                        'company_id' => $contactCompanyId,
+                        'error' => $e->getMessage()
+                    ]);
+                }
+            }
+
             // Ищем компании, где текущий контакт указан как CONTACT_ID
             $companies = $this->bitrixAPI->getEntityList('company', ['CONTACT_ID' => $contactId]);
 
@@ -1172,5 +1310,77 @@ class WebhookProcessor
                 'error' => $e->getMessage()
             ]);
         }
+    }
+
+    /**
+     * Создание карточки в смарт-процессе "Изменение данных в ЛК"
+     *
+     * @param string|int $contactId ID контакта (обязательно)
+     * @param array $additionalData Дополнительные данные (new_email, new_phone, и т.д.)
+     * @return array|false Результат создания или false при ошибке
+     */
+    public function createChangeDataCard($contactId, $additionalData)
+    {
+        if (empty($contactId)) {
+            $this->logger->error('Contact ID is required for creating change data card');
+            return false;
+        }
+
+        $this->logger->info('Creating change data card in smart process', [
+            'contact_id' => $contactId,
+            'has_personal_changes' => !empty($additionalData['new_email']) || !empty($additionalData['new_phone']),
+            'has_company_changes' => !empty($additionalData['new_company_name']) || !empty($additionalData['new_company_inn']),
+            'note' => 'company_id will be retrieved from LK database, manager_id from additionalData or LK database'
+        ]);
+
+        $result = $this->bitrixAPI->createChangeDataCard($contactId, $additionalData, $this->localStorage);
+
+        if ($result) {
+            $this->logger->info('Change data card created successfully', [
+                'contact_id' => $contactId,
+                'card_id' => $result['id'] ?? 'unknown'
+            ]);
+        } else {
+            $this->logger->error('Failed to create change data card', [
+                'contact_id' => $contactId
+            ]);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Создание карточки в смарт-процессе "Удаление пользовательских данных"
+     *
+     * @param string|int $contactId ID контакта (обязательно)
+     * @return array|false Результат создания или false при ошибке
+     */
+    public function createDeleteDataCard($contactId)
+    {
+        if (empty($contactId)) {
+            $this->logger->error('Contact ID is required for creating delete data card');
+            return false;
+        }
+
+        $this->logger->info('Creating delete data card in smart process', [
+            'contact_id' => $contactId,
+            'note' => 'company_id and manager_id will be retrieved from LK database',
+            'local_storage_provided' => $this->localStorage !== null
+        ]);
+
+        $result = $this->bitrixAPI->createDeleteDataCard($contactId, $this->localStorage);
+
+        if ($result) {
+            $this->logger->info('Delete data card created successfully', [
+                'contact_id' => $contactId,
+                'card_id' => $result['id'] ?? 'unknown'
+            ]);
+        } else {
+            $this->logger->error('Failed to create delete data card', [
+                'contact_id' => $contactId
+            ]);
+        }
+
+        return $result;
     }
 }

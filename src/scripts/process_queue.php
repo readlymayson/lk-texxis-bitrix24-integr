@@ -34,6 +34,7 @@ if (empty($config)) {
 try {
     $logger = new Logger($config);
     $bitrixAPI = new Bitrix24API($config, $logger);
+    $config['reconnect']=true;
     $localStorage = new LocalStorage($logger, $config);
     $queueManager = new QueueManager($logger, $config);
     $processor = new WebhookProcessor($bitrixAPI, $localStorage, $logger, $config);
@@ -66,11 +67,12 @@ function checkAndSetPidFile($logger)
     // Записываем текущий PID
     $currentPid = getmypid();
     if (file_put_contents($pidFile, $currentPid) === false) {
-        $logger->error('Failed to write PID file');
-        return false;
+        $logger->warning('Failed to write PID file - worker will continue without PID file protection');
+        // Продолжаем работу без PID файла, но выводим предупреждение
+    } else {
+        $logger->info('Worker PID file created', ['pid' => $currentPid]);
     }
 
-    $logger->info('Worker PID file created', ['pid' => $currentPid]);
     return true;
 }
 

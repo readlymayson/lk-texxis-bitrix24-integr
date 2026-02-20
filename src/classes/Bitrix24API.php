@@ -1422,6 +1422,40 @@ class Bitrix24API
                         'company_id' => $companyId
                     ]);
                 }
+            } else {
+                $this->logger->warning('Contact not found in local storage for project card, will try to get data from Bitrix24 API', [
+                    'contact_id' => $contactId
+                ]);
+
+                // Если контакт не найден в локальном хранилище, получаем данные из Bitrix24 API
+                $contactData = $this->getEntityData('contact', $contactId);
+
+                if ($contactData && isset($contactData['result'])) {
+                    $contactInfo = $contactData['result'];
+
+                    // Получаем manager_id из данных Bitrix24
+                    if (!empty($contactInfo['ASSIGNED_BY_ID'])) {
+                        $managerId = $contactInfo['ASSIGNED_BY_ID'];
+                        $this->logger->debug('Manager ID retrieved from Bitrix24 API', [
+                            'contact_id' => $contactId,
+                            'manager_id' => $managerId
+                        ]);
+                    }
+
+                    // Получаем company_id из данных Bitrix24
+                    if (!empty($contactInfo['COMPANY_ID'])) {
+                        $companyId = $contactInfo['COMPANY_ID'];
+                        $this->logger->debug('Company ID retrieved from Bitrix24 API', [
+                            'contact_id' => $contactId,
+                            'company_id' => $companyId
+                        ]);
+                    }
+                } else {
+                    $this->logger->warning('Failed to get contact data from Bitrix24 API for project card', [
+                        'contact_id' => $contactId,
+                        'api_result' => $contactData
+                    ]);
+                }
             }
         }
 
@@ -1604,9 +1638,39 @@ class Bitrix24API
                     ]);
                 }
             } else {
-                $this->logger->warning('Contact not found in local storage', [
+                $this->logger->warning('Contact not found in local storage, will try to get manager from Bitrix24 API', [
                     'contact_id' => $contactId
                 ]);
+
+                // Если контакт не найден в локальном хранилище, получаем данные из Bitrix24 API
+                $contactData = $this->getEntityData('contact', $contactId);
+
+                if ($contactData && isset($contactData['result'])) {
+                    $contactInfo = $contactData['result'];
+
+                    // Получаем company_id из данных Bitrix24
+                    if (!empty($contactInfo['COMPANY_ID']) && !empty($mapping['company_id'])) {
+                        $fields[$mapping['company_id']] = $contactInfo['COMPANY_ID'];
+                        $this->logger->debug('Retrieved company_id from Bitrix24 API', [
+                            'contact_id' => $contactId,
+                            'company_id' => $contactInfo['COMPANY_ID']
+                        ]);
+                    }
+
+                    // Получаем manager_id из данных Bitrix24, только если не передан в additionalData
+                    if (!isset($additionalData['manager_id']) && !empty($contactInfo['ASSIGNED_BY_ID']) && !empty($mapping['manager_id'])) {
+                        $fields[$mapping['manager_id']] = $contactInfo['ASSIGNED_BY_ID'];
+                        $this->logger->debug('Retrieved manager_id from Bitrix24 API', [
+                            'contact_id' => $contactId,
+                            'manager_id' => $contactInfo['ASSIGNED_BY_ID']
+                        ]);
+                    }
+                } else {
+                    $this->logger->warning('Failed to get contact data from Bitrix24 API', [
+                        'contact_id' => $contactId,
+                        'api_result' => $contactData
+                    ]);
+                }
             }
         }
 
@@ -1691,10 +1755,23 @@ class Bitrix24API
             $fields[$mapping['contact_id']] = $contactId;
         }
         
-        // Получаем данные из локального хранилища, если передан LocalStorage
+        // Всегда пытаемся получить данные менеджера, даже если localStorage не передан
+        $managerRetrieved = false;
+
+        // Сначала пробуем получить данные из локального хранилища, если оно передано
         if ($localStorage !== null) {
+            $this->logger->debug('LocalStorage provided for delete data card', [
+                'contact_id' => $contactId,
+                'local_storage_type' => get_class($localStorage)
+            ]);
+
             $contact = $localStorage->getContact($contactId);
-            
+            $this->logger->debug('Contact lookup result in local storage', [
+                'contact_id' => $contactId,
+                'contact_found' => $contact !== null,
+                'contact_data' => $contact ? array_keys($contact) : null
+            ]);
+
             if ($contact) {
                 // Получаем company_id из контакта
                 if (!empty($contact['company']) && !empty($mapping['company_id'])) {
@@ -1704,20 +1781,82 @@ class Bitrix24API
                         'company_id' => $contact['company']
                     ]);
                 }
-                
+
                 // Получаем manager_id из контакта (локальное хранилище)
+                $this->logger->debug('Checking manager_id in local storage contact', [
+                    'contact_id' => $contactId,
+                    'has_manager_id' => isset($contact['manager_id']),
+                    'manager_id_value' => $contact['manager_id'] ?? null,
+                    'mapping_has_manager_id' => !empty($mapping['manager_id'])
+                ]);
+
                 if (!empty($contact['manager_id']) && !empty($mapping['manager_id'])) {
                     $fields[$mapping['manager_id']] = $contact['manager_id'];
                     $this->logger->debug('Retrieved manager_id from local storage', [
                         'contact_id' => $contactId,
                         'manager_id' => $contact['manager_id']
                     ]);
+                    $managerRetrieved = true;
+                }
+            }
+        }
+
+        // Если manager_id не получен из localStorage (или localStorage не передано), получаем из Bitrix24 API
+        if (!$managerRetrieved && !empty($mapping['manager_id'])) {
+            $this->logger->debug('Retrieving manager_id from Bitrix24 API', [
+                'contact_id' => $contactId,
+                'reason' => $localStorage === null ? 'no_local_storage' : 'not_found_in_local_storage'
+            ]);
+
+            $contactData = $this->getEntityData('contact', $contactId);
+
+            if ($contactData && isset($contactData['result'])) {
+                $contactInfo = $contactData['result'];
+
+                $this->logger->debug('Contact info from Bitrix24 API', [
+                    'contact_id' => $contactId,
+                    'has_company_id' => isset($contactInfo['COMPANY_ID']),
+                    'company_id_value' => $contactInfo['COMPANY_ID'] ?? null,
+                    'has_assigned_by_id' => isset($contactInfo['ASSIGNED_BY_ID']),
+                    'assigned_by_id_value' => $contactInfo['ASSIGNED_BY_ID'] ?? null
+                ]);
+
+                // Получаем company_id из данных Bitrix24
+                if (!empty($contactInfo['COMPANY_ID']) && !empty($mapping['company_id'])) {
+                    $fields[$mapping['company_id']] = $contactInfo['COMPANY_ID'];
+                    $this->logger->debug('Retrieved company_id from Bitrix24 API', [
+                        'contact_id' => $contactId,
+                        'company_id' => $contactInfo['COMPANY_ID']
+                    ]);
+                }
+
+                // Получаем manager_id из данных Bitrix24
+                if (!empty($contactInfo['ASSIGNED_BY_ID'])) {
+                    $fields[$mapping['manager_id']] = $contactInfo['ASSIGNED_BY_ID'];
+                    $this->logger->debug('Retrieved manager_id from Bitrix24 API', [
+                        'contact_id' => $contactId,
+                        'manager_id' => $contactInfo['ASSIGNED_BY_ID']
+                    ]);
+                    $managerRetrieved = true;
+                } else {
+                    $this->logger->warning('ASSIGNED_BY_ID not available in Bitrix24 API', [
+                        'contact_id' => $contactId,
+                        'contact_info_keys' => array_keys($contactInfo)
+                    ]);
                 }
             } else {
-                $this->logger->warning('Contact not found in local storage', [
-                    'contact_id' => $contactId
+                $this->logger->warning('Failed to get contact data from Bitrix24 API', [
+                    'contact_id' => $contactId,
+                    'api_result' => $contactData
                 ]);
             }
+        }
+
+        if (!$managerRetrieved && !empty($mapping['manager_id'])) {
+            $this->logger->warning('Manager_id could not be retrieved from any source', [
+                'contact_id' => $contactId,
+                'local_storage_provided' => $localStorage !== null
+            ]);
         }
 
         $this->logger->debug('Prepared fields for delete data card', [
