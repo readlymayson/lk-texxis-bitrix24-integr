@@ -92,12 +92,10 @@ class Bitrix24API
                 $jsonData = json_decode($body, true);
                 if (json_last_error() === JSON_ERROR_NONE && is_array($jsonData) && !empty($jsonData)) {
                     $data = $jsonData;
-                    $this->logger->debug('Auto-detected JSON format');
                 } else {
                     parse_str($body, $urlData);
                     if (!empty($urlData)) {
                         $data = $urlData;
-                        $this->logger->debug('Auto-detected URL-encoded format');
                     } else {
                         $this->logger->error('Failed to auto-detect webhook body format', [
                             'body_preview' => substr($body, 0, 500),
@@ -164,14 +162,6 @@ class Bitrix24API
                 return false;
             }
 
-            $this->logger->debug('Webhook request validated successfully', [
-                'content_type' => $contentType,
-                'format' => str_contains($contentTypeBase, 'json') ? 'json' : 'url-encoded',
-                'data_keys' => array_keys($data),
-                'event' => $data['event'] ?? 'UNKNOWN',
-                'application_token_valid' => !empty($expectedToken) ? ($receivedToken === $expectedToken ? 'valid' : 'invalid') : 'not_configured',
-                'user_agent_valid' => $isValidUserAgent
-            ]);
             return $data;
 
         } catch (Exception $e) {
@@ -215,19 +205,12 @@ class Bitrix24API
 
         if (!empty($selectFields)) {
             $params['select'] = $selectFields;
-            $this->logger->debug('Using mapped fields for entity data retrieval', [
-                'entity_type' => $entityType,
-                'select_fields' => $selectFields
-            ]);
         }
 
         $result = $this->makeApiCall($method, $params);
 
         if ($result && isset($result['result'])) {
-            $this->logger->debug('Successfully retrieved entity data from Bitrix24 API', [
-                'entity_type' => $entityType,
-                'entity_id' => $entityId
-            ]);
+            // Entity data retrieved successfully
         } else {
             $this->logger->warning('Failed to retrieve entity data from Bitrix24 API', [
                 'entity_type' => $entityType,
@@ -321,15 +304,8 @@ class Bitrix24API
             ]);
             
             if (is_array($contacts) && !empty($contacts)) {
-                $this->logger->debug('Successfully retrieved company contacts', [
-                    'company_id' => $companyId,
-                    'contacts_count' => count($contacts)
-                ]);
                 return $contacts;
             } else {
-                $this->logger->debug('Company contacts list is empty', [
-                    'company_id' => $companyId
-                ]);
                 return [];
             }
         } else {
@@ -548,11 +524,6 @@ class Bitrix24API
                 return false;
             }
 
-            $this->logger->debug('API call successful', [
-                'method' => $method,
-                'result_count' => isset($result['result']) && is_array($result['result']) ? count($result['result']) : (isset($result['result']) ? 1 : 0)
-            ]);
-
             return $result;
         }
 
@@ -607,10 +578,7 @@ class Bitrix24API
         $result = $this->makeApiCall('bizproc.workflow.start', $params);
 
         if ($result && isset($result['result'])) {
-            $this->logger->debug('Email business process started successfully', [
-            'contact_id' => $contactId,
-                'workflow_id' => $result['result'] ?? 'unknown'
-            ]);
+            // Email business process started successfully
         } else {
             $this->logger->warning('Failed to start email business process', [
                 'contact_id' => $contactId,
@@ -744,12 +712,6 @@ class Bitrix24API
         }
 
         $fields = array_values(array_unique($fields));
-
-        $this->logger->debug('Extracted mapped fields for entity', [
-            'entity_type' => $entityType,
-            'mapped_fields' => $fields,
-            'mapping_keys' => array_keys($mapping)
-        ]);
 
         return $fields;
     }

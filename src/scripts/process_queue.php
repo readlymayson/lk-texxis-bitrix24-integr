@@ -97,11 +97,6 @@ function processQueue($queueManager, $processor, $logger, $config)
     $batchSize = $config['queue']['batch_size'] ?? 10;
     $maxAttempts = $config['queue']['max_attempts'] ?? 3;
 
-    $logger->info('Starting queue processing', [
-        'batch_size' => $batchSize,
-        'max_attempts' => $maxAttempts
-    ]);
-
     $processedCount = 0;
     $failedCount = 0;
     $skippedCount = 0;
@@ -110,7 +105,6 @@ function processQueue($queueManager, $processor, $logger, $config)
     $tasks = $queueManager->popBatch($batchSize);
 
     if (empty($tasks)) {
-        $logger->debug('No pending tasks found');
         return ['processed' => 0, 'failed' => 0, 'skipped' => 0];
     }
 
@@ -119,17 +113,7 @@ function processQueue($queueManager, $processor, $logger, $config)
     // Группируем задачи по entity_id для последовательной обработки
     $groupedTasks = $queueManager->groupByEntity($tasks);
 
-    $logger->info('Grouped tasks by entity', [
-        'entity_count' => count($groupedTasks),
-        'entities' => array_keys($groupedTasks)
-    ]);
-
     foreach ($groupedTasks as $entityId => $entityTasks) {
-        $logger->info('Processing entity tasks', [
-            'entity_id' => $entityId,
-            'task_count' => count($entityTasks)
-        ]);
-
         // Сортируем задачи по времени для гарантии порядка
         usort($entityTasks, function($a, $b) {
             return ($a['ts'] ?? 0) <=> ($b['ts'] ?? 0);
@@ -141,13 +125,6 @@ function processQueue($queueManager, $processor, $logger, $config)
             $webhookData = $task['data'];
             $attempts = $task['attempts'] ?? 0;
 
-            $logger->debug('Processing task', [
-                'task_id' => $taskId,
-                'entity_id' => $entityId,
-                'event' => $eventName,
-                'attempts' => $attempts
-            ]);
-
             try {
                 // Обрабатываем событие через WebhookProcessor
                 $result = $processor->processEvent($eventName, $webhookData);
@@ -156,11 +133,6 @@ function processQueue($queueManager, $processor, $logger, $config)
                     // Успешно обработано - удаляем из очереди
                     $queueManager->updateStatus($taskId, 'completed');
                     $processedCount++;
-                    $logger->info('Task processed successfully', [
-                        'task_id' => $taskId,
-                        'entity_id' => $entityId,
-                        'event' => $eventName
-                    ]);
                 } else {
                     // Обработка не удалась
                     $attempts++;
@@ -215,13 +187,6 @@ function processQueue($queueManager, $processor, $logger, $config)
     // Очищаем завершенные задачи из файла
     $cleanedCount = $queueManager->clearProcessed();
 
-    $logger->info('Queue processing completed', [
-        'processed' => $processedCount,
-        'failed' => $failedCount,
-        'skipped' => $skippedCount,
-        'cleaned' => $cleanedCount
-    ]);
-
     return [
         'processed' => $processedCount,
         'failed' => $failedCount,
@@ -259,22 +224,34 @@ function main($queueManager, $processor, $logger, $config)
     $iteration = 0;
     $totalProcessed = 0;
     $totalFailed = 0;
+    $lastStatusLogTime = time();
+    $startTime = time();
 
     try {
         while (true) {
             $iteration++;
-
-            $logger->debug('Worker iteration', ['iteration' => $iteration]);
+            $currentTime = time();
 
             $stats = processQueue($queueManager, $processor, $logger, $config);
 
             $totalProcessed += $stats['processed'];
             $totalFailed += $stats['failed'];
 
+            // Логируем статус воркера каждые 10 минут
+            if ($currentTime - $lastStatusLogTime >= 600) {
+                $logger->info('Worker status update', [
+                    'iterations' => $iteration,
+                    'total_processed' => $totalProcessed,
+                    'total_failed' => $totalFailed,
+                    'uptime_minutes' => round(($currentTime - $startTime) / 60, 1),
+                    'timestamp' => date('Y-m-d H:i:s')
+                ]);
+                $lastStatusLogTime = $currentTime;
+            }
+
             // Если в этой итерации ничего не обработали, делаем паузу
             if ($stats['processed'] === 0 && $stats['failed'] === 0 && $stats['skipped'] === 0) {
                 $sleepTime = $config['queue']['idle_sleep_time'] ?? 30;
-                $logger->debug('No tasks processed, sleeping', ['sleep_seconds' => $sleepTime]);
                 sleep($sleepTime);
             } else {
                 // Если были задачи, проверяем сразу еще раз
