@@ -39,6 +39,7 @@ class LocalStorage
     private $CompanyHLEntityID;
     private $ProjectHLEntityID;
     private $bitrixAPI;
+    private $lastReconnectAtTs = 0;
 	
 
     public function __construct($logger, $config = null)
@@ -56,8 +57,11 @@ class LocalStorage
         $this->CompanyHLEntityID = $config['local_storage']['company_hl_entity_id'] ?? 2;
         $this->ProjectHLEntityID = $config['local_storage']['project_hl_entity_id'] ?? 3;
         $this->ensureDataDirectory();
-        if ($config["reconect"])
+        // Воркер передаёт флаг как reconnect, в этом файле исторически использовался reconect (опечатка).
+        // Поддерживаем оба ключа.
+        if (!empty($config["reconnect"]) || !empty($config["reconect"])) {
             $this->Reconnect();
+        }
 
         require_once $_SERVER["DOCUMENT_ROOT"].'/local/php_interface/lk/src/classes/Bitrix24API.php';
         $this->b24List = $this->readData($this->b24ListFile, 'b24list');
@@ -91,6 +95,84 @@ class LocalStorage
             $this->writeData($this->b24ListFile, $this->b24List, 'b24list');
 		}
 
+    }
+
+    /**
+     * Держим соединение "свежим" для долгоживущего воркера.
+     * По умолчанию делаем реконнект раз в 5 минут, если включён флаг reconnect/reconect.
+     */
+    private function ensureConnectionAlive(): void
+    {
+        $cfg = is_array($this->config) ? $this->config : [];
+        $reconnectEnabled = !empty($cfg['reconnect']) || !empty($cfg['reconect']);
+        if (!$reconnectEnabled) {
+            return;
+        }
+
+        $keepAliveSeconds = (int)($cfg['db_keepalive_seconds'] ?? 300);
+        if ($keepAliveSeconds <= 0) {
+            return;
+        }
+
+        $now = time();
+        if ($this->lastReconnectAtTs > 0 && ($now - $this->lastReconnectAtTs) < $keepAliveSeconds) {
+            return;
+        }
+
+        try {
+            $this->Reconnect();
+        } catch (\Throwable $e) {
+            // Не валим обработку только из-за keepalive — реальная ошибка проявится на запросе.
+            if ($this->logger) {
+                $this->logger->warning('DB keepalive reconnect failed', [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+    }
+
+    /**
+     * Выполняет DB-операцию с авто-reconnect+retry (одна попытка) для 2006/2013.
+     */
+    private function runDbOperation(string $opName, callable $fn, array $options = [])
+    {
+        $retryOnGoneAway = (bool)($options['retry_on_gone_away'] ?? false);
+        $this->ensureConnectionAlive();
+
+        try {
+            return $fn();
+        } catch (\Throwable $e) {
+            if (!$this->isMysqlGoneAway($e)) {
+                throw $e;
+            }
+
+            if ($this->logger) {
+                $this->logger->warning('MySQL connection lost, reconnecting and retrying', [
+                    'operation' => $opName,
+                    'error' => $e->getMessage(),
+                    'retry_enabled' => $retryOnGoneAway,
+                ]);
+            }
+
+            $this->Reconnect();
+
+            if (!$retryOnGoneAway) {
+                // Не делаем повтор для неидемпотентных write-операций, чтобы не получить дубли.
+                throw $e;
+            }
+
+            // Retry ONCE (идемпотентные операции)
+            return $fn();
+        }
+    }
+
+    private function isMysqlGoneAway(\Throwable $e): bool
+    {
+        $msg = $e->getMessage() ?? '';
+        // На практике Bitrix/DB исключения часто содержат текст "MySQL server has gone away" и код (2006)/(2013)
+        return (stripos($msg, 'server has gone away') !== false)
+            || (stripos($msg, '(2006)') !== false)
+            || (stripos($msg, '(2013)') !== false);
     }
 	
 	public function SendUserInfo($siteUserID, $checkword=false)
@@ -229,58 +311,60 @@ class LocalStorage
      */
     public function createLK($contactData)
     {
-		$this->logger->debug('Добавление пользователя', ['contact_id' => $contactData['ID']]);
+        return $this->runDbOperation(__FUNCTION__, function () use ($contactData) {
+		    $this->logger->debug('Добавление пользователя', ['contact_id' => $contactData['ID']]);
 		
-		$user = new CUser;
-		$pass= $contactData['PASSWORD'] ? $contactData['PASSWORD'] : $this->SetPassword();
-		if (is_array($contactData['EMAIL']) && $contactData['EMAIL'][0]["VALUE"])
-			$contactData['EMAIL']=$contactData['EMAIL'][0]["VALUE"];
-		if (is_array($contactData['PHONE']) && $contactData['PHONE'][0]["VALUE"])
-			$contactData['PHONE']=$contactData['PHONE'][0]["VALUE"];
+		    $user = new CUser;
+		    $pass= $contactData['PASSWORD'] ? $contactData['PASSWORD'] : $this->SetPassword();
+		    if (is_array($contactData['EMAIL']) && $contactData['EMAIL'][0]["VALUE"])
+			    $contactData['EMAIL']=$contactData['EMAIL'][0]["VALUE"];
+		    if (is_array($contactData['PHONE']) && $contactData['PHONE'][0]["VALUE"])
+			    $contactData['PHONE']=$contactData['PHONE'][0]["VALUE"];
 		
-		// Получаем значение поля агентского договора
-        $agentContractValue = $this->b24List['contacts']['agent_contract_status'][$this->getFieldValue($contactData, 'contact', 'agent_contract_status')];
-        $lkClientValue = $this->b24List['contacts']['lk_client_field'][$this->getFieldValue($contactData, 'contact', 'lk_client_field')];
-		//$agentContractValue = $this->getFieldValue($contactData, 'contact', 'agent_contract_status');
-		//$lkClientValue = $this->getFieldValue($contactData, 'contact', 'lk_client_field');
-		$checkword=Bitrix\Main\Security\Random::getString(32);
-		$lkData = [
-			"XML_ID" =>  $contactData['ID'],
-			'NAME' => $contactData['NAME'] ?? '',
-            'LAST_NAME' => $contactData['LAST_NAME'] ?? '',
-            'SECOND_NAME' => $contactData['SECOND_NAME'] ?? '',
-            'EMAIL' => $contactData['EMAIL'] ?? 'b24user'.$contactData['ID'].'@texxis.ru',
-			'LOGIN' => $contactData['EMAIL'] ?? 'b24user'.$contactData['ID'].'@texxis.ru',
-            'PERSONAL_PHONE' => $contactData['PHONE'] ?? '',
-            'WORK_COMPANY' => $contactData['COMPANY_ID'] ?? null,
-			"GROUP_ID" =>  $this->GetUserGroup('client', $lkClientValue),
-			"PASSWORD" => $pass,
-			"CONFIRM_PASSWORD" => $pass,
-			"CHECKWORD"=> $checkword,
-			"ADMIN_NOTES" => $pass,
-			"UF_B24_MD5" => md5(serialize($contactData)),
-			"UF_MANAGER_ID"=> $this->GetUserIDByXMLID("USER_".$contactData['ASSIGNED_BY_ID']),
-			"UF_TYPE_ID" => $contactData['TYPE_ID'],
-			"UF_AGENT_CONTRACT_STATUS" => $agentContractValue,
-			"UF_LK_CLIENT " => $lkClientValue,
-		];
-		$siteID=$user->Add($lkData);
-		if (intval($siteID) > 0)
-			$this->logger->info('Успешное добавление пользователя', ['ID' => $siteID]);
-		else
-		{
-			$this->logger->error('Ошибка добавления пользователя', ["error"=>$user->LAST_ERROR]);
-			return false;
-		}
-		//$rs=CUser::GetList("id","asc", ["ID"=>$siteID], ["FIELDS"=>["LOGIN","CHECKWORD"]]);
-		//if ($ar=$rs->Fetch())
-		//{
-			$url='https://'.$_SERVER["HTTP_HOST"].'/personal/?change_password=yes&lang=ru&USER_CHECKWORD='.$checkword.'&USER_LOGIN='.urlencode($lkData["LOGIN"]);
-			$this->bitrixAPI->startEmailBusinessProcess($contactData['ID'], $url);
-			//$this->SendUserInfo($siteID, $checkword);
-		//}
+		    // Получаем значение поля агентского договора
+            $agentContractValue = $this->b24List['contacts']['agent_contract_status'][$this->getFieldValue($contactData, 'contact', 'agent_contract_status')];
+            $lkClientValue = $this->b24List['contacts']['lk_client_field'][$this->getFieldValue($contactData, 'contact', 'lk_client_field')];
+		    //$agentContractValue = $this->getFieldValue($contactData, 'contact', 'agent_contract_status');
+		    //$lkClientValue = $this->getFieldValue($contactData, 'contact', 'lk_client_field');
+		    $checkword=Bitrix\Main\Security\Random::getString(32);
+		    $lkData = [
+			    "XML_ID" =>  $contactData['ID'],
+			    'NAME' => $contactData['NAME'] ?? '',
+                'LAST_NAME' => $contactData['LAST_NAME'] ?? '',
+                'SECOND_NAME' => $contactData['SECOND_NAME'] ?? '',
+                'EMAIL' => $contactData['EMAIL'] ?? 'b24user'.$contactData['ID'].'@texxis.ru',
+			    'LOGIN' => $contactData['EMAIL'] ?? 'b24user'.$contactData['ID'].'@texxis.ru',
+                'PERSONAL_PHONE' => $contactData['PHONE'] ?? '',
+                'WORK_COMPANY' => $contactData['COMPANY_ID'] ?? null,
+			    "GROUP_ID" =>  $this->GetUserGroup('client', $lkClientValue),
+			    "PASSWORD" => $pass,
+			    "CONFIRM_PASSWORD" => $pass,
+			    "CHECKWORD"=> $checkword,
+			    "ADMIN_NOTES" => $pass,
+			    "UF_B24_MD5" => md5(serialize($contactData)),
+			    "UF_MANAGER_ID"=> $this->GetUserIDByXMLID("USER_".$contactData['ASSIGNED_BY_ID']),
+			    "UF_TYPE_ID" => $contactData['TYPE_ID'],
+			    "UF_AGENT_CONTRACT_STATUS" => $agentContractValue,
+			    "UF_LK_CLIENT " => $lkClientValue,
+		    ];
+		    $siteID=$user->Add($lkData);
+		    if (intval($siteID) > 0)
+			    $this->logger->info('Успешное добавление пользователя', ['ID' => $siteID]);
+		    else
+		    {
+			    $this->logger->error('Ошибка добавления пользователя', ["error"=>$user->LAST_ERROR]);
+			    return false;
+		    }
+		    //$rs=CUser::GetList("id","asc", ["ID"=>$siteID], ["FIELDS"=>["LOGIN","CHECKWORD"]]);
+		    //if ($ar=$rs->Fetch())
+		    //{
+			    $url='https://'.$_SERVER["HTTP_HOST"].'/personal/?change_password=yes&lang=ru&USER_CHECKWORD='.$checkword.'&USER_LOGIN='.urlencode($lkData["LOGIN"]);
+			    $this->bitrixAPI->startEmailBusinessProcess($contactData['ID'], $url);
+			    //$this->SendUserInfo($siteID, $checkword);
+		    //}
 
-        return true;
+            return true;
+        }, ['retry_on_gone_away' => false]);
     }
 
     /**
@@ -288,54 +372,56 @@ class LocalStorage
      */
     public function createCompany($companyData, $inn = null)
     {
-        $companyId = $companyData['ID'] ?? $companyData['id'] ?? null;
+        return $this->runDbOperation(__FUNCTION__, function () use ($companyData, $inn) {
+            $companyId = $companyData['ID'] ?? $companyData['id'] ?? null;
 		
-		$this->logger->debug('Добавление компании', ['company_id' => $companyId, 'inn_provided' => $inn !== null]);
+		    $this->logger->debug('Добавление компании', ['company_id' => $companyId, 'inn_provided' => $inn !== null]);
 		
-		if (is_array($companyData['EMAIL']) && $companyData['EMAIL'][0]["VALUE"])
-			$companyData['EMAIL']=$companyData['EMAIL'][0]["VALUE"];
-		if (is_array($companyData['PHONE']) && $companyData['PHONE'][0]["VALUE"])
-			$companyData['PHONE']=$companyData['PHONE'][0]["VALUE"];
-		if (is_array($companyData['WEB']) && $companyData['WEB'][0]["VALUE"])
-			$companyData['WEB']=$companyData['WEB'][0]["VALUE"];
-		// Получаем значение поля партнерского договора
-        //$partnerContractValue = $this->getFieldValue($companyData, 'company', 'partner_contract_status');
-        $partnerContractValue = $this->b24List['companies']['partner_contract_status'][$this->getFieldValue($companyData, 'company', 'partner_contract_status')];
+		    if (is_array($companyData['EMAIL']) && $companyData['EMAIL'][0]["VALUE"])
+			    $companyData['EMAIL']=$companyData['EMAIL'][0]["VALUE"];
+		    if (is_array($companyData['PHONE']) && $companyData['PHONE'][0]["VALUE"])
+			    $companyData['PHONE']=$companyData['PHONE'][0]["VALUE"];
+		    if (is_array($companyData['WEB']) && $companyData['WEB'][0]["VALUE"])
+			    $companyData['WEB']=$companyData['WEB'][0]["VALUE"];
+		    // Получаем значение поля партнерского договора
+            //$partnerContractValue = $this->getFieldValue($companyData, 'company', 'partner_contract_status');
+            $partnerContractValue = $this->b24List['companies']['partner_contract_status'][$this->getFieldValue($companyData, 'company', 'partner_contract_status')];
 		
-		$innValue = $inn ?? $companyData['INN'] ?? $companyData['inn'] ?? null;
-		$arData= [
-			"UF_DATE_UPDATE" => new \Bitrix\Main\Type\DateTime,
-			"UF_DATE_INSERT" => new \Bitrix\Main\Type\DateTime,
-			"UF_PARTNER_CONTRACT_STATUS" => $partnerContractValue,
-			"UF_EMAIL" => $companyData['EMAIL'],
-			"UF_WEB" => $companyData['WEB'],
-			"UF_INN" => $innValue,
-			//"UF_INN" => print_r($companyData, true),
-			"UF_CONTACT_ID" => $companyData['CONTACT_ID'],
-			"UF_PHONE" => $companyData['PHONE'],
-			"UF_NAME" => $companyData['TITLE'],
-			"UF_ID" => $companyId
-		];
+		    $innValue = $inn ?? $companyData['INN'] ?? $companyData['inn'] ?? null;
+		    $arData= [
+			    "UF_DATE_UPDATE" => new \Bitrix\Main\Type\DateTime,
+			    "UF_DATE_INSERT" => new \Bitrix\Main\Type\DateTime,
+			    "UF_PARTNER_CONTRACT_STATUS" => $partnerContractValue,
+			    "UF_EMAIL" => $companyData['EMAIL'],
+			    "UF_WEB" => $companyData['WEB'],
+			    "UF_INN" => $innValue,
+			    //"UF_INN" => print_r($companyData, true),
+			    "UF_CONTACT_ID" => $companyData['CONTACT_ID'],
+			    "UF_PHONE" => $companyData['PHONE'],
+			    "UF_NAME" => $companyData['TITLE'],
+			    "UF_ID" => $companyId
+		    ];
 		
-		$hlblock =\Bitrix\Highloadblock\HighloadBlockTable::getById($this->CompanyHLEntityID)->fetch(); 
-		$entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
-		$entity_data_class = $entity->getDataClass();
+		    $hlblock =\Bitrix\Highloadblock\HighloadBlockTable::getById($this->CompanyHLEntityID)->fetch(); 
+		    $entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
+		    $entity_data_class = $entity->getDataClass();
 
-        $result = $entity_data_class::add($arData);
-        if ($result->isSuccess())
-        {
-            $this->logger->info('Компания добавлена', ['company_id' => $companyId, 'inn' => $innValue]);
-            return $result->getId();
-        }
-        else
-        {
-            $this->logger->error('Ошибка добавления компании', ["error"=>$result->getErrorMessages()]);
-            return false;
-        }
+            $result = $entity_data_class::add($arData);
+            if ($result->isSuccess())
+            {
+                $this->logger->info('Компания добавлена', ['company_id' => $companyId, 'inn' => $innValue]);
+                return $result->getId();
+            }
+            else
+            {
+                $this->logger->error('Ошибка добавления компании', ["error"=>$result->getErrorMessages()]);
+                return false;
+            }
 		
 		
 
-        return true;
+            return true;
+        }, ['retry_on_gone_away' => false]);
     }
 
     /**
@@ -767,22 +853,24 @@ class LocalStorage
      */
     public function deleteContactData($contactId) 
     {
-        $this->logger->debug('Удаление всех данных контакта и всего связанного с ним', ['contact_id' => $contactId]);
+        return $this->runDbOperation(__FUNCTION__, function () use ($contactId) {
+            $this->logger->debug('Удаление всех данных контакта и всего связанного с ним', ['contact_id' => $contactId]);
 
-        $contactId = (string)$contactId;
+            $contactId = (string)$contactId;
 		
-		$SITE_ID=$this->GetUserIDByXMLID($contactId);
-		$this->DeleteUserCompanies($contactId);
-		$this->DeleteUserProjects($contactId);
-		$user = new CUser;
-		if ($SITE_ID)
-		{
-			//$user->Update($SITE_ID, ["ACTIVE"=>"N"]);
-			\Bitrix\Main\UserAuthActionTable::addLogoutAction($SITE_ID);
-			$user->Delete($SITE_ID);
-		}
-		$this->logger->info('Удаление всех данных контакта и всего связанного с ним завершено', ['contact_id' => $contactId]);		
-        return true;
+		    $SITE_ID=$this->GetUserIDByXMLID($contactId);
+		    $this->DeleteUserCompanies($contactId);
+		    $this->DeleteUserProjects($contactId);
+		    $user = new CUser;
+		    if ($SITE_ID)
+		    {
+			    //$user->Update($SITE_ID, ["ACTIVE"=>"N"]);
+			    \Bitrix\Main\UserAuthActionTable::addLogoutAction($SITE_ID);
+			    $user->Delete($SITE_ID);
+		    }
+		    $this->logger->info('Удаление всех данных контакта и всего связанного с ним завершено', ['contact_id' => $contactId]);		
+            return true;
+        }, ['retry_on_gone_away' => true]);
     }
 	
 	public function GetUserDataByXMLID($XML_ID)
@@ -1093,5 +1181,6 @@ class LocalStorage
 		$cn = \Bitrix\Main\Application::getConnection();
 		$cn->disconnect();
 		$cn->connect();
+        $this->lastReconnectAtTs = time();
 	}
 }

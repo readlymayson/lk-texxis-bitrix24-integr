@@ -22,15 +22,29 @@ WORKER_SCRIPT="$PROJECT_ROOT/src/scripts/process_queue.php"
 PID_FILE="$PROJECT_ROOT/src/data/worker.pid"
 PHP_BIN=$(which php)
 
-# Цвета для вывода
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+# Файл лога этого управляющего скрипта (удобно смотреть, что сделал cron)
+LOG_FILE="${LOG_FILE:-$PROJECT_ROOT/src/data/restart_worker.log}"
+
+# Цвета для вывода (только если есть TTY)
+if [ -t 1 ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    NC='\033[0m' # No Color
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    NC=''
+fi
 
 # Функция для логирования
 log() {
-    echo -e "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+    local msg
+    msg="$(date '+%Y-%m-%d %H:%M:%S') - $1"
+    echo -e "$msg"
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    echo -e "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 # Функция для показа справки
@@ -52,8 +66,8 @@ show_help() {
   */5 * * * * $0
 
 ЛОГИ:
-  Скрипт выводит подробную информацию о процессе перезапуска
-  в консоль с временными метками.
+  Скрипт выводит подробную информацию в консоль и пишет в файл:
+  $LOG_FILE
 
 EOF
 }
@@ -112,6 +126,8 @@ fi
 
 log "Перезапуск воркера..."
 log "Скрипт воркера: $WORKER_SCRIPT"
+log "PID файл воркера: $PID_FILE"
+log "Лог управляющего скрипта: $LOG_FILE"
 
 # Функция для поиска работающего воркера
 find_running_worker() {
@@ -157,12 +173,6 @@ else
     log "Воркер не был запущен ранее"
 fi
 
-# Удаляем PID файл, если он существует
-if [ -f "$PID_FILE" ]; then
-    rm -f "$PID_FILE" 2>/dev/null
-    log "PID файл удален"
-fi
-
 # Запускаем новый экземпляр воркера
 log "${GREEN}Запуск нового экземпляра воркера...${NC}"
 
@@ -171,35 +181,30 @@ cd "$PROJECT_ROOT/src/scripts" || {
     exit 1
 }
 
-# Запускаем воркер в фоне
-"$PHP_BIN" "$WORKER_SCRIPT" &
+# Запускаем воркер в фоне (как отдельный процесс), вывод воркера глушим:
+# сам воркер пишет свои логи через Logger.
+nohup "$PHP_BIN" "$WORKER_SCRIPT" >/dev/null 2>&1 &
 
 NEW_PID=$!
-log "${GREEN}Воркер запущен с PID $NEW_PID${NC}"
+log "${GREEN}PHP-процесс воркера запущен (PID: $NEW_PID). Ожидание PID-файла воркера...${NC}"
 
-# Ждем немного и проверяем, что процесс запустился
-sleep 2
-
-if is_process_running "$NEW_PID"; then
-    log "${GREEN}Воркер успешно перезапущен (PID: $NEW_PID)${NC}"
-
-    # Сохраняем PID в файл для совместимости
-    # Пробуем записать PID файл, если не получается - создаем с правами
-    if echo "$NEW_PID" > "$PID_FILE" 2>/dev/null; then
-        log "PID сохранен в файл: $PID_FILE"
-    else
-        log "${YELLOW}Не удалось сохранить PID в файл, создаем с правами...${NC}"
-        # Создаем файл с правильными правами
-        touch "$PID_FILE" && chmod 666 "$PID_FILE" && echo "$NEW_PID" > "$PID_FILE" 2>/dev/null
-        if [ $? -eq 0 ]; then
-            log "PID файл создан успешно: $PID_FILE"
-        else
-            log "${YELLOW}Предупреждение: Не удалось создать PID файл. Воркер работает, но без PID файла.${NC}"
+# Ждём, пока воркер сам создаст PID файл (он это делает в checkAndSetPidFile()).
+for i in $(seq 1 30); do
+    if [ -f "$PID_FILE" ]; then
+        WORKER_PID_FROM_FILE="$(cat "$PID_FILE" 2>/dev/null)"
+        if [ -n "$WORKER_PID_FROM_FILE" ] && is_process_running "$WORKER_PID_FROM_FILE"; then
+            log "${GREEN}Воркер подтверждён: PID $WORKER_PID_FROM_FILE (из $PID_FILE)${NC}"
+            log "${GREEN}Перезапуск завершен успешно${NC}"
+            exit 0
         fi
     fi
-else
-    log "${RED}Ошибка: Воркер не запустился${NC}"
-    exit 1
-fi
+    # Если PHP-процесс уже умер, дальше ждать бессмысленно
+    if ! is_process_running "$NEW_PID"; then
+        log "${RED}Ошибка: PHP-процесс воркера завершился до создания PID-файла (PID: $NEW_PID)${NC}"
+        exit 1
+    fi
+    sleep 1
+done
 
-log "${GREEN}Перезапуск завершен успешно${NC}"
+log "${RED}Ошибка: воркер не создал/не подтвердил PID-файл за 30 секунд${NC}"
+exit 1

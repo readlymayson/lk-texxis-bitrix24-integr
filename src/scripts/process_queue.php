@@ -44,6 +44,53 @@ try {
 }
 
 /**
+ * Подключение/переподключение к БД перед задачей.
+ * Если используется Bitrix-ориентированный LocalStorage (например LocalStorage_prod.php),
+ * то в нём могут быть методы Reconnect/Disconnect.
+ */
+function dbReconnectForTask($logger, $localStorage = null): void
+{
+    try {
+        if ($localStorage && method_exists($localStorage, 'Reconnect')) {
+            $localStorage->Reconnect();
+            return;
+        }
+
+        if (class_exists('\\Bitrix\\Main\\Application')) {
+            $cn = \Bitrix\Main\Application::getConnection();
+            $cn->disconnect();
+            $cn->connect();
+        }
+    } catch (Throwable $e) {
+        $logger->warning('DB reconnect failed before task', [
+            'error' => $e->getMessage(),
+        ]);
+    }
+}
+
+/**
+ * Отключение от БД после задачи, чтобы не держать idle-соединение > wait_timeout (например 180 сек).
+ */
+function dbDisconnectAfterTask($logger, $localStorage = null): void
+{
+    try {
+        if ($localStorage && method_exists($localStorage, 'Disconnect')) {
+            $localStorage->Disconnect();
+            return;
+        }
+
+        if (class_exists('\\Bitrix\\Main\\Application')) {
+            $cn = \Bitrix\Main\Application::getConnection();
+            $cn->disconnect();
+        }
+    } catch (Throwable $e) {
+        $logger->warning('DB disconnect failed after task', [
+            'error' => $e->getMessage(),
+        ]);
+    }
+}
+
+/**
  * Проверка и установка PID файла для предотвращения запуска нескольких экземпляров
  */
 function checkAndSetPidFile($logger)
@@ -92,14 +139,20 @@ function removePidFile($logger)
 /**
  * Основная функция обработки очереди
  */
-function processQueue($queueManager, $processor, $logger, $config)
+function processQueue($queueManager, $processor, $logger, $config, $localStorage = null)
 {
     $batchSize = $config['queue']['batch_size'] ?? 10;
     $maxAttempts = $config['queue']['max_attempts'] ?? 3;
+    $processingTimeout = (int)($config['queue']['processing_timeout_seconds'] ?? 600);
 
     $processedCount = 0;
     $failedCount = 0;
     $skippedCount = 0;
+
+    // Возвращаем зависшие processing-задачи в pending
+    if (method_exists($queueManager, 'requeueStaleProcessing')) {
+        $queueManager->requeueStaleProcessing($processingTimeout);
+    }
 
     // Получаем задачи из очереди
     $tasks = $queueManager->popBatch($batchSize);
@@ -126,6 +179,9 @@ function processQueue($queueManager, $processor, $logger, $config)
             $attempts = $task['attempts'] ?? 0;
 
             try {
+                // Вариант 2: держим соединение с БД только на время обработки задачи
+                dbReconnectForTask($logger, $localStorage);
+
                 // Обрабатываем событие через WebhookProcessor
                 $result = $processor->processEvent($eventName, $webhookData);
 
@@ -135,27 +191,29 @@ function processQueue($queueManager, $processor, $logger, $config)
                     $processedCount++;
                 } else {
                     // Обработка не удалась
-                    $attempts++;
+                    $nextAttempts = $attempts + 1;
+                    $errorMessage = 'Processor returned false';
 
-                    if ($attempts >= $maxAttempts) {
+                    if ($nextAttempts >= $maxAttempts) {
                         // Превышено максимальное количество попыток
-                        $queueManager->updateStatus($taskId, 'failed', 'Max attempts exceeded');
+                        $queueManager->updateStatus($taskId, 'failed', $errorMessage);
                         $failedCount++;
                         $logger->error('Task failed permanently', [
                             'task_id' => $taskId,
                             'entity_id' => $entityId,
                             'event' => $eventName,
-                            'attempts' => $attempts
+                            'attempts' => $nextAttempts,
+                            'max_attempts' => $maxAttempts
                         ]);
                     } else {
                         // Будет повторена позже
-                        $queueManager->updateStatus($taskId, 'pending');
+                        $queueManager->updateStatus($taskId, 'pending', $errorMessage);
                         $skippedCount++;
                         $logger->warning('Task processing failed, will retry', [
                             'task_id' => $taskId,
                             'entity_id' => $entityId,
                             'event' => $eventName,
-                            'attempts' => $attempts,
+                            'attempts' => $nextAttempts,
                             'max_attempts' => $maxAttempts
                         ]);
                     }
@@ -163,23 +221,25 @@ function processQueue($queueManager, $processor, $logger, $config)
 
             } catch (Exception $e) {
                 $errorMessage = $e->getMessage();
-                $attempts++;
+                $nextAttempts = $attempts + 1;
 
                 $logger->error('Exception during task processing', [
                     'task_id' => $taskId,
                     'entity_id' => $entityId,
                     'event' => $eventName,
-                    'attempts' => $attempts,
+                    'attempts' => $nextAttempts,
                     'error' => $errorMessage
                 ]);
 
-                if ($attempts >= $maxAttempts) {
+                if ($nextAttempts >= $maxAttempts) {
                     $queueManager->updateStatus($taskId, 'failed', $errorMessage);
                     $failedCount++;
                 } else {
-                    $queueManager->updateStatus($taskId, 'pending');
+                    $queueManager->updateStatus($taskId, 'pending', $errorMessage);
                     $skippedCount++;
                 }
+            } finally {
+                dbDisconnectAfterTask($logger, $localStorage);
             }
         }
     }
@@ -232,7 +292,7 @@ function main($queueManager, $processor, $logger, $config)
             $iteration++;
             $currentTime = time();
 
-            $stats = processQueue($queueManager, $processor, $logger, $config);
+            $stats = processQueue($queueManager, $processor, $logger, $config, $GLOBALS['localStorage'] ?? null);
 
             $totalProcessed += $stats['processed'];
             $totalFailed += $stats['failed'];

@@ -69,26 +69,25 @@ class QueueManager
     {
         return $this->atomicWrite(function(&$queue) use ($limit) {
             $pendingTasks = [];
-            $remainingTasks = [];
 
-            foreach ($queue as &$task) {
+            foreach ($queue as $idx => &$task) {
                 if (!is_array($task)) {
                     continue; // Пропускаем невалидные задачи
                 }
 
-                if (count($pendingTasks) < $limit && ($task['status'] ?? 'pending') === 'pending') {
+                if (count($pendingTasks) >= $limit) {
+                    continue;
+                }
+
+                if (($task['status'] ?? 'pending') === 'pending') {
                     $task['status'] = 'processing';
                     $task['processed_at'] = date('Y-m-d H:i:s');
                     $pendingTasks[] = $task;
-                } else {
-                    $remainingTasks[] = $task;
                 }
             }
 
-            // Обновляем очередь, оставляя только необработанные задачи
-            $queue = $remainingTasks;
-
-            // Возвращаем взятые задачи
+            // ВАЖНО: задачи НЕ удаляем из очереди при выдаче.
+            // Иначе updateStatus() не сможет найти их по task_id, и ретраи/статусы сломаются.
             return $pendingTasks;
         });
     }
@@ -109,10 +108,13 @@ class QueueManager
                     $task['status'] = $status;
                     $task['updated_at'] = date('Y-m-d H:i:s');
 
-                    if ($status === 'failed' && $error) {
+                    if ($error) {
                         $task['last_error'] = $error;
                         $task['attempts'] = ($task['attempts'] ?? 0) + 1;
-                    } elseif ($status === 'completed') {
+                        $task['last_error_at'] = date('Y-m-d H:i:s');
+                    }
+
+                    if ($status === 'completed') {
                         $task['completed_at'] = date('Y-m-d H:i:s');
                     }
 
@@ -148,6 +150,65 @@ class QueueManager
             }
 
             return $removedCount;
+        });
+    }
+
+    /**
+     * Возвращает "зависшие" processing-задачи обратно в pending по таймауту.
+     * Нужен для варианта A: popBatch() не удаляет задачи из файла.
+     *
+     * @param int $timeoutSeconds Сколько секунд задача может быть в processing
+     * @return int Количество возвращённых задач
+     */
+    public function requeueStaleProcessing(int $timeoutSeconds = 600): int
+    {
+        if ($timeoutSeconds <= 0) {
+            return 0;
+        }
+
+        return (int)$this->atomicWrite(function (&$queue) use ($timeoutSeconds) {
+            $now = time();
+            $requeued = 0;
+
+            foreach ($queue as &$task) {
+                if (!is_array($task)) {
+                    continue;
+                }
+
+                if (($task['status'] ?? 'pending') !== 'processing') {
+                    continue;
+                }
+
+                $processedAtRaw = $task['processed_at'] ?? null;
+                $processedAtTs = $processedAtRaw ? strtotime($processedAtRaw) : null;
+
+                // Если processed_at отсутствует/непарсится — считаем задачу зависшей
+                if (!$processedAtTs) {
+                    $task['status'] = 'pending';
+                    $task['requeued_at'] = date('Y-m-d H:i:s');
+                    $task['last_error'] = 'Stale processing task without processed_at';
+                    $task['last_error_at'] = date('Y-m-d H:i:s');
+                    $requeued++;
+                    continue;
+                }
+
+                if (($now - $processedAtTs) >= $timeoutSeconds) {
+                    $task['status'] = 'pending';
+                    $task['requeued_at'] = date('Y-m-d H:i:s');
+                    $task['last_error'] = 'Stale processing timeout exceeded';
+                    $task['last_error_at'] = date('Y-m-d H:i:s');
+                    $requeued++;
+                }
+            }
+
+            if ($requeued > 0) {
+                $this->logger->warning('Requeued stale processing tasks', [
+                    'requeued' => $requeued,
+                    'timeout_seconds' => $timeoutSeconds
+                ]);
+            }
+
+            return $requeued;
         });
     }
 
