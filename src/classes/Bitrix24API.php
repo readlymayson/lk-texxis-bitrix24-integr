@@ -591,6 +591,57 @@ class Bitrix24API
     }
 
     /**
+     * Запуск бизнес-процесса первой авторизации пользователя в контакте через Битрикс24
+     *
+     * @param int|string $contactId ID контакта в Bitrix24 (из XML_ID пользователя на сайте)
+     * @return array|false Результат bizproc.workflow.start или false при ошибке
+     */
+    public function startFirstAuthBusinessProcess($contactId)
+    {
+        if (empty($contactId)) {
+            $this->logger->error('Contact ID is required to start first auth business process');
+            return false;
+        }
+
+        $businessProcessId = $this->config['bitrix24']['first_auth_business_process_id'] ?? 0;
+
+        if (empty($businessProcessId)) {
+            $this->logger->error('First auth business process ID is not configured', [
+                'contact_id' => $contactId
+            ]);
+            return false;
+        }
+
+        $params = [
+            'TEMPLATE_ID' => (int)$businessProcessId,
+            'DOCUMENT_TYPE' => ['crm', 'CCrmDocumentContact', 'CONTACT'],
+            'DOCUMENT_ID' => ['crm', 'CCrmDocumentContact', 'CONTACT_' . (int)$contactId],
+        ];
+
+        $this->logger->info('Starting first auth business process via Bitrix24', [
+            'contact_id' => $contactId,
+            'business_process_id' => $businessProcessId,
+        ]);
+
+        $result = $this->makeApiCall('bizproc.workflow.start', $params);
+
+        if ($result && isset($result['result'])) {
+            $this->logger->info('First auth business process started successfully', [
+                'contact_id' => $contactId,
+                'workflow_id' => $result['result']
+            ]);
+        } else {
+            $this->logger->warning('Failed to start first auth business process', [
+                'contact_id' => $contactId,
+                'business_process_id' => $businessProcessId,
+                'result' => $result
+            ]);
+        }
+
+        return $result;
+    }
+
+    /**
      * Добавление параметров для смарт-процессов (entityTypeId)
      */
     private function addSmartProcessParams($entityType, &$params)
