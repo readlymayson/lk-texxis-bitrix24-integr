@@ -385,10 +385,17 @@ class Bitrix24API
                 return false;
             }
 
+            // Не пишем в лог fileContent (base64 файла) — он может быть огромным
+            $logParams = $params;
+            $uploadMethods = ['disk.folder.uploadfile', 'disk.file.upload', 'disk.file.uploadfile'];
+            if (in_array($method, $uploadMethods, true) && isset($logParams['fileContent'])) {
+                $logParams['fileContent'] = '[base64 ' . strlen($logParams['fileContent']) . ' bytes]';
+            }
+
             $this->logger->debug('Making API call', [
                 'method' => $method,
                 'url' => preg_replace('/\/[^\/]+\/[^\/]+\//', '/***/', $url), // Скрываем токен в логах
-                'params' => $params,
+                'params' => $logParams,
                 'attempt' => $attempt
             ]);
 
@@ -794,72 +801,38 @@ class Bitrix24API
      */
     private function getRootFolderId()
     {
-        // Метод 1: disk.folder.getforupload - специальный метод для получения папки для загрузки
-        $method1 = 'disk.folder.getforupload';
-        $result1 = $this->makeApiCall($method1, []);
-        
-        if ($result1 && isset($result1['result'])) {
-            $folderId = $result1['result']['FOLDER_ID'] ?? $result1['result']['folder_id'] ?? 
-                       $result1['result']['ID'] ?? $result1['result']['id'] ?? null;
-            if ($folderId) {
-                $this->logger->debug('Root folder ID obtained via getforupload', [
-                    'method' => $method1,
-                    'folder_id' => $folderId,
-                    'result_structure' => json_encode($result1['result'], JSON_UNESCAPED_UNICODE)
-                ]);
-                return $folderId;
-            }
-        }
-        
-        // Метод 2: disk.storage.get - получаем хранилище и извлекаем ROOT_FOLDER_ID
+        // disk.storage.get - получаем хранилище и извлекаем ROOT_FOLDER_ID
         // Пробуем сначала с ID=1, если не работает - получаем список всех хранилищ
-        $method2 = 'disk.storage.get';
-        
+        $method = 'disk.storage.get';
+
         // Сначала пробуем получить конкретное хранилище
-        $result2 = $this->makeApiCall($method2, ['id' => 1]);
-        
+        $result = $this->makeApiCall($method, ['id' => 1]);
+
         // Если не получилось, пробуем получить список хранилищ
-        if (!$result2 || !isset($result2['result'])) {
-            $result2 = $this->makeApiCall($method2, []);
+        if (!$result || !isset($result['result'])) {
+            $result = $this->makeApiCall($method, []);
         }
         
-        if ($result2 && isset($result2['result'])) {
-            $resultData = $result2['result'];
-            $this->logger->debug('disk.storage.get response structure', [
-                'result_type' => gettype($resultData),
-                'is_array' => is_array($resultData),
-                'array_count' => is_array($resultData) ? count($resultData) : 0,
-                'is_numeric_array' => is_array($resultData) && (empty($resultData) || array_keys($resultData) === range(0, count($resultData) - 1)),
-                'keys' => is_array($resultData) ? array_keys($resultData) : 'not_array',
-                'sample' => is_array($resultData) ? json_encode(array_slice($resultData, 0, 10), JSON_UNESCAPED_UNICODE) : json_encode($resultData, JSON_UNESCAPED_UNICODE)
-            ]);
-            
+        if ($result && isset($result['result'])) {
+            $resultData = $result['result'];
+
             $folderId = null;
-            
+
             // Проверяем, является ли result массивом с числовыми индексами (список хранилищ)
             // или ассоциативным массивом/объектом (одно хранилище)
             $isNumericArray = is_array($resultData) && !empty($resultData) && array_keys($resultData) === range(0, count($resultData) - 1);
-            
+
             if ($isNumericArray) {
                 // Если result - это массив хранилищ (числовые индексы)
                 foreach ($resultData as $index => $storage) {
                     if (is_array($storage)) {
                         // Пробуем разные варианты ключей
-                        $folderId = $storage['ROOT_FOLDER_ID'] ?? 
-                                   $storage['root_folder_id'] ?? 
-                                   $storage['ROOT_FOLDER']['ID'] ?? 
+                        $folderId = $storage['ROOT_FOLDER_ID'] ??
+                                   $storage['root_folder_id'] ??
+                                   $storage['ROOT_FOLDER']['ID'] ??
                                    $storage['root_folder']['id'] ?? null;
-                        
-                        // Если не нашли, логируем структуру для отладки
-                        if (!$folderId) {
-                            $this->logger->debug('Storage item structure', [
-                                'index' => $index,
-                                'storage_keys' => array_keys($storage),
-                                'has_root_folder' => isset($storage['ROOT_FOLDER']),
-                                'has_root_folder_id' => isset($storage['ROOT_FOLDER_ID']),
-                                'storage_sample' => json_encode(array_slice($storage, 0, 15), JSON_UNESCAPED_UNICODE)
-                            ]);
-                        } else {
+
+                        if ($folderId) {
                             $this->logger->debug('Found root folder ID in storage', [
                                 'storage_index' => $index,
                                 'storage_id' => $storage['ID'] ?? $storage['id'] ?? 'unknown',
@@ -874,9 +847,9 @@ class Bitrix24API
             } else {
                 // Если result - это объект хранилища (ассоциативный массив)
                 // Пробуем разные варианты получения ROOT_FOLDER_ID
-                $folderId = $resultData['ROOT_FOLDER_ID'] ?? 
+                $folderId = $resultData['ROOT_FOLDER_ID'] ??
                            $resultData['root_folder_id'] ?? null;
-                
+
                 // Если не нашли напрямую, проверяем вложенный объект ROOT_FOLDER
                 if (!$folderId && isset($resultData['ROOT_FOLDER'])) {
                     $rootFolder = $resultData['ROOT_FOLDER'];
@@ -884,98 +857,26 @@ class Bitrix24API
                         $folderId = $rootFolder['ID'] ?? $rootFolder['id'] ?? null;
                     }
                 }
-                
+
                 // Если не нашли ROOT_FOLDER_ID, пробуем использовать ROOT_OBJECT_ID
-                // В некоторых версиях Bitrix24 ROOT_OBJECT_ID может быть ID корневой папки
                 if (!$folderId && isset($resultData['ROOT_OBJECT_ID'])) {
                     $folderId = $resultData['ROOT_OBJECT_ID'];
                     $this->logger->debug('Using ROOT_OBJECT_ID as folder ID', [
                         'root_object_id' => $folderId
                     ]);
                 }
-                
-                // Логируем структуру для отладки, если не нашли
-                if (!$folderId) {
-                    $this->logger->debug('Storage object structure', [
-                        'storage_keys' => is_array($resultData) ? array_keys($resultData) : 'not_array',
-                        'has_root_folder' => isset($resultData['ROOT_FOLDER']),
-                        'has_root_folder_id' => isset($resultData['ROOT_FOLDER_ID']),
-                        'has_root_object_id' => isset($resultData['ROOT_OBJECT_ID']),
-                        'root_object_id' => $resultData['ROOT_OBJECT_ID'] ?? 'not_set',
-                        'root_folder_type' => isset($resultData['ROOT_FOLDER']) ? gettype($resultData['ROOT_FOLDER']) : 'not_set',
-                        'root_folder_keys' => (isset($resultData['ROOT_FOLDER']) && is_array($resultData['ROOT_FOLDER'])) 
-                            ? array_keys($resultData['ROOT_FOLDER']) : 'not_array',
-                        'storage_sample' => json_encode(array_slice(is_array($resultData) ? $resultData : [], 0, 20), JSON_UNESCAPED_UNICODE)
-                    ]);
-                }
             }
-            
+
             if ($folderId) {
                 $this->logger->debug('Root folder ID obtained via storage.get', [
-                    'method' => $method2,
+                    'method' => $method,
                     'folder_id' => $folderId
                 ]);
                 return $folderId;
-            } else {
-                // Детальное логирование для отладки структуры ответа
-                $debugInfo = [
-                    'result_type' => gettype($resultData),
-                    'is_array' => is_array($resultData),
-                    'array_count' => is_array($resultData) ? count($resultData) : 0
-                ];
-                
-                if (is_array($resultData) && !empty($resultData)) {
-                    // Логируем информацию о каждом элементе массива
-                    $debugInfo['items_info'] = [];
-                    foreach (array_slice($resultData, 0, 3) as $idx => $item) {
-                        $itemInfo = [
-                            'index' => $idx,
-                            'type' => gettype($item),
-                            'is_array' => is_array($item)
-                        ];
-                        if (is_array($item)) {
-                            $itemInfo['keys'] = array_keys($item);
-                            $itemInfo['has_root_folder_id'] = isset($item['ROOT_FOLDER_ID']);
-                            $itemInfo['has_root_folder'] = isset($item['ROOT_FOLDER']);
-                            $itemInfo['sample'] = json_encode(array_slice($item, 0, 20), JSON_UNESCAPED_UNICODE);
-                        } else {
-                            $itemInfo['value'] = $item;
-                        }
-                        $debugInfo['items_info'][] = $itemInfo;
-                    }
-                } else {
-                    $debugInfo['result_value'] = is_array($resultData) ? 'empty_array' : json_encode($resultData, JSON_UNESCAPED_UNICODE);
-                }
-                
-                $this->logger->warning('disk.storage.get returned result but ROOT_FOLDER_ID not found', $debugInfo);
             }
         }
-        
-        // Метод 3: disk.folder.getchildren - получаем список дочерних папок корневой папки
-        // Пробуем с ID=0 (корневая папка) или без параметров
-        $method3 = 'disk.folder.getchildren';
-        $result3 = $this->makeApiCall($method3, ['id' => 0]);
-        
-        // Если не получилось с ID=0, пробуем без параметров
-        if (!$result3 || !isset($result3['result'])) {
-            $result3 = $this->makeApiCall($method3, []);
-        }
-        
-        if ($result3 && isset($result3['result'])) {
-            $this->logger->debug('disk.folder.getchildren response', [
-                'result_type' => gettype($result3['result']),
-                'is_array' => is_array($result3['result']),
-                'has_items' => is_array($result3['result']) && !empty($result3['result'])
-            ]);
-            // Этот метод возвращает список папок, но не ID корневой папки напрямую
-            // Поэтому используем его только для проверки доступности API
-        }
-        
-        $this->logger->warning('Failed to get root folder ID using all methods', [
-            'method1_result' => isset($result1) ? (is_array($result1) ? 'array' : gettype($result1)) : 'not_called',
-            'method2_result' => isset($result2) ? (is_array($result2) ? 'array' : gettype($result2)) : 'not_called',
-            'method3_result' => isset($result3) ? (is_array($result3) ? 'array' : gettype($result3)) : 'not_called'
-        ]);
+
+        $this->logger->warning('Failed to get root folder ID via disk.storage.get');
         return false;
     }
 
@@ -1105,7 +1006,7 @@ class Bitrix24API
 
         // Формируем безопасное имя файла
         $safeFileName = preg_replace('/[^a-zA-Z0-9а-яА-ЯёЁ_\-\.]/u', '_', $pathInfo['filename']);
-        $fileName = $safeFileName . '_' . time() . ($extension ? '.' . $extension : '');
+        $fileName = $safeFileName . '_' . round(microtime(true) * 100) . ($extension ? '.' . $extension : '');
         
         // Если folderId не получен, пробуем использовать ROOT_OBJECT_ID из storage
         if ($folderId === null || $folderId === false) {
