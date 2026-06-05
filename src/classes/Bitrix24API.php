@@ -885,9 +885,10 @@ class Bitrix24API
      *
      * @param string $filePath Путь к локальному файлу
      * @param int $folderId ID папки на Диске Bitrix24 (опционально, будет получен автоматически)
+     * @param string $projectPrefix Префикс с названием проекта (будет добавлен в имя файла)
      * @return array|false Результат загрузки с ID файла или false при ошибке
      */
-    public function uploadFile($filePath, $folderId = null)
+    public function uploadFile($filePath, $folderId = null, $projectPrefix = '')
     {
         // Проверяем существование файла
         if (!file_exists($filePath)) {
@@ -1006,7 +1007,18 @@ class Bitrix24API
 
         // Формируем безопасное имя файла
         $safeFileName = preg_replace('/[^a-zA-Z0-9а-яА-ЯёЁ_\-\.]/u', '_', $pathInfo['filename']);
-        $fileName = $safeFileName . '_' . round(microtime(true) * 100) . ($extension ? '.' . $extension : '');
+
+        // Добавляем префикс проекта, если указан
+        $projectPrefixPart = '';
+        if (!empty($projectPrefix)) {
+            $safePrefix = preg_replace('/[^a-zA-Z0-9а-яА-ЯёЁ_\-\.]/u', '_', $projectPrefix);
+            $safePrefix = trim($safePrefix, '_.-');
+            if (!empty($safePrefix)) {
+                $projectPrefixPart = $safePrefix . '_';
+            }
+        }
+
+        $fileName = $projectPrefixPart . $safeFileName . '_' . round(microtime(true) * 100) . ($extension ? '.' . $extension : '');
         
         // Если folderId не получен, пробуем использовать ROOT_OBJECT_ID из storage
         if ($folderId === null || $folderId === false) {
@@ -1447,7 +1459,14 @@ class Bitrix24API
                         'file_path' => $path,
                         'file_size' => filesize($path)
                     ]);
-                    $uploadResult = $this->uploadFile($path);
+                    // Определяем префикс проекта для имени загружаемого файла
+                    $projectPrefix = '';
+                    if (!empty($formFields['object_name'])) {
+                        $projectPrefix = $formFields['object_name'];
+                    } elseif (!empty($formFields['organization_name'])) {
+                        $projectPrefix = $formFields['organization_name'];
+                    }
+                    $uploadResult = $this->uploadFile($path, null, $projectPrefix);
                     if (is_array($uploadResult)) {
                         $finalFileId = $uploadResult['id'] ?? null;
                         $internalLink = $uploadResult['internal_link'] ?? null;

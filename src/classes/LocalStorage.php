@@ -1,5 +1,10 @@
 <?php
-
+if (!$_SERVER['DOCUMENT_ROOT'])
+	$_SERVER['DOCUMENT_ROOT'] ="/home/t/texxis/public_html";
+if (!$_SERVER["HTTP_HOST"])
+	$_SERVER["HTTP_HOST"]="texxis.ru";
+require_once($_SERVER['DOCUMENT_ROOT'] . "/bitrix/modules/main/include/prolog_before.php");
+\Bitrix\Main\Loader::includeModule("highloadblock");
 /**
  * Класс для локального хранения данных интеграции с Битрикс24
  * Заменяет API личного кабинета локальным хранением
@@ -13,12 +18,29 @@ class LocalStorage
     private $companiesFile;
     private $projectsFile;
     private $managersFile;
+    private $b24ListFile;
     private $cachedData = [
         'contacts' => null,
         'companies' => null,
+        'deals' => null,
         'projects' => null,
-        'managers' => null
+        'managers' => null,
+        'b24list' => null,
     ];
+    public $b24List = [
+        'contacts' => [],
+        'companies' => [],
+        'projects' => [],
+    ];
+    private $siteUserGroup = [6,7];
+    private $siteManagerGroup = [6,8];
+    private $siteUserRoleGroup = [47=>9, 63=>10, 75=>11]; //Инсталлятор, интегратор =47, Торговый дом = 63, Проектировщик = 75
+    private $siteNewUserText = [47=>'integrator.txt', 63=>'trading.txt', 75=>'project.txt']; //Инсталлятор, интегратор =47, Торговый дом = 63, Проектировщик = 75
+    private $CompanyHLEntityID;
+    private $ProjectHLEntityID;
+    private $bitrixAPI;
+    private $lastReconnectAtTs = 0;
+	
 
     public function __construct($logger, $config = null)
     {
@@ -29,9 +51,189 @@ class LocalStorage
         $this->companiesFile = $this->dataDir . '/companies.json';
         $this->projectsFile = $this->dataDir . '/projects.json';
         $this->managersFile = $this->dataDir . '/managers.json';
+        $this->b24ListFile = $this->dataDir . '/b24list.json';
 
+        // Инициализация ID Highload-блоков из конфигурации
+        $this->CompanyHLEntityID = $config['local_storage']['company_hl_entity_id'] ?? 2;
+        $this->ProjectHLEntityID = $config['local_storage']['project_hl_entity_id'] ?? 3;
         $this->ensureDataDirectory();
+        // Воркер передаёт флаг как reconnect, в этом файле исторически использовался reconect (опечатка).
+        // Поддерживаем оба ключа.
+        if (!empty($config["reconnect"]) || !empty($config["reconect"])) {
+            $this->Reconnect();
+        }
+
+        require_once $_SERVER["DOCUMENT_ROOT"].'/local/php_interface/lk/src/classes/Bitrix24API.php';
+        $this->b24List = $this->readData($this->b24ListFile, 'b24list');
+		$date=time();
+		$this->bitrixAPI = new Bitrix24API($config, $logger);
+        if (!$this->b24List || ($date-60*60)>$this->b24List['date'])
+		{	
+			$contactList=$this->bitrixAPI->getContactListFields();
+			$companyList=$this->bitrixAPI->getCompanyListFields();
+			$projectList=$this->bitrixAPI->getSmartProcessListFields($config["bitrix24"]["smart_process_id"]);
+			$map=$this->config['field_mapping']["contact"];
+			foreach ($map as $k=>$v)
+			{
+                if (is_string($v) && !empty($v) && isset($contactList[$v]))
+                    $this->b24List['contacts'][$k]=$contactList[$v]['values'];
+			}
+			$map=$this->config['field_mapping']["company"];
+			foreach ($map as $k=>$v)
+			{
+                if (is_string($v) && !empty($v) && isset($companyList[$v]))
+                    $this->b24List['companies'][$k]=$companyList[$v]['values'];
+			}
+			$map=$this->config['field_mapping']["smart_process"];
+			foreach ($map as $k=>$v)
+			{
+                if (is_string($v) && !empty($v) && isset($projectList[$v]))
+                    $this->b24List['projects'][$k]=$projectList[$v]['values'];
+            }
+            $this->b24List['date']=time();
+
+            $this->writeData($this->b24ListFile, $this->b24List, 'b24list');
+		}
+
     }
+
+    /**
+     * Держим соединение "свежим" для долгоживущего воркера.
+     * По умолчанию делаем реконнект раз в 5 минут, если включён флаг reconnect/reconect.
+     */
+    private function ensureConnectionAlive(): void
+    {
+        $cfg = is_array($this->config) ? $this->config : [];
+        $reconnectEnabled = !empty($cfg['reconnect']) || !empty($cfg['reconect']);
+        if (!$reconnectEnabled) {
+            return;
+        }
+
+        $keepAliveSeconds = (int)($cfg['db_keepalive_seconds'] ?? 300);
+        if ($keepAliveSeconds <= 0) {
+            return;
+        }
+
+        $now = time();
+        if ($this->lastReconnectAtTs > 0 && ($now - $this->lastReconnectAtTs) < $keepAliveSeconds) {
+            return;
+        }
+
+        try {
+            $this->Reconnect();
+        } catch (\Throwable $e) {
+            // Не валим обработку только из-за keepalive — реальная ошибка проявится на запросе.
+            if ($this->logger) {
+                $this->logger->warning('DB keepalive reconnect failed', [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+    }
+
+    /**
+     * Выполняет DB-операцию с авто-reconnect+retry (одна попытка) для 2006/2013.
+     */
+    private function runDbOperation(string $opName, callable $fn, array $options = [])
+    {
+        $retryOnGoneAway = (bool)($options['retry_on_gone_away'] ?? false);
+        $this->ensureConnectionAlive();
+
+        try {
+            return $fn();
+        } catch (\Throwable $e) {
+            if (!$this->isMysqlGoneAway($e)) {
+                throw $e;
+            }
+
+            if ($this->logger) {
+                $this->logger->warning('MySQL connection lost, reconnecting and retrying', [
+                    'operation' => $opName,
+                    'error' => $e->getMessage(),
+                    'retry_enabled' => $retryOnGoneAway,
+                ]);
+            }
+
+            $this->Reconnect();
+
+            if (!$retryOnGoneAway) {
+                // Не делаем повтор для неидемпотентных write-операций, чтобы не получить дубли.
+                throw $e;
+            }
+
+            // Retry ONCE (идемпотентные операции)
+            return $fn();
+        }
+    }
+
+    private function isMysqlGoneAway(\Throwable $e): bool
+    {
+        $msg = $e->getMessage() ?? '';
+        // На практике Bitrix/DB исключения часто содержат текст "MySQL server has gone away" и код (2006)/(2013)
+        return (stripos($msg, 'server has gone away') !== false)
+            || (stripos($msg, '(2006)') !== false)
+            || (stripos($msg, '(2013)') !== false);
+    }
+	
+	public function SendUserInfo($siteUserID, $checkword=false)
+	{
+		if (!$checkword)
+		{
+			$checkword=Bitrix\Main\Security\Random::getString(32);
+			$user = new CUser;
+			//$user->Update($siteUserID, ["CHECKWORD"=>$checkword]);
+		}
+		$this->logger->info('Отправка данных пользователю', ['ID' => $siteUserID, "CHECKWORD"=>$checkword]);
+		$rs=CUser::GetList("id","asc", ["ID"=>$siteUserID], ["FIELDS"=>[], "SELECT"=> ["UF_*"]]);
+		if ($ar=$rs->Fetch())
+		{
+			if (intval($ar["UF_MANAGER_ID"])>0)
+			{
+				$rs2=CUser::GetList("id","asc", ["ID"=>$ar["UF_MANAGER_ID"]], ["FIELDS"=>[], "SELECT"=>["UF_*"]]);
+				if ($arManager=$rs2->Fetch())
+				{
+					
+				}
+			}
+			else $arManager=[];
+            $lkKey=array_search($ar["UF_LK_CLIENT"], $this->b24List['contacts']['lk_client_field']);
+			//echo print_r($ar,true)."lk=".$ar["UF_LK_CLIENT"]."key=".$lkKey.'temp='.$this->siteNewUserText[$lkKey].intval(($lkKey && $this->siteNewUserText[$lkKey]));
+			if ($lkKey && $this->siteNewUserText[$lkKey])
+			{
+				$file=$this->dataDir.'/'.$this->siteNewUserText[$lkKey];
+				if (!file_exists($file)) {
+					return [];
+				}
+				
+				$data = file_get_contents($file);
+				$site='https://'.$_SERVER["HTTP_HOST"].'/';
+				$url=$site.'personal/?change_password=yes&lang=ru&USER_CHECKWORD='.$checkword.'&USER_LOGIN='.urlencode($ar["LOGIN"]);
+				$data=str_replace(
+					["#NAME#", "#SITE#", "#NEW_LK#", '#MANAGER_LAST_NAME#', '#MANAGER_NAME#', '#MANAGER_EMAIL#', '#MANAGER_PHONEW#'],
+					[$ar["NAME"], $site, $url, $arManager["LAST_NAME"], $arManager["NAME"], $arManager["EMAIL"], $arManager["WORK_PHONE"]],
+					$data
+				);
+				CUser::SendUserInfo($siteUserID, 's1', $data, false, "USER_INFO", $checkword);
+				$this->logger->info('Отправка данных пользователю завершена', ['USER' => $ar, "MANAGER"=>$arManager]);
+			}
+		}
+	}
+	
+	private function GetUserGroup($type, $lkClient)
+	{
+		if ($type=="manager")
+		{
+			return $this->siteManagerGroup;
+		}
+		else
+		{
+			$group=$this->siteUserGroup;
+			if ($lkClient && isset($this->siteUserRoleGroup[$lkClient]))
+				$group[]=$this->siteUserRoleGroup[$lkClient];
+			return $group;
+		}
+	}
+
 
     /**
      * Создание директории для данных
@@ -109,98 +311,117 @@ class LocalStorage
      */
     public function createLK($contactData)
     {
-        $this->logger->debug('Creating local LK for contact', ['contact_id' => $contactData['ID']]);
+        return $this->runDbOperation(__FUNCTION__, function () use ($contactData) {
+		    $this->logger->debug('Добавление пользователя', ['contact_id' => $contactData['ID']]);
+		
+		    $user = new CUser;
+		    $pass= $contactData['PASSWORD'] ? $contactData['PASSWORD'] : $this->SetPassword();
+		    if (is_array($contactData['EMAIL']) && $contactData['EMAIL'][0]["VALUE"])
+			    $contactData['EMAIL']=$contactData['EMAIL'][0]["VALUE"];
+		    if (is_array($contactData['PHONE']) && $contactData['PHONE'][0]["VALUE"])
+			    $contactData['PHONE']=$contactData['PHONE'][0]["VALUE"];
+		
+		    // Получаем значение поля агентского договора
+            $agentContractValue = $this->b24List['contacts']['agent_contract_status'][$this->getFieldValue($contactData, 'contact', 'agent_contract_status')];
+            $lkClientValue = $this->b24List['contacts']['lk_client_field'][$this->getFieldValue($contactData, 'contact', 'lk_client_field')];
+		    //$agentContractValue = $this->getFieldValue($contactData, 'contact', 'agent_contract_status');
+		    //$lkClientValue = $this->getFieldValue($contactData, 'contact', 'lk_client_field');
+		    $checkword=Bitrix\Main\Security\Random::getString(32);
+		    $lkData = [
+			    "XML_ID" =>  $contactData['ID'],
+			    'NAME' => $contactData['NAME'] ?? '',
+                'LAST_NAME' => $contactData['LAST_NAME'] ?? '',
+                'SECOND_NAME' => $contactData['SECOND_NAME'] ?? '',
+                'EMAIL' => $contactData['EMAIL'] ?? 'b24user'.$contactData['ID'].'@texxis.ru',
+			    'LOGIN' => $contactData['EMAIL'] ?? 'b24user'.$contactData['ID'].'@texxis.ru',
+                'PERSONAL_PHONE' => $contactData['PHONE'] ?? '',
+                'WORK_COMPANY' => $contactData['COMPANY_ID'] ?? null,
+			    "GROUP_ID" =>  $this->GetUserGroup('client', $lkClientValue),
+			    "PASSWORD" => $pass,
+			    "CONFIRM_PASSWORD" => $pass,
+			    "CHECKWORD"=> $checkword,
+			    "ADMIN_NOTES" => $pass,
+			    "UF_B24_MD5" => md5(serialize($contactData)),
+			    "UF_MANAGER_ID"=> $this->GetUserIDByXMLID("USER_".$contactData['ASSIGNED_BY_ID']),
+			    "UF_TYPE_ID" => $contactData['TYPE_ID'],
+			    "UF_AGENT_CONTRACT_STATUS" => $agentContractValue,
+			    "UF_LK_CLIENT " => $lkClientValue,
+		    ];
+		    $siteID=$user->Add($lkData);
+		    if (intval($siteID) > 0)
+			    $this->logger->info('Успешное добавление пользователя', ['ID' => $siteID]);
+		    else
+		    {
+			    $this->logger->error('Ошибка добавления пользователя', ["error"=>$user->LAST_ERROR]);
+			    return false;
+		    }
+		    //$rs=CUser::GetList("id","asc", ["ID"=>$siteID], ["FIELDS"=>["LOGIN","CHECKWORD"]]);
+		    //if ($ar=$rs->Fetch())
+		    //{
+			    $url='https://'.$_SERVER["HTTP_HOST"].'/personal/?change_password=yes&lang=ru&USER_CHECKWORD='.$checkword.'&USER_LOGIN='.urlencode($lkData["LOGIN"]);
+			    $this->bitrixAPI->startEmailBusinessProcess($contactData['ID'], $url);
+			    //$this->SendUserInfo($siteID, $checkword);
+		    //}
 
-        $contacts = $this->readData($this->contactsFile, 'contacts');
-
-        $lkId = 'LK-' . time() . '-' . $contactData['ID'];
-
-        // Получаем значение поля агентского договора
-        $agentContractValue = $this->getFieldValue($contactData, 'contact', 'agent_contract_status');
-        
-        // Получаем значение поля ЛК клиента
-        $lkClientValue = $this->getFieldValue($contactData, 'contact', 'lk_client_field');
-
-        $lkData = [
-            'id' => $lkId,
-            'bitrix_id' => $contactData['ID'],
-            'name' => $contactData['NAME'] ?? '',
-            'last_name' => $contactData['LAST_NAME'] ?? '',
-            'second_name' => $contactData['SECOND_NAME'] ?? '',
-            'email' => $contactData['EMAIL'] ?? '',
-            'phone' => $contactData['PHONE'] ?? '',
-            'type_id' => $contactData['TYPE_ID'] ?? '',
-            'company' => $contactData['COMPANY_ID'] ?? null,
-            'manager_id' => $contactData['ASSIGNED_BY_ID'] ?? null,
-            'agent_contract_status' => $agentContractValue,
-            'lk_client_field' => $lkClientValue,
-            'status' => 'active',
-            'created_at' => date('Y-m-d H:i:s'),
-            'updated_at' => date('Y-m-d H:i:s'),
-            'source' => 'bitrix24_webhook'
-        ];
-
-        $contacts[$contactData['ID']] = $lkData;
-        $this->writeData($this->contactsFile, $contacts, 'contacts');
-
-        $this->logger->info('Local LK created successfully', ['lk_id' => $lkId, 'contact_id' => $contactData['ID']]);
-
-        return true;
+            return true;
+        }, ['retry_on_gone_away' => false]);
     }
 
     /**
      * Создание компании
-     *
-     * @param array $companyData Данные компании из Bitrix24
-     * @param string|null $inn ИНН компании (если не передан, будет получен через API)
-     * @return bool
      */
     public function createCompany($companyData, $inn = null)
     {
-        $companyId = $companyData['ID'] ?? $companyData['id'] ?? null;
+        return $this->runDbOperation(__FUNCTION__, function () use ($companyData, $inn) {
+            $companyId = $companyData['ID'] ?? $companyData['id'] ?? null;
+		
+		    $this->logger->debug('Добавление компании', ['company_id' => $companyId, 'inn_provided' => $inn !== null]);
+		
+		    if (is_array($companyData['EMAIL']) && $companyData['EMAIL'][0]["VALUE"])
+			    $companyData['EMAIL']=$companyData['EMAIL'][0]["VALUE"];
+		    if (is_array($companyData['PHONE']) && $companyData['PHONE'][0]["VALUE"])
+			    $companyData['PHONE']=$companyData['PHONE'][0]["VALUE"];
+		    if (is_array($companyData['WEB']) && $companyData['WEB'][0]["VALUE"])
+			    $companyData['WEB']=$companyData['WEB'][0]["VALUE"];
+		    // Получаем значение поля партнерского договора
+            //$partnerContractValue = $this->getFieldValue($companyData, 'company', 'partner_contract_status');
+            $partnerContractValue = $this->b24List['companies']['partner_contract_status'][$this->getFieldValue($companyData, 'company', 'partner_contract_status')];
+		
+		    $innValue = $inn ?? $companyData['INN'] ?? $companyData['inn'] ?? null;
+		    $arData= [
+			    "UF_DATE_UPDATE" => new \Bitrix\Main\Type\DateTime,
+			    "UF_DATE_INSERT" => new \Bitrix\Main\Type\DateTime,
+			    "UF_PARTNER_CONTRACT_STATUS" => $partnerContractValue,
+			    "UF_EMAIL" => $companyData['EMAIL'],
+			    "UF_WEB" => $companyData['WEB'],
+			    "UF_INN" => $innValue,
+			    //"UF_INN" => print_r($companyData, true),
+			    "UF_CONTACT_ID" => $companyData['CONTACT_ID'],
+			    "UF_PHONE" => $companyData['PHONE'],
+			    "UF_NAME" => $companyData['TITLE'],
+			    "UF_ID" => $companyId
+		    ];
+		
+		    $hlblock =\Bitrix\Highloadblock\HighloadBlockTable::getById($this->CompanyHLEntityID)->fetch(); 
+		    $entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
+		    $entity_data_class = $entity->getDataClass();
 
-        if (empty($companyId)) {
-            $this->logger->error('Company ID is missing in company data', [
-                'data_keys' => array_keys($companyData),
-                'has_id' => isset($companyData['ID']),
-                'has_lowercase_id' => isset($companyData['id'])
-            ]);
-            return false;
-        }
+            $result = $entity_data_class::add($arData);
+            if ($result->isSuccess())
+            {
+                $this->logger->info('Компания добавлена', ['company_id' => $companyId, 'inn' => $innValue]);
+                return $result->getId();
+            }
+            else
+            {
+                $this->logger->error('Ошибка добавления компании', ["error"=>$result->getErrorMessages()]);
+                return false;
+            }
+		
+		
 
-        $this->logger->debug('Creating company locally', ['company_id' => $companyId, 'inn_provided' => $inn !== null]);
-
-        $companies = $this->readData($this->companiesFile, 'companies');
-
-        // Получаем значения полей из маппинга
-        $partnerContractValue = $this->getFieldValue($companyData, 'company', 'partner_contract_status');
-
-        // ИНН передается как параметр или берется из данных (для обратной совместимости)
-        $innValue = $inn ?? $companyData['INN'] ?? $companyData['inn'] ?? null;
-
-        $companies[$companyId] = [
-            'id' => $companyId,
-            'title' => $companyData['TITLE'] ?? $companyData['title'] ?? '',
-            'email' => $companyData['EMAIL'] ?? $companyData['email'] ?? '',
-            'phone' => $companyData['PHONE'] ?? $companyData['phone'] ?? '',
-            'inn' => $innValue,
-            'type' => $companyData['COMPANY_TYPE'] ?? $companyData['company_type'] ?? '',
-            'industry' => $companyData['INDUSTRY'] ?? $companyData['industry'] ?? '',
-            'employees' => $companyData['EMPLOYEES'] ?? $companyData['employees'] ?? '',
-            'revenue' => $companyData['REVENUE'] ?? $companyData['revenue'] ?? '',
-            'address' => $companyData['ADDRESS'] ?? $companyData['address'] ?? '',
-            'contact_id' => $companyData['CONTACT_ID'] ?? null,
-            'partner_contract_status' => $partnerContractValue,
-            'created_at' => date('Y-m-d H:i:s'),
-            'updated_at' => date('Y-m-d H:i:s'),
-            'source' => 'bitrix24_webhook'
-        ];
-
-        $this->writeData($this->companiesFile, $companies, 'companies');
-
-        $this->logger->info('Company created successfully', ['company_id' => $companyId, 'inn' => $innValue]);
-
-        return true;
+            return true;
+        }, ['retry_on_gone_away' => false]);
     }
 
     /**
@@ -208,304 +429,237 @@ class LocalStorage
      */
     public function syncContactByBitrixId($contactId, $contactData)
     {
-        $existingContact = $this->getContact($contactId);
+        $existingContact = $this->GetUserIDByXMLID($contactId);
 
         if (!$existingContact) {
-            $this->logger->warning('Contact not found for sync by Bitrix ID', [
+            $this->logger->warning('Контакт не найден', [
                 'contact_id' => $contactId
             ]);
             return false;
         }
 
-        return $this->syncContact($existingContact['id'], $contactData);
+        return $this->syncContact($contactId, $existingContact, $contactData);
     }
 
     /**
      * Синхронизация данных контакта
      */
-    public function syncContact($lkId, $contactData)
+    public function syncContact($lkId, $siteID, $contactData)
     {
-        $this->logger->debug('Syncing contact data locally', [
-            'lk_id' => $lkId,
-            'contact_id' => $contactData['ID']
-        ]);
-
-        $contacts = $this->readData($this->contactsFile, 'contacts');
-
-        if (!isset($contacts[$contactData['ID']])) {
-            $this->logger->warning('Contact not found in local storage, creating new', [
-                'contact_id' => $contactData['ID'],
-                'available_contacts' => array_keys($contacts)
+		$existingContact = $this->GetUserIDByXMLID($contactId);
+		if (!$existingContact) {
+            $this->logger->warning('Контакт не найден, создаем новый', [
+                'contact_id' => $lkId,
+                //'available_contacts' => $contactData,
             ]);
             return $this->createLK($contactData);
         }
-
-        $oldData = $contacts[$contactData['ID']];
-        $this->logger->debug('Contact found, preparing update', [
-            'contact_id' => $contactData['ID']
+		
+		$this->logger->debug('Обновление данных контакта', [
+            'lk_id' => $lkId,
+            'contact_id' => $lkId
         ]);
+		
+		$user = new CUser;
+		
+		$lkData = [];
+		if (is_array($contactData['PHONE']) && $contactData['PHONE'][0]["VALUE"])
+			$contactData['PHONE']=$contactData['PHONE'][0]["VALUE"];
+		if (is_array($contactData['EMAIL']) && $contactData['EMAIL'][0]["VALUE"])
+			$contactData['EMAIL']=$contactData['EMAIL'][0]["VALUE"];
+		
+        $agentContractValue = $this->b24List['contacts']['agent_contract_status'][$this->getFieldValue($contactData, 'contact', 'agent_contract_status')];
+        $lkClientValue = $this->b24List['contacts']['lk_client_field'][$this->getFieldValue($contactData, 'contact', 'lk_client_field')];
+		//$agentContractValue = $this->getFieldValue($contactData, 'contact', 'agent_contract_status');
+		//$lkClientValue = $this->getFieldValue($contactData, 'contact', 'lk_client_field');
+		
+		$bitrixManagerId=$this->GetUserIDByXMLID("USER_".$contactData['ASSIGNED_BY_ID']);
+		if (!$bitrixManagerId && $contactData['ASSIGNED_BY_ID'])
+		{
+			$assignedById=$contactData['ASSIGNED_BY_ID'];
+			$managerData = $this->bitrixAPI->getEntityData('user', $assignedById);
+			
+			if ($managerData && isset($managerData['result'])) {
+				$userData = $managerData['result'];
+				if (is_array($userData) && isset($userData[0])) {
+					$userData = $userData[0];
+				}
+			}
+			$this->syncManagerByBitrixId($assignedById, $userData);
+			$bitrixManagerId=$this->GetUserIDByXMLID("USER_".$contactData['ASSIGNED_BY_ID']);
+		}
+		
+		if ($contactData['NAME']) $lkData['NAME'] = $contactData['NAME'];
+		if ($contactData['LAST_NAME']) $lkData['LAST_NAME'] = $contactData['LAST_NAME'];
+		if ($contactData['SECOND_NAME']) $lkData['SECOND_NAME'] = $contactData['SECOND_NAME'];
+		if ($contactData['EMAIL']) { $lkData['EMAIL'] = $contactData['EMAIL']; $lkData['LOGIN'] = $contactData['EMAIL'];}
+		if ($contactData['PHONE']) $lkData['PERSONAL_PHONE'] = $contactData['PHONE'];	
+		if ($contactData['COMPANY_ID']) $lkData['WORK_COMPANY'] = $contactData['COMPANY_ID'];
+		if ($contactData['PASSWORD']) { $lkData['PASSWORD'] = $contactData['PASSWORD']; $lkData["CONFIRM_PASSWORD"]=$contactData['PASSWORD'];}
+		if ($contactData['ASSIGNED_BY_ID']) $lkData['UF_MANAGER_ID'] = $bitrixManagerId;
+		if ($agentContractValue) $lkData["UF_AGENT_CONTRACT_STATUS"] = $agentContractValue;
+		if ($contactData['TYPE_ID']) $lkData["UF_TYPE_ID"] = $contactData['TYPE_ID'];
+		if ($lkClientValue) $lkData["UF_LK_CLIENT"] = $lkClientValue;
 
-        $contacts[$contactData['ID']]['name'] = $contactData['NAME'] ?? $contacts[$contactData['ID']]['name'];
-        $contacts[$contactData['ID']]['last_name'] = $contactData['LAST_NAME'] ?? $contacts[$contactData['ID']]['last_name'];
-        $contacts[$contactData['ID']]['second_name'] = $contactData['SECOND_NAME'] ?? $contacts[$contactData['ID']]['second_name'];
-        $contacts[$contactData['ID']]['email'] = $contactData['EMAIL'] ?? $contacts[$contactData['ID']]['email'];
-        $contacts[$contactData['ID']]['phone'] = $contactData['PHONE'] ?? $contacts[$contactData['ID']]['phone'];
-        $contacts[$contactData['ID']]['type_id'] = $contactData['TYPE_ID'] ?? $contacts[$contactData['ID']]['type_id'];
-        $contacts[$contactData['ID']]['company'] = $contactData['COMPANY_ID'] ?? $contacts[$contactData['ID']]['company'];
-        $contacts[$contactData['ID']]['manager_id'] = $contactData['ASSIGNED_BY_ID'] ?? $contacts[$contactData['ID']]['manager_id'];
-        
-        // Обновляем поле агентского договора
-        $agentContractValue = $this->getFieldValue($contactData, 'contact', 'agent_contract_status');
-        if ($agentContractValue !== null) {
-            $contacts[$contactData['ID']]['agent_contract_status'] = $agentContractValue;
-        }
-        
-        // Обновляем поле ЛК клиента
-        $lkClientValue = $this->getFieldValue($contactData, 'contact', 'lk_client_field');
-        if ($lkClientValue !== null) {
-            $contacts[$contactData['ID']]['lk_client_field'] = $lkClientValue;
-        }
-        
-        $newUpdatedAt = date('Y-m-d H:i:s');
-        $contacts[$contactData['ID']]['updated_at'] = $newUpdatedAt;
-
-        $this->logger->debug('Contact data updated in memory', [
-            'contact_id' => $contactData['ID']
-        ]);
-
-        $writeResult = $this->writeData($this->contactsFile, $contacts, 'contacts');
-        
-        if ($writeResult === false) {
-            $this->logger->error('Failed to write contact data', ['contact_id' => $contactData['ID']]);
-        } else {
-            $this->logger->info('Contact synced successfully', ['contact_id' => $contactData['ID']]);
-        }
+		$lkData["UF_B24_MD5"] = md5(serialize($contactData));
+		
+		$res=$user->Update($siteID, $lkData);
+		if ($res)
+			$this->logger->info('Пользователь обновлен', ['ID' => $siteID, 'contactData'=>$contactData, /*'lkData'=> $lkData,  'agentContractValue'=>$agentContractValue*/]);
+		else
+		{
+			$this->logger->error('Ошибка обновления пользователя', ["error"=>$user->LAST_ERROR]);
+			return false;
+		}
 
         return true;
     }
 
     /**
      * Синхронизация данных компании
-     *
-     * @param string $lkId ID в локальном хранилище (не используется, оставлено для совместимости)
-     * @param array $companyData Данные компании из Bitrix24
-     * @param string|null $inn ИНН компании (если не передан, будет получен через API)
-     * @return bool
      */
     public function syncCompany($lkId, $companyData, $inn = null)
-    {
-        $this->logger->debug('Syncing company data locally', [
-            'lk_id' => $lkId,
-            'company_id' => $companyData['ID'],
-            'inn_provided' => $inn !== null
-        ]);
+    {	
+		$this->logger->debug('Обновление компании', ['lk_id' => $lkId, 'company_id' => $companyData['ID'], 'inn_provided' => $inn !== null]);
+		$company=$this->getCompanyByXMLID($lkId);
+		if ($company["SITE_ID"])
+		{
+			$arData= [];
+			$arData["UF_DATE_UPDATE"] = new \Bitrix\Main\Type\DateTime;
+			if (is_array($companyData['EMAIL']) && $companyData['EMAIL'][0]["VALUE"])
+				$companyData['EMAIL']=$companyData['EMAIL'][0]["VALUE"];
+			if (is_array($companyData['PHONE']) && $companyData['PHONE'][0]["VALUE"])
+				$companyData['PHONE']=$companyData['PHONE'][0]["VALUE"];
+			if (is_array($companyData['WEB']) && $companyData['WEB'][0]["VALUE"])
+				$companyData['WEB']=$companyData['WEB'][0]["VALUE"];
+			// Получаем значение поля партнерского договора
+			//$partnerContractValue = $this->getFieldValue($companyData, 'company', 'partner_contract_status');
+	        $partnerContractValue = $this->b24List['companies']['partner_contract_status'][$this->getFieldValue($companyData, 'company', 'partner_contract_status')];
+			$innValue = $inn ?? $companyData['INN'] ?? $companyData['inn'] ?? null;
+				
+			if ($partnerContractValue) $arData["UF_PARTNER_CONTRACT_STATUS"] = $partnerContractValue;
+			if ($companyData['EMAIL']) $arData["UF_EMAIL"] = $companyData['EMAIL'];
+			if ($companyData['WEB']) $arData["UF_WEB"]= $companyData['WEB'];
+			if ($innValue) $arData["UF_INN"] = $innValue;
+			if ($companyData['CONTACT_ID']) $arData["UF_CONTACT_ID"] = $companyData['CONTACT_ID'];
+			if ($companyData['PHONE']) $arData["UF_PHONE"] = $companyData['PHONE'];
+			if ($companyData['TITLE']) $arData["UF_NAME"] = $companyData['TITLE'];
+			
+			
+			
+			$hlblock = \Bitrix\Highloadblock\HighloadBlockTable::getById($this->CompanyHLEntityID)->fetch(); 
+			$entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
+			$entity_data_class = $entity->getDataClass();
 
-        $companies = $this->readData($this->companiesFile, 'companies');
-
-        // Получаем значения полей из маппинга
-        $partnerContractValue = $this->getFieldValue($companyData, 'company', 'partner_contract_status');
-
-        // ИНН передается как параметр или берется из данных (для обратной совместимости)
-        $innValue = $inn ?? $companyData['INN'] ?? $companyData['inn'] ?? null;
-
-        $companies[$companyData['ID']] = [
-            'id' => $companyData['ID'],
-            'title' => $companyData['TITLE'] ?? '',
-            'email' => $companyData['EMAIL'] ?? '',
-            'phone' => $companyData['PHONE'] ?? '',
-            'inn' => $innValue,
-            'industry' => $companyData['INDUSTRY'] ?? '',
-            'employees' => $companyData['EMPLOYEES'] ?? '',
-            'revenue' => $companyData['REVENUE'] ?? '',
-            'address' => $companyData['ADDRESS'] ?? '',
-            'contact_id' => $companyData['CONTACT_ID'] ?? null,
-            'partner_contract_status' => $partnerContractValue,
-            'created_at' => $companyData['DATE_CREATE'] ?? date('Y-m-d H:i:s'),
-            'updated_at' => date('Y-m-d H:i:s'),
-            'source' => 'bitrix24_webhook'
-        ];
-
-        $writeResult = $this->writeData($this->companiesFile, $companies, 'companies');
-
-        if ($writeResult === false) {
-            $this->logger->error('Failed to write company data', ['company_id' => $companyData['ID']]);
-        } else {
-            $this->logger->info('Company synced successfully', ['company_id' => $companyData['ID'], 'inn' => $innValue]);
-        }
+			$result = $entity_data_class::update($company["SITE_ID"], $arData);
+			if ($result->isSuccess())
+			{
+				$this->logger->info('Компания обновлена', ['company_id' => $companyData['ID'], 'inn' => $innValue]);
+				return $result->getId();
+			}
+			else
+			{
+				this->logger->error('Ошибка обновления компании', ["error"=>$result->getErrorMessages()]);
+				return false;
+			}
+		}
 
         return true;
     }
 
-    /**
-     * Получение всех контактов
-     */
-    public function getAllContacts()
-    {
-        return $this->readData($this->contactsFile, 'contacts');
-    }
-
-    /**
-     * Получение последнего обновленного контакта
-     */
-    public function getLastUpdatedContact()
-    {
-        $contacts = $this->readData($this->contactsFile, 'contacts');
-
-        if (empty($contacts)) {
-            return null;
-        }
-
-        uasort($contacts, function($a, $b) {
-            return strtotime($b['updated_at'] ?? $b['created_at']) <=> strtotime($a['updated_at'] ?? $a['created_at']);
-        });
-
-        return reset($contacts);
-    }
-
-    /**
-     * Получение контактов отсортированных по времени обновления
-     */
-    public function getContactsSortedByUpdate($limit = null)
-    {
-        $contacts = $this->readData($this->contactsFile, 'contacts');
-
-        if (empty($contacts)) {
-            return [];
-        }
-
-        uasort($contacts, function($a, $b) {
-            return strtotime($b['updated_at'] ?? $b['created_at']) <=> strtotime($a['updated_at'] ?? $a['created_at']);
-        });
-
-        if ($limit !== null) {
-            return array_slice($contacts, 0, $limit, true);
-        }
-
-        return $contacts;
-    }
-
+  
     /**
      * Получение контакта по ID
      */
     public function getContact($contactId)
     {
-        $contacts = $this->readData($this->contactsFile, 'contacts');
-        return $contacts[$contactId] ?? null;
-    }
-
-    /**
-     * Получение контакта по email
-     */
-    public function getContactByEmail($email)
-    {
-        $contacts = $this->readData($this->contactsFile, 'contacts');
-
-        foreach ($contacts as $contact) {
-            if (isset($contact['email']) && $contact['email'] === $email) {
-                return $contact;
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     * Получение всех компаний
-     */
-    public function getAllCompanies()
-    {
-        return $this->readData($this->companiesFile, 'companies');
+        /*$contacts = $this->readData($this->contactsFile, 'contacts');
+        return $contacts[$contactId] ?? null;*/
+		return $this->GetUserDataByXMLID($contactId);
+		
     }
 
     /**
      * Получение компании по ID
      */
-    public function getCompany($companyId)
+    public function getCompany($companyId) 
     {
-        $companies = $this->readData($this->companiesFile, 'companies');
-        return $companies[$companyId] ?? null;
+        /*$companies = $this->readData($this->companiesFile, 'companies');
+        return $companies[$companyId] ?? null;*/
+		return $this->getCompanyByXMLID($companyId);
     }
 
-    /**
-     * Получение всех проектов
-     */
-    public function getAllProjects()
-    {
-        return $this->readData($this->projectsFile, 'projects');
-    }
-
-    /**
-     * Получение всех менеджеров
-     */
-    public function getAllManagers()
-    {
-        return $this->readData($this->managersFile, 'managers');
-    }
 
     /**
      * Добавление проекта
      */
-    public function addProject($projectData)
+    public function addProject($projectData) 
     {
-        $projectId = $projectData['id'] ?? $projectData['ID'] ?? $projectData['bitrix_id'] ?? null;
-        if (!$projectId) {
-            $this->logger->error('Project ID not found in data', ['project_data_keys' => array_keys($projectData)]);
-            return false;
-        }
+		$projectId = $projectData['id'] ?? $projectData['ID'] ?? $projectData['bitrix_id'] ?? null;
+		if ($_SESSION["addProject"]==$projectId) return false;
+		$_SESSION["addProject"]=$projectId;
+		$project=$this->getProjectByXMLID($projectId);
+		if ($project) {
+			$this->logger->warning('Такой проект уже есть', [
+                'project_id' => $projectId,
+				'project_data' => $projectData,
+            ]);
+			return false;
+		}
+		$this->logger->debug('Добавление проекта', ['project_id' => $projectId]);
+		if(is_array($projectData['system_types']))
+		{
+			foreach ($projectData['system_types'] as $k=>$v)
+			{
+                $projectData['system_types'][$k]=$this->b24List['projects']['system_types'][$v];
+			}
+			$projectData['system_types']=implode(', ', $projectData['system_types']);
+		}
+		else
+		{
+            $projectData['system_types']=$this->b24List['projects']['system_types'][$projectData['system_types']];
+		}
+        $projectData['request_type']=$this->b24List['projects']['request_type'][$projectData['request_type']];
+		$projectData['location'] = trim(explode('|', $projectData['location'])[0]);
+		
+		$project=$this->getProjectByXMLID($projectId);
+		$arData= [
+			"UF_DATE_UPDATE" => new \Bitrix\Main\Type\DateTime,
+			"UF_DATE_INSERT" => new \Bitrix\Main\Type\DateTime,
+			'UF_ID' => $projectId,
+            'UF_ORGANIZATION_NAME' => $projectData['organization_name'] ?? '',
+            'UF_OBJECT_NAME' => $projectData['object_name'] ?? '',
+            'UF_SYSTEM_TYPE' => $projectData['system_types'] ?? '',
+            'UF_LOCATION' => $projectData['location'] ?? '',
+            'UF_IMPLEMENTATION_DATE' => $projectData['implementation_date'] ?? null,
+            'UF_STATUS' => $projectData['status'] ?? '',
+            'UF_CLIENT_ID' => $projectData['client_id'] ?? null,
+            'UF_MANAGER_ID' =>  "USER_".$projectData['manager_id'] ?? null,
+			'UF_REQUEST_TYPE' => $projectData['request_type'] ?? null,
+			//'UF_EQUIPMENT_LIST' => $projectData['equipment_list'] ?? null,
+			'UF_EQUIPMENT_LIST_TEXT' => $projectData['equipment_list_text'] ?? '',
+			'UF_COMPETITORS' => $projectData['competitors'] ?? null,
+			'UF_MARKETING_DISCOUNT' => $projectData['marketing_discount'] ?? null,
+			'UF_TECHNICAL_DESCRIPTION' => $projectData['technical_description'] ?? null,
+		];
+		
+		$hlblock =\Bitrix\Highloadblock\HighloadBlockTable::getById($this->ProjectHLEntityID)->fetch(); 
+		$entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
+		$entity_data_class = $entity->getDataClass();
 
-        $this->logger->debug('Adding project locally', ['project_id' => $projectId]);
-
-        $projects = $this->readData($this->projectsFile, 'projects');
-
-        // Если проект уже существует, переключаемся на синхронизацию
-        if (isset($projects[$projectId])) {
-            $this->logger->info('Project already exists, switching to sync mode', ['project_id' => $projectId]);
-            return $this->syncProjectByBitrixId($projectId, $projectData);
-        }
-
-        // Обработка equipment_list - всегда массив файлов
-        $equipmentList = $projectData['equipment_list'] ?? [];
-        if (!is_array($equipmentList)) {
-            // Если это не массив, преобразуем в массив (для обратной совместимости)
-            $equipmentList = !empty($equipmentList) ? [$equipmentList] : [];
-        }
-
-        $projects[$projectId] = [
-            'bitrix_id' => $projectId,
-            'organization_name' => $projectData['organization_name'] ?? '',
-            'object_name' => $projectData['object_name'] ?? '',
-            'system_types' => is_array($projectData['system_types'] ?? null) ? $projectData['system_types'] : (!empty($projectData['system_types']) ? [$projectData['system_types']] : []),
-            'location' => $projectData['location'] ?? '',
-            'implementation_date' => $projectData['implementation_date'] ?? null,
-            'request_type' => $projectData['request_type'] ?? '',
-            'equipment_list' => $equipmentList,
-            'equipment_list_text' => $projectData['equipment_list_text'] ?? '',
-            'competitors' => $projectData['competitors'] ?? '',
-            'marketing_discount' => $projectData['marketing_discount'] ?? false,
-            'technical_description' => $projectData['technical_description'] ?? '',
-            'status' => $projectData['status'] ?? '',
-            'client_id' => $projectData['client_id'] ?? null,
-            'manager_id' => $projectData['manager_id'] ?? null,
-            'created_at' => $projectData['created_at'] ?? date('Y-m-d H:i:s'),
-            'updated_at' => date('Y-m-d H:i:s'),
-            'source' => 'bitrix24_webhook'
-        ];
-        
-        $this->logger->debug('Project data being saved', [
-            'project_id' => $projectId,
-            'organization_name' => $projects[$projectId]['organization_name'],
-            'client_id' => $projects[$projectId]['client_id'],
-            'status' => $projects[$projectId]['status']
-        ]);
-
-        $writeResult = $this->writeData($this->projectsFile, $projects, 'projects');
-
-        if ($writeResult === false) {
-            $this->logger->error('Failed to write project data', ['project_id' => $projectId]);
-        } else {
-            $this->logger->info('Project added successfully', ['project_id' => $projectId]);
-        }
-
+		$result = $entity_data_class::add($arData);
+		if ($result->isSuccess())
+		{
+			$this->logger->info('Проект добавлен', ['project_id' => $projectId, 'site_id' => $result->getId()]);
+			return $result->getId();
+		}
+		else
+		{
+			this->logger->error('Ошибка добавления проекта', ["error"=>$result->getErrorMessages()]);
+			return false;
+		}
+		$_SESSION["addProject"]=false;
+	
         return true;
     }
 
@@ -514,57 +668,56 @@ class LocalStorage
      */
     public function addManager($managerData)
     {
-        $this->logger->debug('Adding manager locally', ['manager_id' => $managerData['ID'] ?? 'unknown']);
-
-        $managers = $this->readData($this->managersFile, 'managers');
-
-        $managerId = $managerData['ID'] ?? $managerData['bitrix_id'] ?? null;
-        if (!$managerId) {
-            $this->logger->error('Manager ID not found in data', ['manager_data_keys' => array_keys($managerData)]);
-            return false;
-        }
-
-        $managers[$managerId] = [
-            'bitrix_id' => $managerId,
-            'name' => $managerData['NAME'] ?? '',
-            'last_name' => $managerData['LAST_NAME'] ?? '',
-            'email' => $managerData['EMAIL'] ?? '',
-            'phone' => $this->extractManagerPhone($managerData),
-            'position' => $managerData['WORK_POSITION'] ?? '',
-            'photo' => $this->extractManagerPhoto($managerData),
-            'messengers' => $this->extractManagerMessengers($managerData),
-            'created_at' => date('Y-m-d H:i:s'),
-            'updated_at' => date('Y-m-d H:i:s'),
-            'source' => 'bitrix24_webhook'
-        ];
-
-        $writeResult = $this->writeData($this->managersFile, $managers, 'managers');
-
-        if ($writeResult === false) {
-            $this->logger->error('Failed to write manager data', ['manager_id' => $managerId]);
-        } else {
-            $this->logger->info('Manager added successfully', ['manager_id' => $managerId]);
-        }
+		$this->logger->debug('Добавление менеджера', ['manager_id' => $managerData["ID"]/*, "data"=>$managerData*/]);
+		$user = new CUser;
+		$pass=$managerData['PASSWORD'] ? $managerData['PASSWORD'] : $this->SetPassword();
+		if (is_array($managerData['EMAIL']) && $managerData['EMAIL'][0]["VALUE"])
+			$managerData['EMAIL']=$managerData['EMAIL'][0]["VALUE"];
+		/*if (is_array($managerData['PHONE']) && $managerData['PHONE'][0]["VALUE"])
+			$managerData['PHONE']=$managerData['PHONE'][0]["VALUE"];
+		elseif (is_array($managerData['PHONE']) && $managerData['PHONE'][0]["VALUE"])
+			$managerData['PHONE']=$managerData['PHONE'][0]["VALUE"];*/
+		
+		$lkData = [
+			"XML_ID" =>  "USER_".$managerData["ID"],
+			'NAME' => $managerData['NAME'] ?? '',
+            'LAST_NAME' => $managerData['LAST_NAME'] ?? '',
+            'SECOND_NAME' => $managerData['SECOND_NAME'] ?? '',
+            'EMAIL' => $managerData['EMAIL'] ?? 'b24user'.$managerData['ID'].'@texxis.ru',
+			'LOGIN' => $managerData['EMAIL'] ?? 'b24user'.$managerData['ID'].'@texxis.ru',
+            'WORK_PHONE' => $this->extractManagerPhone($managerData),
+            'WORK_POSITION' => $managerData['WORK_POSITION'] ?? null,
+			'PERSONAL_PHOTO' => @CFile::MakeFileArray($managerData['PERSONAL_PHOTO']),
+			"UF_B24_MD5" => md5(serialize($managerData)),
+			"GROUP_ID" => $this->GetUserGroup('manager', ''),
+			"PASSWORD"          => $pass,
+			"CONFIRM_PASSWORD"  => $pass,
+			"ADMIN_NOTES" => $pass,
+			'UF_MESSENGERS' => serialize($this->extractManagerMessengers($managerData)),
+		];
+		$siteID=$user->Add($lkData);
+		if (intval($siteID) > 0)
+			$this->logger->info('Менеджер добавлен', ['ID' => $siteID]);
+		else
+		{
+			$this->logger->error('Ошибка добавления менеджера', ["error"=>$user->LAST_ERROR]);
+			return false;
+		}		
 
         return true;
     }
 
     /**
      * Синхронизация данных компании по Bitrix ID
-     *
-     * @param int $companyId ID компании в Bitrix24
-     * @param array $companyData Данные компании из Bitrix24
-     * @param string|null $inn ИНН компании (если не передан, будет получен через API)
-     * @return bool
      */
-    public function syncCompanyByBitrixId($companyId, $companyData, $inn = null)
+    public function syncCompanyByBitrixId($companyId, $companyData, $inn = null) 
     {
         $existingCompany = $this->getCompany($companyId);
 
         if (!$existingCompany) {
-            $this->logger->warning('Company not found for sync by Bitrix ID, creating new', [
+            $this->logger->warning('Компания не найдена, создаем новую', [
                 'company_id' => $companyId,
-                'inn_provided' => $inn !== null
+				'inn_provided' => $inn !== null
             ]);
             return $this->createCompany($companyData, $inn);
         }
@@ -575,58 +728,71 @@ class LocalStorage
     /**
      * Синхронизация данных проекта по Bitrix ID
      */
-    public function syncProjectByBitrixId($projectId, $projectData)
+    public function syncProjectByBitrixId($projectId, $projectData) 
     {
-        $this->logger->debug('Syncing project by Bitrix ID', ['project_id' => $projectId]);
-
-        $projects = $this->readData($this->projectsFile, 'projects');
-
-        if (!isset($projects[$projectId])) {
-            $this->logger->debug('Project not found for sync by Bitrix ID, creating new', [
-                'project_id' => $projectId
+	
+		$project=$this->getProjectByXMLID($projectId);
+		if (!$project) {
+            $this->logger->warning('Проект не найден, добавляем проект', [
+                'project_id' => $projectId,
+				'project_data' => $projectData,
             ]);
-            return $this->addProject($projectData);
+			if ($projectData)
+				return $this->addProject($projectData);
         }
+		
+		$this->logger->debug('Обновление проекта', ['project_id' => $projectId, 'project_data' => $projectData,]);
+		
+		
+		$arData=[
+			"UF_DATE_UPDATE" => new \Bitrix\Main\Type\DateTime,
+		];
+		
+		if(is_array($projectData['system_types']))
+		{
+			foreach ($projectData['system_types'] as $k=>$v)
+			{
+                $projectData['system_types'][$k]=$this->b24List['projects']['system_types'][$v];
+			}
+			$projectData['system_types']=implode(', ', $projectData['system_types']);
+		}
+		else
+		{
+            $projectData['system_types']=$this->b24List['projects']['system_types'][$projectData['system_types']];
+		}
+        $projectData['request_type']=$this->b24List['projects']['request_type'][$projectData['request_type']];
+		$projectData['location'] = trim(explode('|', $projectData['location'])[0]);
+		
+		if ($projectData['organization_name']) $arData['UF_ORGANIZATION_NAME'] = $projectData['organization_name'];
+		if ($projectData['object_name']) $arData['UF_OBJECT_NAME'] = $projectData['object_name'];
+		if ($projectData['system_types']) $arData['UF_SYSTEM_TYPE'] = $projectData['system_types'];
+		if ($projectData['location']) $arData['UF_LOCATION'] = $projectData['location'];
+		if ($projectData['implementation_date']) $arData['UF_IMPLEMENTATION_DATE'] = $projectData['implementation_date'];
+		if ($projectData['status']) $arData['UF_STATUS'] = $projectData['status'];
+		if ($projectData['client_id']) $arData['UF_CLIENT_ID'] = $projectData['client_id'];
+		if ($projectData['manager_id']) $arData['UF_MANAGER_ID'] = "USER_".$projectData['manager_id'];
+		if ($projectData['request_type']) $arData['UF_REQUEST_TYPE'] = $projectData['request_type'];
+		//if ($projectData['equipment_list']["id"]) $arData['UF_EQUIPMENT_LIST'] = @CFile::MakeFileArray($projectData['equipment_list']["id"]);
+		if ($projectData['competitors']) $arData['UF_COMPETITORS'] = $projectData['competitors'];
+		if (isset($projectData['marketing_discount'])) $arData['UF_MARKETING_DISCOUNT'] = $projectData['marketing_discount'];
+		if ($projectData['technical_description']) $arData['UF_TECHNICAL_DESCRIPTION'] = $projectData['technical_description'];
+		
+					
+		$hlblock = \Bitrix\Highloadblock\HighloadBlockTable::getById($this->ProjectHLEntityID)->fetch(); 
+		$entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
+		$entity_data_class = $entity->getDataClass();
 
-        $projects[$projectId]['organization_name'] = $projectData['organization_name'] ?? $projects[$projectId]['organization_name'] ?? '';
-        $projects[$projectId]['object_name'] = $projectData['object_name'] ?? $projects[$projectId]['object_name'] ?? '';
-        $systemTypesValue = $projectData['system_types'] ?? $projects[$projectId]['system_types'] ?? [];
-        $projects[$projectId]['system_types'] = is_array($systemTypesValue) ? $systemTypesValue : (!empty($systemTypesValue) ? [$systemTypesValue] : []);
-        $projects[$projectId]['location'] = $projectData['location'] ?? $projects[$projectId]['location'] ?? '';
-        $projects[$projectId]['implementation_date'] = $projectData['implementation_date'] ?? $projects[$projectId]['implementation_date'] ?? null;
-        $projects[$projectId]['request_type'] = $projectData['request_type'] ?? $projects[$projectId]['request_type'] ?? '';
-        $projects[$projectId]['equipment_list_text'] = $projectData['equipment_list_text'] ?? $projects[$projectId]['equipment_list_text'] ?? '';
-        
-        // Обработка equipment_list - всегда массив файлов
-        $equipmentList = $projectData['equipment_list'] ?? $projects[$projectId]['equipment_list'] ?? [];
-        if (!is_array($equipmentList)) {
-            // Если это не массив, преобразуем в массив (для обратной совместимости)
-            $equipmentList = !empty($equipmentList) ? [$equipmentList] : [];
-        }
-        $projects[$projectId]['equipment_list'] = $equipmentList;
-        
-        $projects[$projectId]['competitors'] = $projectData['competitors'] ?? $projects[$projectId]['competitors'] ?? '';
-        $projects[$projectId]['marketing_discount'] = $projectData['marketing_discount'] ?? $projects[$projectId]['marketing_discount'] ?? false;
-        $projects[$projectId]['technical_description'] = $projectData['technical_description'] ?? $projects[$projectId]['technical_description'] ?? '';
-        $projects[$projectId]['status'] = $projectData['status'] ?? $projects[$projectId]['status'] ?? 'NEW';
-        $projects[$projectId]['client_id'] = $projectData['client_id'] ?? $projects[$projectId]['client_id'] ?? null;
-        $projects[$projectId]['manager_id'] = $projectData['manager_id'] ?? $projects[$projectId]['manager_id'] ?? null;
-        $projects[$projectId]['updated_at'] = date('Y-m-d H:i:s');
-        
-        $this->logger->debug('Project data being updated', [
-            'project_id' => $projectId,
-            'organization_name' => $projects[$projectId]['organization_name'],
-            'client_id' => $projects[$projectId]['client_id'],
-            'status' => $projects[$projectId]['status']
-        ]);
-
-        $writeResult = $this->writeData($this->projectsFile, $projects, 'projects');
-
-        if ($writeResult === false) {
-            $this->logger->error('Failed to write project data', ['project_id' => $projectId]);
-        } else {
-            $this->logger->info('Project synced successfully', ['project_id' => $projectId]);
-        }
+		$result = $entity_data_class::update($project["SITE_ID"], $arData);
+		if ($result->isSuccess())
+		{
+			 $this->logger->info('Проект обновлен', ['project_id' => $projectId]);
+			return $result->getId();
+		}
+		else
+		{
+			this->logger->error('Ошибка обновления проекта', ["error"=>$result->getErrorMessages()]);
+			return false;
+		}
 
         return true;
     }
@@ -636,41 +802,47 @@ class LocalStorage
      */
     public function syncManagerByBitrixId($managerId, $managerData)
     {
-        $this->logger->debug('Syncing manager by Bitrix ID', ['manager_id' => $managerId]);
-
-        $managers = $this->readData($this->managersFile, 'managers');
-
-        if (!isset($managers[$managerId])) {
-            $this->logger->warning('Manager not found for sync by Bitrix ID, creating new', [
+		$contact=$this->GetUserDataByXMLID("USER_".$managerId);
+		if (!$contact) {
+            $this->logger->warning('Менеджер не найден, создаем нового', [
                 'manager_id' => $managerId
             ]);
             return $this->addManager($managerData);
         }
-
-        $managers[$managerId]['name'] = $managerData['NAME'] ?? $managers[$managerId]['name'];
-        $managers[$managerId]['last_name'] = $managerData['LAST_NAME'] ?? $managers[$managerId]['last_name'];
-        $managers[$managerId]['email'] = $managerData['EMAIL'] ?? $managers[$managerId]['email'];
-        $managers[$managerId]['phone'] = $this->extractManagerPhone($managerData) ?: ($managers[$managerId]['phone'] ?? '');
-        $managers[$managerId]['position'] = $managerData['WORK_POSITION'] ?? $managers[$managerId]['position'];
-        $managers[$managerId]['photo'] = $this->extractManagerPhoto($managerData) ?: ($managers[$managerId]['photo'] ?? '');
-        $messengers = $this->extractManagerMessengers($managerData);
-        if (!empty($messengers)) {
-            $managers[$managerId]['messengers'] = $messengers;
-        } elseif (!isset($managers[$managerId]['messengers'])) {
-            $managers[$managerId]['messengers'] = [];
-        }
-        $managers[$managerId]['updated_at'] = date('Y-m-d H:i:s');
-
-        $writeResult = $this->writeData($this->managersFile, $managers, 'managers');
-
-        if ($writeResult === false) {
-            $this->logger->error('Failed to write manager data', ['manager_id' => $managerId]);
-        } else {
-            $this->logger->info('Manager synced successfully', ['manager_id' => $managerId]);
-        }
+		
+		if (is_array($managerData['EMAIL']) && $managerData['EMAIL'][0]["VALUE"])
+			$managerData['EMAIL']=$managerData['EMAIL'][0]["VALUE"];
+		/*if (is_array($managerData['PHONE']) && $managerData['PHONE'][0]["VALUE"])
+			$managerData['PHONE']=$managerData['PHONE'][0]["VALUE"];*/
+		$messengers = $this->extractManagerMessengers($managerData);
+		$managerData['PHONE']=$this->extractManagerPhone($managerData);
+		
+		if ($managerData['NAME']) $lkData['NAME'] = $managerData['NAME'];
+		if ($managerData['LAST_NAME']) $lkData['LAST_NAME'] = $managerData['LAST_NAME'];
+		if ($managerData['SECOND_NAME']) $lkData['SECOND_NAME'] = $managerData['SECOND_NAME'];
+		//if ($managerData['EMAIL']) { $lkData['EMAIL'] = $managerData['EMAIL']; $lkData['LOGIN'] = $managerData['EMAIL'];}
+		if ($managerData['PHONE']) $lkData['WORK_PHONE'] = $managerData['PHONE'];	
+		if ($managerData['COMPANY_ID']) $lkData['WORK_COMPANY'] = $managerData['COMPANY_ID'];
+		if ($managerData['PASSWORD']) { $lkData['PASSWORD'] = $managerData['PASSWORD']; $lkData["CONFIRM_PASSWORD"]=$managerData['PASSWORD'];}
+		if ($managerData['WORK_POSITION']) $lkData['WORK_POSITION'] = $managerData['WORK_POSITION'];
+		if ($managerData['PERSONAL_PHOTO']) $lkData['PERSONAL_PHOTO'] = @CFile::MakeFileArray($managerData['PERSONAL_PHOTO']);
+		if ($messengers) $lkData['UF_MESSENGERS'] = serialize($messengers);
+		
+		
+		$siteID= $contact["SITE_ID"];
+		$user = new CUser;
+		$res=$user->Update($siteID, $lkData);
+		if ($res)
+			$this->logger->info('Менеджер обновлен', ['ID' => $siteID]);
+		else
+		{
+			$this->logger->error('Ошибка обновления менеджера', ["site_id"=>$siteID, "manager_id"=>$managerId,"error"=>$user->LAST_ERROR]);
+			return false;
+		}
 
         return true;
     }
+
 
     /**
      * Удаление всех данных контакта из базы данных
@@ -679,161 +851,162 @@ class LocalStorage
      * @param string $contactId ID контакта в Bitrix24
      * @return bool true при успешном удалении, false при ошибке
      */
-    public function deleteContactData($contactId)
+    public function deleteContactData($contactId) 
     {
-        $this->logger->debug('Starting deletion of contact data and all related entities', ['contact_id' => $contactId]);
+        return $this->runDbOperation(__FUNCTION__, function () use ($contactId) {
+            $this->logger->debug('Удаление всех данных контакта и всего связанного с ним', ['contact_id' => $contactId]);
 
-        $contactId = (string)$contactId;
-        
-        $deletedCompanies = [];
-        $deletedProjects = [];
-        $contactDeleted = false;
-
-        $contacts = $this->readData($this->contactsFile, 'contacts');
-        if (isset($contacts[$contactId])) {
-            unset($contacts[$contactId]);
-            $writeResult = $this->writeData($this->contactsFile, $contacts, 'contacts');
-            if ($writeResult !== false) {
-                $contactDeleted = true;
-                $this->logger->debug('Contact deleted from local storage', ['contact_id' => $contactId]);
-            } else {
-                $this->logger->error('Failed to write contacts file after deletion', ['contact_id' => $contactId]);
-            }
-        } else {
-            $this->logger->warning('Contact not found in local storage', ['contact_id' => $contactId]);
-        }
-
-        // Удаляем связанные компании
-        $companies = $this->readData($this->companiesFile, 'companies');
-        foreach ($companies as $companyId => $company) {
-            $companyContactId = $company['contact_id'] ?? null;
-            
-            // Проверяем связь через contact_id (может быть строкой, числом или массивом)
-            $shouldDelete = false;
-            if (is_array($companyContactId)) {
-                // Если это массив, проверяем наличие contactId в массиве
-                $shouldDelete = in_array($contactId, array_map('strval', $companyContactId), true);
-            } else {
-                // Приводим к строке для сравнения
-                $shouldDelete = ((string)$companyContactId === $contactId);
-            }
-            
-            if ($shouldDelete) {
-                unset($companies[$companyId]);
-                $deletedCompanies[] = $companyId;
-            }
-        }
-        if (!empty($deletedCompanies)) {
-            $writeResult = $this->writeData($this->companiesFile, $companies, 'companies');
-            if ($writeResult !== false) {
-                $this->logger->debug('Related companies deleted', [
-                    'contact_id' => $contactId,
-                    'count' => count($deletedCompanies)
-                ]);
-            } else {
-                $this->logger->error('Failed to write companies file after deletion', [
-                    'contact_id' => $contactId,
-                    'deleted_companies' => $deletedCompanies
-                ]);
-            }
-        }
-
-        $projects = $this->readData($this->projectsFile, 'projects');
-        foreach ($projects as $projectId => $project) {
-            $projectClientId = $project['client_id'] ?? null;
-            if ((string)$projectClientId === $contactId) {
-                unset($projects[$projectId]);
-                $deletedProjects[] = $projectId;
-            }
-        }
-        if (!empty($deletedProjects)) {
-            $writeResult = $this->writeData($this->projectsFile, $projects, 'projects');
-            if ($writeResult !== false) {
-                $this->logger->debug('Related projects deleted', [
-                    'contact_id' => $contactId,
-                    'count' => count($deletedProjects)
-                ]);
-            } else {
-                $this->logger->error('Failed to write projects file after deletion', [
-                    'contact_id' => $contactId,
-                    'deleted_projects' => $deletedProjects
-                ]);
-            }
-        }
-
-        $totalDeleted = count($deletedCompanies) + count($deletedProjects);
-        
-        $this->logger->info('Contact data deletion completed', [
-            'contact_id' => $contactId,
-            'contact_deleted' => $contactDeleted,
-            'companies_deleted' => count($deletedCompanies),
-            'projects_deleted' => count($deletedProjects),
-            'total_related_entities_deleted' => $totalDeleted
-        ]);
-
-        return true;
-    }
-
-    /**
-     * Удаление компании из локального хранилища
-     * 
-     * @param string $companyId ID компании в Bitrix24
-     * @return bool true при успешном удалении, false при ошибке
-     */
-    public function deleteCompany($companyId)
-    {
-        $this->logger->debug('Starting deletion of company', ['company_id' => $companyId]);
-
-        $companyId = (string)$companyId;
-        $companies = $this->readData($this->companiesFile, 'companies');
-        
-        if (!isset($companies[$companyId])) {
-            $this->logger->warning('Company not found in local storage', ['company_id' => $companyId]);
-            return false;
-        }
-
-        unset($companies[$companyId]);
-        $writeResult = $this->writeData($this->companiesFile, $companies, 'companies');
-        
-        if ($writeResult !== false) {
-            $this->logger->info('Company deleted from local storage', ['company_id' => $companyId]);
+            $contactId = (string)$contactId;
+		
+		    $SITE_ID=$this->GetUserIDByXMLID($contactId);
+		    $this->DeleteUserCompanies($contactId);
+		    $this->DeleteUserProjects($contactId);
+		    $user = new CUser;
+		    if ($SITE_ID)
+		    {
+			    //$user->Update($SITE_ID, ["ACTIVE"=>"N"]);
+			    \Bitrix\Main\UserAuthActionTable::addLogoutAction($SITE_ID);
+			    $user->Delete($SITE_ID);
+		    }
+		    $this->logger->info('Удаление всех данных контакта и всего связанного с ним завершено', ['contact_id' => $contactId]);		
             return true;
-        } else {
-            $this->logger->error('Failed to write companies file after deletion', ['company_id' => $companyId]);
-            return false;
-        }
+        }, ['retry_on_gone_away' => true]);
     }
+	
+	public function GetUserDataByXMLID($XML_ID)
+	{
+		global $USER;
+		$rs=CUser::GetList("id","asc", ["XML_ID"=>$XML_ID], ["FIELDS"=>[], "SELECT"=> ["UF_*"], "NAV_PARAMS"=> ["nTopCount"=>1]]);
+		if ($ar=$rs->Fetch())
+		{
+			$ar["SITE_ID"]=$ar["ID"];
+			$ar["ID"]=$ar["XML_ID"];
+			return $ar;
+		}
+	}
+	
+	public function GetUserIDByXMLID($XML_ID)
+	{
+		global $USER;
+		$rs=CUser::GetList("id","asc", ["XML_ID"=>$XML_ID], ["FIELDS"=>["ID"], "NAV_PARAMS"=> ["nTopCount"=>1]]);
+		if ($ar=$rs->Fetch())
+		{
+			return $ar["ID"];
+		}
+		return false;
+	}
+	public function getCompanyByXMLID($XML_ID)
+	{
+		$hlblock =\Bitrix\Highloadblock\HighloadBlockTable::getById($this->CompanyHLEntityID)->fetch(); 
+		$entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
+		$entity_data_class = $entity->getDataClass();
+		$rsData = $entity_data_class::getList(array(
+		   "select" => array("*"),
+		   "filter" => array("UF_ID"=>$XML_ID),
+		   "limit" => 1,
+		));
+		if($arData = $rsData->Fetch()){
+			$arData["SITE_ID"]=$arData["ID"];
+			$arData["ID"]=$arData["UF_ID"];
+			return $arData;
+		}
+		return false;
+	}
+	
+	public function DeleteUserCompanies($XML_ID)
+	{
+		$hlblock =\Bitrix\Highloadblock\HighloadBlockTable::getById($this->CompanyHLEntityID)->fetch(); 
+		$entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
+		$entity_data_class = $entity->getDataClass();
+		$rsData = $entity_data_class::getList(array(
+		   "select" => array("*"),
+		   "filter" => array("UF_CONTACT_ID"=>$XML_ID),
+		   //"limit" => 1,
+		));
+		while($arData = $rsData->Fetch()){
+			$entity_data_class::Delete($arData["ID"]);
+			$this->logger->debug('Удаление компании', ['contact_id' => $XML_ID, "site_id" => $arData["ID"]]);
+		}
+		return false;
+	}
+	
+	public function getUserCompaniesID($XML_ID)
+	{
+		$hlblock =\Bitrix\Highloadblock\HighloadBlockTable::getById($this->CompanyHLEntityID)->fetch(); 
+		$entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
+		$entity_data_class = $entity->getDataClass();
+		$rsData = $entity_data_class::getList(array(
+		   "select" => array("ID"),
+		   "filter" => array("UF_CONTACT_ID"=>$XML_ID),
+		   //"limit" => 1,
+		));
+		while($arData = $rsData->Fetch()){
+			$arDatas[]=$arData;
+		}
+		return $arDatas;
+		
+	}
 
-    /**
-     * Удаление проекта из локального хранилища
-     * 
-     * @param string $projectId ID проекта в Bitrix24
-     * @return bool true при успешном удалении, false при ошибке
-     */
-    public function deleteProject($projectId)
-    {
-        $this->logger->debug('Starting deletion of project', ['project_id' => $projectId]);
-
-        $projectId = (string)$projectId;
-        $projects = $this->readData($this->projectsFile, 'projects');
-        
-        if (!isset($projects[$projectId])) {
-            $this->logger->warning('Project not found in local storage', ['project_id' => $projectId]);
-            return false;
-        }
-
-        unset($projects[$projectId]);
-        $writeResult = $this->writeData($this->projectsFile, $projects, 'projects');
-        
-        if ($writeResult !== false) {
-            $this->logger->info('Project deleted from local storage', ['project_id' => $projectId]);
-            return true;
-        } else {
-            $this->logger->error('Failed to write projects file after deletion', ['project_id' => $projectId]);
-            return false;
-        }
-    }
-
+	public function getProjectByXMLID($XML_ID)
+	{
+		$hlblock =\Bitrix\Highloadblock\HighloadBlockTable::getById($this->ProjectHLEntityID)->fetch(); 
+		$entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
+		$entity_data_class = $entity->getDataClass();
+		$rsData = $entity_data_class::getList(array(
+		   "select" => array("*"),
+		   "filter" => array("UF_ID"=>$XML_ID),
+		   "limit" => 1,
+		));
+		if($arData = $rsData->Fetch()){
+			$arData["SITE_ID"]=$arData["ID"];
+			$arData["ID"]=$arData["UF_ID"];
+			return $arData;
+		}
+		return false;
+	}
+	
+	public function getUserProjectsID($XML_ID)
+	{
+		$hlblock =\Bitrix\Highloadblock\HighloadBlockTable::getById($this->ProjectHLEntityID)->fetch(); 
+		$entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
+		$entity_data_class = $entity->getDataClass();
+		$rsData = $entity_data_class::getList(array(
+		   "select" => array("ID"),
+		   "filter" => array("UF_CLIENT_ID"=>$XML_ID),
+		   //"limit" => 1,
+		));
+		while($arData = $rsData->Fetch()){
+			$arDatas[]=$arData;
+		}
+		return $arDatas;
+		
+	}
+	public function DeleteUserProjects($XML_ID)
+	{
+		$hlblock =\Bitrix\Highloadblock\HighloadBlockTable::getById($this->ProjectHLEntityID)->fetch(); 
+		$entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
+		$entity_data_class = $entity->getDataClass();
+		$rsData = $entity_data_class::getList(array(
+		   "select" => array("ID"),
+		   "filter" => array("UF_CLIENT_ID"=>$XML_ID),
+		   //"limit" => 1,
+		));
+		while($arData = $rsData->Fetch()){
+			$entity_data_class::Delete($arData["ID"]);
+			$this->logger->debug('Удаление проекта', ['client_id' => $XML_ID, "site_id"=>$arData["ID"]]);
+		}
+	}
+	
+	public function SetPassword()
+	{
+		return randString(7, array(
+			"abcdefghijklnmopqrstuvwxyz",
+			"ABCDEFGHIJKLNMOPQRSTUVWXYZ",
+			"0123456789",
+			"!@#\$%^&*()",
+		));
+	}
+	
     /**
      * Извлечение ссылки на фото менеджера по маппингу
      */
@@ -936,4 +1109,78 @@ class LocalStorage
 
         return $entityData[$fieldName];
     }
+	
+    public function deleteProject($projectId)
+    {
+        $this->logger->debug('Удаление проекта', ['project_id' => $projectId]);
+
+        $projectId = (string)$projectId;
+        
+		$hlblock =\Bitrix\Highloadblock\HighloadBlockTable::getById($this->ProjectHLEntityID)->fetch(); 
+		$entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
+		$entity_data_class = $entity->getDataClass();
+		$rsData = $entity_data_class::getList(array(
+		   "select" => array("ID"),
+		   "filter" => array("UF_ID"=>$projectId),
+		   "limit" => 1,
+		));
+		$res=false;
+		if($arData = $rsData->Fetch()){
+			$entity_data_class::Delete($arData["ID"]);
+			$this->logger->debug('Удаление проекта', ['project_id' => $projectId, "site_id"=>$arData["ID"]]);
+			$res=true;
+		}       
+        
+        if ($res !== false) {
+            $this->logger->info('Проект удален', ['project_id' => $projectId]);
+            return true;
+        } else {
+            $this->logger->error('Проект не найден', ['project_id' => $projectId]);
+            return false;
+        }
+    }
+
+    public function deleteCompany($companyId)
+    {
+        $this->logger->debug('Удаление компании', ['company_id' => $companyId]);
+
+        $companyId = (string)$companyId;
+        
+		$hlblock =\Bitrix\Highloadblock\HighloadBlockTable::getById($this->CompanyHLEntityID)->fetch(); 
+		$entity = \Bitrix\Highloadblock\HighloadBlockTable::compileEntity($hlblock); 
+		$entity_data_class = $entity->getDataClass();
+		$rsData = $entity_data_class::getList(array(
+		   "select" => array("ID"),
+		   "filter" => array("UF_ID"=>$companyId),
+		   "limit" => 1,
+		));
+		$res=false;
+		if($arData = $rsData->Fetch()){
+			$entity_data_class::Delete($arData["ID"]);
+			$this->logger->debug('Удаление компании', ['company_id' => $companyId, "site_id"=>$arData["ID"]]);
+			$res=true;
+		}       
+        
+        if ($res !== false) {
+            $this->logger->info('Компания удалена', ['company_id' => $companyId]);
+            return true;
+        } else {
+            $this->logger->error('Компания не найдена', ['company_id' => $companyId]);
+            return false;
+        }
+    }
+	
+	public function Disconnect()
+	{
+		$cn = \Bitrix\Main\Application::getConnection();
+		$cn->disconnect();
+	}
+	
+	public function Reconnect()
+	{
+		$cn = \Bitrix\Main\Application::getConnection();
+		$cn->disconnect();
+		$cn->connect();
+        $this->lastReconnectAtTs = time();
+	}
 }
