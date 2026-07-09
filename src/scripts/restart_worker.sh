@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# Защита от запуска через sh (dash): скрипт требует bash
+if [ -z "$BASH_VERSION" ]; then
+    echo "Ошибка: этот скрипт должен запускаться через bash, а не sh." >&2
+    echo "Используйте: bash $0 или chmod +x $0 && $0" >&2
+    echo "В cron: /bin/bash $(readlink -f "$0" 2>/dev/null || echo "$0")" >&2
+    exit 1
+fi
+
 # Скрипт для перезапуска воркера process_queue.php
 #
 # Функционал:
@@ -78,6 +86,17 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     exit 0
 fi
 
+# --- Защита от параллельного запуска (lock-файл) ---
+LOCK_FILE="$PROJECT_ROOT/src/data/restart_worker.lock"
+
+# Создаём lock-файл. flock использует файловый дескриптор для атомарного захвата.
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    log "${YELLOW}Скрипт уже выполняется (lock занят). Выход.${NC}"
+    exit 0
+fi
+# При выходе (любом) lock освободится автоматически — ядро закроет дескриптор 9.
+
 # Функция для проверки существования процесса
 is_process_running() {
     local pid=$1
@@ -141,7 +160,8 @@ find_running_worker() {
     fi
 
     # Если PID файл не найден или процесс не работает, ищем процесс в системе
-    WORKER_PID=$(pgrep -f "process_queue.php" 2>/dev/null | head -1)
+    # -x: точное совпадение имени (не подстрока); -f: по полной командной строке
+    WORKER_PID=$(pgrep -fx ".*php.*process_queue\.php($| .*)" 2>/dev/null | head -1)
     if [ -n "$WORKER_PID" ]; then
         echo "$WORKER_PID"
         return 0
@@ -164,10 +184,12 @@ if [ -n "$RUNNING_PID" ]; then
     # Ждем завершения
     if wait_for_process_exit "$RUNNING_PID" 30; then
         log "${GREEN}Воркер успешно остановлен${NC}"
+        rm -f "$PID_FILE"
     else
         log "${RED}Принудительная остановка воркера...${NC}"
         kill -KILL "$RUNNING_PID" 2>/dev/null
         sleep 2
+        rm -f "$PID_FILE"
     fi
 else
     log "Воркер не был запущен ранее"
