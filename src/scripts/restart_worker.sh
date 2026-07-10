@@ -31,7 +31,7 @@ PID_FILE="$PROJECT_ROOT/src/data/worker.pid"
 PHP_BIN=$(which php)
 
 # Файл лога этого управляющего скрипта (удобно смотреть, что сделал cron)
-LOG_FILE="${LOG_FILE:-$PROJECT_ROOT/src/data/restart_worker.log}"
+LOG_FILE="${LOG_FILE:-$PROJECT_ROOT/src/logs/restart_worker.log}"
 
 # Цвета для вывода (только если есть TTY)
 if [ -t 1 ]; then
@@ -50,9 +50,9 @@ fi
 log() {
     local msg
     msg="$(date '+%Y-%m-%d %H:%M:%S') - $1"
-    echo -e "$msg"
+    printf '%b\n' "$msg"
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
-    echo -e "$msg" >> "$LOG_FILE" 2>/dev/null || true
+    printf '%b\n' "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 # Функция для показа справки
