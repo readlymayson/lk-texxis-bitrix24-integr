@@ -28,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 WORKER_SCRIPT="$PROJECT_ROOT/src/scripts/process_queue.php"
 PID_FILE="$PROJECT_ROOT/src/data/worker.pid"
-PHP_BIN=$(which php)
+PHP_BIN="${PHP_BIN:-$(which php 2>/dev/null || echo "/usr/bin/php")}"
 
 # Файл лога этого управляющего скрипта (удобно смотреть, что сделал cron)
 LOG_FILE="${LOG_FILE:-$PROJECT_ROOT/src/logs/restart_worker.log}"
@@ -68,6 +68,7 @@ show_help() {
 
 ИСПОЛЬЗОВАНИЕ:
   $0              # Перезапуск воркера
+  $0 --force      # Принудительный сброс lock и перезапуск
   $0 --help       # Показать эту справку
 
 ПРИМЕР ИСПОЛЬЗОВАНИЯ В CRON:
@@ -86,15 +87,43 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     exit 0
 fi
 
+FORCE=0
+if [ "$1" = "--force" ] || [ "$1" = "-f" ]; then
+    FORCE=1
+fi
+
 # --- Защита от параллельного запуска (lock-файл) ---
 LOCK_FILE="$PROJECT_ROOT/src/data/restart_worker.lock"
 
-# Создаём lock-файл. flock использует файловый дескриптор для атомарного захвата.
-exec 9>"$LOCK_FILE"
+if [ "$FORCE" -eq 1 ]; then
+    # Читаем PID прямо из lock-файла
+    LOCK_PID=$(cat "$LOCK_FILE" 2>/dev/null)
+    if [ -n "$LOCK_PID" ]; then
+        log "${YELLOW}Принудительный сброс lock'а (PID: $LOCK_PID)...${NC}"
+        kill "$LOCK_PID" 2>/dev/null
+        sleep 1
+    fi
+    rm -f "$LOCK_FILE"
+fi
+
+# Открываем дескриптор 9 на запись/чтение к lock-файлу
+exec 9>>"$LOCK_FILE"
+
 if ! flock -n 9; then
-    log "${YELLOW}Скрипт уже выполняется (lock занят). Выход.${NC}"
+    LOCK_PID=$(cat "$LOCK_FILE" 2>/dev/null)
+    if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
+        log "${YELLOW}Скрипт уже выполняется (lock занят процессом PID: $LOCK_PID).${NC}"
+        log "Используйте: $0 --force  — чтобы принудительно сбросить lock"
+    else
+        log "${YELLOW}Скрипт уже выполняется (но процесс из lock-файла не отвечает).${NC}"
+        log "Запустите с параметром --force для очистки."
+    fi
     exit 0
 fi
+
+# Очищаем старый PID и записываем PID текущего процесса в lock-файл
+truncate -s 0 "$LOCK_FILE" 2>/dev/null || true
+echo $$ >&9
 # При выходе (любом) lock освободится автоматически — ядро закроет дескриптор 9.
 
 # Функция для проверки существования процесса
@@ -159,9 +188,8 @@ find_running_worker() {
         fi
     fi
 
-    # Если PID файл не найден или процесс не работает, ищем процесс в системе
-    # -x: точное совпадение имени (не подстрока); -f: по полной командной строке
-    WORKER_PID=$(pgrep -fx ".*php.*process_queue\.php($| .*)" 2>/dev/null | head -1)
+    # Поиск по имени скрипта в командной строке
+    WORKER_PID=$(pgrep -f "process_queue\.php" 2>/dev/null | head -1)
     if [ -n "$WORKER_PID" ]; then
         echo "$WORKER_PID"
         return 0
