@@ -233,7 +233,7 @@ cd "$PROJECT_ROOT/src/scripts" || {
 
 # Запускаем воркер в фоне (как отдельный процесс), вывод воркера глушим:
 # сам воркер пишет свои логи через Logger.
-nohup "$PHP_BIN" "$WORKER_SCRIPT" >/dev/null 2>&1 &
+nohup "$PHP_BIN" "$WORKER_SCRIPT" >/dev/null 2>&1 9>&- &
 
 NEW_PID=$!
 log "${GREEN}PHP-процесс воркера запущен (PID: $NEW_PID). Ожидание PID-файла воркера...${NC}"
